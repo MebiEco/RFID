@@ -1,0 +1,14 @@
+menu "SD / SPIFFS WAV"
+    config USE_SPIFFS_WAV
+        bool "Phat WAV tu SPIFFS (khong can the SD)"
+        default y
+        help
+            Bat: mount SPIFFS, phat /spiffs/music.wav (file duoc dong goi khi flash).
+            Tat: dung the SD nhu cu (SPI + FAT).
+
+    config SD_FORMAT_IF_MOUNT_FAILED
+        bool "Tu dong format the SD neu mount FAT that (XOA HET DU LIEU TREN THE)"
+        default n
+        help
+            Chi dung khi tat SPIFFS WAV. Nguy hiem: se format lai the neu FAT loi.
+endmenu

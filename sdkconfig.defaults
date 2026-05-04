@@ -1,0 +1,16 @@
+# Bảng phân vùng tùy chỉnh
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+# Flash thực tế thường 8–16MB; 2MB sẽ không đủ cho factory + spiffs
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
+
+# ── Octal SPI PSRAM (SPIRAM) ───────────────────────────────────────────────
+# N16R8 có PSRAM trên chip; board USB/DevKit **không phải** module đó → vẫn báo "PSRAM not connected".
+# IGNORE_NOTFOUND: không abort — chạy RAM nội nếu init PSRAM lỗi (log cảnh báo).
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_IGNORE_NOTFOUND=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_USE_CAPS_ALLOC=y
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384

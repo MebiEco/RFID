@@ -1,0 +1,12 @@
+{
+    "idf.currentSetup": "C:\\esp\\v5.3.4\\esp-idf",
+    "idf.customExtraVars": {
+        "IDF_TARGET": "esp32s3"
+    },
+    "cmake.sourceDirectory": "C:/esp/RFID/main",
+    "idf.flashType": "UART",
+    "idf.portWin": "COM5",
+    "idf.openOcdConfigs": [
+        "board/esp32s3-builtin.cfg"
+    ]
+}

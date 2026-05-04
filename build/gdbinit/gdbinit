@@ -1,0 +1,2 @@
+source C:/esp/RFID/build/gdbinit/symbols
+source C:/esp/RFID/build/gdbinit/connect
