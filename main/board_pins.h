@@ -90,6 +90,13 @@
 #ifndef BOARD_SD_PROFILES_DIR
 #define BOARD_SD_PROFILES_DIR BOARD_SD_MOUNT_POINT "/profiles"
 #endif
+/** Anh mac dinh khi khong co <UID>.jpg — uu tien trong profiles/, roi goc the. */
+#ifndef BOARD_SD_PROFILES_DEFAULT_JPG
+#define BOARD_SD_PROFILES_DEFAULT_JPG BOARD_SD_PROFILES_DIR "/default.jpg"
+#endif
+#ifndef BOARD_SD_ROOT_DEFAULT_JPG
+#define BOARD_SD_ROOT_DEFAULT_JPG BOARD_SD_MOUNT_POINT "/default.jpg"
+#endif
 #define BOARD_SD_IMAGE_FILENAME "a.jpg"
 #define BOARD_SD_IMAGE_PATH BOARD_SD_MOUNT_POINT "/" BOARD_SD_IMAGE_FILENAME
 

@@ -575,10 +575,18 @@ static void rfid_task(void *arg)
                 if (prof_err == ESP_OK) {
                     log_reg = reg ? 1 : 0;
                     check_type = determine_check_type(uid_nc); /* ghi file checkin */
-                    snprintf(img_path, sizeof(img_path), "/sdcard/%s.jpg", uid_nc);
+                    snprintf(img_path, sizeof(img_path), "%s/%s.jpg", BOARD_SD_PROFILES_DIR, uid_nc);
                     img_exists = sd_file_exists(img_path);
                     if (!img_exists) {
-                        snprintf(img_path, sizeof(img_path), "%s/default.jpg", BOARD_SD_MOUNT_POINT);
+                        snprintf(img_path, sizeof(img_path), "%s/%s.jpg", BOARD_SD_MOUNT_POINT, uid_nc);
+                        img_exists = sd_file_exists(img_path);
+                    }
+                    if (!img_exists) {
+                        snprintf(img_path, sizeof(img_path), "%s", BOARD_SD_PROFILES_DEFAULT_JPG);
+                        img_exists = sd_file_exists(img_path);
+                    }
+                    if (!img_exists) {
+                        snprintf(img_path, sizeof(img_path), "%s", BOARD_SD_ROOT_DEFAULT_JPG);
                         img_exists = sd_file_exists(img_path);
                     }
                 } else {

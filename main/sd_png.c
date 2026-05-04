@@ -2,6 +2,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 
 #include "esp_heap_caps.h"
@@ -15,17 +16,16 @@
 #include "sd_card.h"
 #include "stb_image.h"
 
-/** Giới hạn kích thước file JPEG đọc vào RAM (bytes). 64 KB đủ cho ảnh chân dung nhỏ. */
-#define SD_PNG_MAX_FILE_BYTES (64 * 1024)
+/** JPEG toi da doc vao RAM — anh 320x480 nen thuong < ~200 KB. */
+#define SD_PNG_MAX_FILE_BYTES (192 * 1024)
 
 static const char *TAG = "sd_png";
 
 /**
- * Giới hạn pixel sau giải mã. Dung luong file (vi du 86KB) la JPEG nen;
- * anh van co the la 3000x2000 pixel -> can ~18MB neu giai full RGB.
- * RAM chip ~300KB sau LCD: giu <= 320x240 (76800 px), buffer RGB ~225KB.
+ * Gioi han pixel sau giai ma (w*h). 320x480x3 ~ 450KB RGB — dung PSRAM.
+ * Hien thi: zoom vung giua, giu dung ty le 64:80.
  */
-#define MAX_DECODE_PIXELS (320 * 240)
+#define MAX_DECODE_PIXELS (320 * 480)
 
 static uint16_t rgb888_to_rgb565(uint8_t r, uint8_t g, uint8_t b)
 {
@@ -53,8 +53,39 @@ static esp_err_t draw_rgba_scaled_at(const uint8_t *rgba, int w, int h, int src_
     if (!panel) {
         return ESP_ERR_INVALID_STATE;
     }
+    if (w < 1 || h < 1 || tgt_w < 1 || tgt_h < 1) {
+        return ESP_ERR_INVALID_ARG;
+    }
 
     const size_t total_px = (size_t)tgt_w * (size_t)tgt_h;
+
+    /* Crop giua anh: giu ty le tgt_w:tgt_h, bo vien (giong "cover" nhung zoom giua). */
+    int crop_x, crop_y, crop_w, crop_h;
+    const int64_t wh_tgt = (int64_t)w * (int64_t)tgt_h;
+    const int64_t hw_tgt = (int64_t)h * (int64_t)tgt_w;
+    if (wh_tgt > hw_tgt) {
+        crop_h = h;
+        crop_w = (int)(hw_tgt / (int64_t)tgt_h);
+        if (crop_w < 1) {
+            crop_w = 1;
+        }
+        if (crop_w > w) {
+            crop_w = w;
+        }
+        crop_x = (w - crop_w) / 2;
+        crop_y = 0;
+    } else {
+        crop_w = w;
+        crop_h = (int)(wh_tgt / (int64_t)tgt_w);
+        if (crop_h < 1) {
+            crop_h = 1;
+        }
+        if (crop_h > h) {
+            crop_h = h;
+        }
+        crop_x = 0;
+        crop_y = (h - crop_h) / 2;
+    }
 
     /* DMA-capable: SPI LCD không chấp nhận buffer chỉ SPIRAM (không DMA) — lỗi tx_color queue */
     uint16_t *fb = heap_caps_malloc(total_px * sizeof(uint16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
@@ -83,8 +114,14 @@ static esp_err_t draw_rgba_scaled_at(const uint8_t *rgba, int w, int h, int src_
 #else
             int sx_map = dx;
 #endif
-            int sx = (sx_map * w) / tgt_w;
-            int sy = (sy_map * h) / tgt_h;
+            int sx = crop_x + (sx_map * crop_w) / tgt_w;
+            int sy = crop_y + (sy_map * crop_h) / tgt_h;
+            if (sx < 0) {
+                sx = 0;
+            }
+            if (sy < 0) {
+                sy = 0;
+            }
             if (sx >= w) {
                 sx = w - 1;
             }
