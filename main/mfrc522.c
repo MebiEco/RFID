@@ -202,7 +202,7 @@ static mfrc522_status_t pcd_calc_crc(spi_device_handle_t spi, uint8_t *data, uin
             result[1] = pcd_read_reg(spi, REG_CRCResultRegH);
             return MFRC522_OK;
         }
-        taskYIELD();
+        vTaskDelay(1);
     } while (millis() < deadline);
     return MFRC522_TIMEOUT;
 }
@@ -252,7 +252,7 @@ static mfrc522_status_t pcd_communicate_with_picc(spi_device_handle_t spi, uint8
         if (n & 0x01) {
             return MFRC522_TIMEOUT;
         }
-        taskYIELD();
+        vTaskDelay(1);
     } while (millis() < deadline);
     if (!completed) {
         return MFRC522_TIMEOUT;
@@ -502,20 +502,20 @@ esp_err_t mfrc522_init(spi_device_handle_t spi, int rst_gpio)
     pcd_write_reg(spi, REG_RFCfgReg, 0x70);
     uint8_t ver = pcd_read_reg(spi, REG_VersionReg);
     uint8_t rfc = pcd_read_reg(spi, REG_RFCfgReg);
-    ESP_LOGI(TAG_MF, "RC522 VersionReg=0x%02x RFCfg=0x%02x (sau khi ghi 0x70/48dB vao RxGain)", ver, rfc);
-    if (ver == 0x00 || ver == 0xFF) {
-        ESP_LOGW(TAG_MF,
-                 "VersionReg 0x%02x: kiem tra day SPI (MISO doc duoc), CS/RST, nguon 3.3V RC522; sdspi khong chiem MISO khi CS_SD=1.",
-                 ver);
-    } else if (ver != 0x91 && ver != 0x92 && ver != 0x12) {
-        ESP_LOGW(TAG_MF,
-                 "VersionReg 0x%02x khac 91/92/12 — thu xem log sau khi sua SPI 1-byte/CS; van loi thi MISO/CS/clone chip.",
-                 ver);
-    }
-    if ((rfc & 0xE0) != 0x40) {
-        /* RFCfg gain field thường 0b010xxxxx sau khi ghi 0x48 */
-        ESP_LOGW(TAG_MF, "RFCfg=0x%02x: neu khong gan 0x4x, SPI doc RC522 co the van sai.", rfc);
-    }
+    // ESP_LOGI(TAG_MF, "RC522 VersionReg=0x%02x RFCfg=0x%02x (sau khi ghi 0x70/48dB vao RxGain)", ver, rfc);
+    // if (ver == 0x00 || ver == 0xFF) {
+    //     //ESP_LOGW(TAG_MF,
+    //              "VersionReg 0x%02x: kiem tra day SPI (MISO doc duoc), CS/RST, nguon 3.3V RC522; sdspi khong chiem MISO khi CS_SD=1.",
+    //              ver);
+    // } else if (ver != 0x91 && ver != 0x92 && ver != 0x12) {
+    //     //ESP_LOGW(TAG_MF,
+    //              "VersionReg 0x%02x khac 91/92/12 — thu xem log sau khi sua SPI 1-byte/CS; van loi thi MISO/CS/clone chip.",
+    //              ver);
+    // }
+    // if ((rfc & 0xE0) != 0x40) {
+    //     /* RFCfg gain field thường 0b010xxxxx sau khi ghi 0x48 */
+    //     //ESP_LOGW(TAG_MF, "RFCfg=0x%02x: neu khong gan 0x4x, SPI doc RC522 co the van sai.", rfc);
+    // }
     return ESP_OK;
 }
 

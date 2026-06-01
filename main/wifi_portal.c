@@ -7,8 +7,6 @@
 #include <sys/time.h>
 #include <time.h>
 
-#include "mbedtls/base64.h"
-
 #include "esp_event.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
@@ -16,11 +14,14 @@
 #include "freertos/task.h"
 #include "esp_netif.h"
 #include "esp_netif_sntp.h"
+#include "esp_sntp.h"
 #include "esp_wifi.h"
 #include "nvs.h"
 
 #include "scan_log.h"
 #include "app_azure.h"
+#include "app_rfid.h"
+#include "portal_web.h"
 
 static const char *TAG = "wifi_portal";
 
@@ -59,6 +60,42 @@ static uint8_t s_current_wifi_idx = 0;
 static void copy_field(char *dst, size_t dstsz, const char *src)
 {
     snprintf(dst, dstsz, "%s", src ? src : "");
+}
+
+/** HostName Azure: bỏ khoảng trắng, mqtts://, :8883 — tránh TLS verify fail do CN/SAN lệch. */
+static void normalize_azure_host(char *host)
+{
+    if (!host || !host[0]) {
+        return;
+    }
+    char *s = host;
+    while (*s == ' ' || *s == '\t' || *s == '\r' || *s == '\n') {
+        s++;
+    }
+    if (s != host) {
+        memmove(host, s, strlen(s) + 1);
+    }
+    char *scheme = strstr(host, "://");
+    if (scheme) {
+        memmove(host, scheme + 3, strlen(scheme + 3) + 1);
+    }
+    char *slash = strchr(host, '/');
+    if (slash) {
+        *slash = '\0';
+    }
+    char *colon = strchr(host, ':');
+    if (colon) {
+        *colon = '\0';
+    }
+    size_t n = strlen(host);
+    while (n > 0 && (host[n - 1] == ' ' || host[n - 1] == '\t')) {
+        host[--n] = '\0';
+    }
+    for (char *p = host; *p; p++) {
+        if (*p >= 'A' && *p <= 'Z') {
+            *p = (char)(*p - 'A' + 'a');
+        }
+    }
 }
 
 static void wifi_list_save(void)
@@ -108,21 +145,6 @@ void wifi_list_add(const char *ssid, const char *pass)
     wifi_list_save();
 }
 
-void wifi_list_remove(const char *ssid)
-{
-    int found = -1;
-    for (int i = 0; i < s_wifi_list.count; i++) {
-        if (strcmp(s_wifi_list.wifis[i].ssid, ssid) == 0) {
-            found = i; break;
-        }
-    }
-    if (found >= 0) {
-        for (int i = found; i < s_wifi_list.count - 1; i++) s_wifi_list.wifis[i] = s_wifi_list.wifis[i+1];
-        s_wifi_list.count--;
-        wifi_list_save();
-    }
-}
-
 int wifi_list_get_count(void) {
     return s_wifi_list.count;
 }
@@ -138,23 +160,33 @@ void wifi_list_get_item(int idx, char *ssid, char *pass) {
 }
 
 /** SoftAP WPA2 — mật khẩu AP_PASS; vào http://192.168.4.1 sau khi nối */
-#define AP_SSID "ESP32-Config"
+#define AP_SSID "Defaufl-AP"
 #define AP_PASS "12345678"
 #define AP_CHANNEL 1
 #define AP_MAX_CONN 4
 
-/** HTTP Basic Auth cho trang cấu hình (khác mật khẩu WiFi AP; cùng giá trị nếu muốn). */
-#define PORTAL_WEB_USER "admin"
-#define PORTAL_WEB_PASS "12345678"
-
 static httpd_handle_t s_server;
 static bool s_sntp_started;
+static bool s_time_synced;
+static esp_netif_t *s_sta_netif;
+static bool s_sntp_retry_task_live;
+static uint8_t s_ntp_server_idx;
+
+/** Xoay vong khi retry (LWIP chi cho 1 server trong config). */
+static const char *s_ntp_servers[] = {
+    "time.google.com",
+    "pool.ntp.org",
+    "vn.pool.ntp.org",
+};
 
 /** true: co NVS WiFi — cho phep tu ket noi lai sau khi mat STA */
 static bool s_sta_auto_reconnect;
 /** So lan da tu goi lai connect sau disconnect (reset khi co IP) */
 static uint8_t s_sta_reconnect_count;
 static volatile bool s_sta_reconnect_task_live;
+static wifi_conn_status_t s_wifi_conn_status = WIFI_STATUS_IDLE;
+static char s_pending_ssid[32];
+static char s_pending_pass[64];
 
 static void sta_apply_current_wifi(void);
 
@@ -240,6 +272,7 @@ static void sta_delayed_connect_task(void *arg)
             s_current_wifi_idx = (s_current_wifi_idx + 1) % s_wifi_list.count;
             sta_apply_current_wifi();
         } else {
+            s_wifi_conn_status = WIFI_STATUS_CONNECTING;
             esp_wifi_connect();
         }
     }
@@ -258,44 +291,6 @@ static void schedule_sta_reconnect(void)
         s_sta_reconnect_task_live = false;
         ESP_LOGW(TAG, "xTaskCreate sta_reco failed");
     }
-}
-
-static esp_err_t send_401_basic(httpd_req_t *req)
-{
-    httpd_resp_set_status(req, "401 Unauthorized");
-    httpd_resp_set_hdr(req, "WWW-Authenticate", "Basic realm=\"ESP32-Config\"");
-    httpd_resp_set_type(req, "text/plain; charset=utf-8");
-    return httpd_resp_sendstr(req, "Unauthorized");
-}
-
-/** Authorization: Basic base64(user:password) */
-static bool portal_auth_ok(httpd_req_t *req)
-{
-    char buf[192];
-    if (httpd_req_get_hdr_value_len(req, "Authorization") == 0) {
-        return false;
-    }
-    if (httpd_req_get_hdr_value_str(req, "Authorization", buf, sizeof(buf)) != ESP_OK) {
-        return false;
-    }
-    if (strncasecmp(buf, "Basic ", 6) != 0) {
-        return false;
-    }
-    const char *b64 = buf + 6;
-    while (*b64 == ' ' || *b64 == '\t') {
-        b64++;
-    }
-    unsigned char dec[96];
-    size_t olen = 0;
-    int ret = mbedtls_base64_decode(dec, sizeof(dec) - 1, &olen, (const unsigned char *)b64, strlen(b64));
-    if (ret != 0) {
-        return false;
-    }
-    dec[olen] = '\0';
-
-    char expect[80];
-    snprintf(expect, sizeof(expect), "%s:%s", PORTAL_WEB_USER, PORTAL_WEB_PASS);
-    return strcmp((char *)dec, expect) == 0;
 }
 
 static esp_err_t cred_load(wifi_cred_t *out)
@@ -364,12 +359,67 @@ static void sta_apply_current_wifi(void)
     w.sta.pmf_cfg.capable = true;
     w.sta.pmf_cfg.required = false;
     ESP_LOGI(TAG, "STA se ket noi WiFi %d/%d: %s", s_current_wifi_idx+1, s_wifi_list.count, w.sta.ssid);
+    s_wifi_conn_status = WIFI_STATUS_CONNECTING;
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &w));
     esp_wifi_disconnect();
     esp_wifi_connect();
 }
+void wifi_portal_connect_to(const char *ssid, const char *pass)
+{
+    if (!ssid || !ssid[0]) return;
+    wifi_config_t w = {0};
+    strncpy((char *)w.sta.ssid, ssid, sizeof(w.sta.ssid) - 1);
+    if (pass) strncpy((char *)w.sta.password, pass, sizeof(w.sta.password) - 1);
+    w.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    w.sta.pmf_cfg.capable = true;
+    w.sta.pmf_cfg.required = false;
+    
+    ESP_LOGI(TAG, "Yeu cau ket noi ngay lap tuc den: %s", ssid);
+    esp_wifi_disconnect();
+    esp_wifi_set_config(WIFI_IF_STA, &w);
+    s_wifi_conn_status = WIFI_STATUS_CONNECTING;
+    strncpy(s_pending_ssid, ssid, sizeof(s_pending_ssid) - 1);
+    strncpy(s_pending_pass, pass ? pass : "", sizeof(s_pending_pass) - 1);
+    esp_wifi_connect();
+}
 
+wifi_conn_status_t wifi_portal_get_conn_status(void)
+{
+    return s_wifi_conn_status;
+}
 
+void wifi_portal_get_azure(char *host, size_t host_sz, char *devid, size_t dev_sz, char *sas_mask,
+                           size_t sas_sz)
+{
+    wifi_cred_t c;
+    memset(&c, 0, sizeof(c));
+    if (host && host_sz) {
+        host[0] = '\0';
+    }
+    if (devid && dev_sz) {
+        devid[0] = '\0';
+    }
+    if (sas_mask && sas_sz) {
+        sas_mask[0] = '\0';
+    }
+    if (cred_load(&c) != ESP_OK) {
+        return;
+    }
+    if (host && host_sz) {
+        copy_field(host, host_sz, c.azure_host);
+    }
+    if (devid && dev_sz) {
+        copy_field(devid, dev_sz, c.azure_dev);
+    }
+    if (sas_mask && sas_sz && c.azure_sas[0]) {
+        size_t n = strlen(c.azure_sas);
+        if (n <= 4) {
+            snprintf(sas_mask, sas_sz, "****");
+        } else {
+            snprintf(sas_mask, sas_sz, "****%s", c.azure_sas + n - 4);
+        }
+    }
+}
 
 static void sta_clear_config(void)
 {
@@ -378,6 +428,84 @@ static void sta_clear_config(void)
     memset(&w, 0, sizeof(w));
     esp_wifi_set_config(WIFI_IF_STA, &w);
     esp_wifi_disconnect();
+}
+
+void wifi_list_remove(const char *ssid)
+{
+    if (!ssid || !ssid[0]) {
+        return;
+    }
+    int found = -1;
+    for (int i = 0; i < s_wifi_list.count; i++) {
+        if (strcmp(s_wifi_list.wifis[i].ssid, ssid) == 0) {
+            found = i;
+            break;
+        }
+    }
+    if (found < 0) {
+        return;
+    }
+
+    if (found < (int)s_current_wifi_idx) {
+        s_current_wifi_idx--;
+    } else if (found == (int)s_current_wifi_idx && s_wifi_list.count > 1 &&
+               found == (int)s_wifi_list.count - 1) {
+        s_current_wifi_idx = (uint8_t)(s_wifi_list.count - 2);
+    }
+
+    for (int i = found; i < s_wifi_list.count - 1; i++) {
+        s_wifi_list.wifis[i] = s_wifi_list.wifis[i + 1];
+    }
+    s_wifi_list.count--;
+    wifi_list_save();
+
+    if (strcmp(s_pending_ssid, ssid) == 0) {
+        s_pending_ssid[0] = '\0';
+    }
+
+    wifi_cred_t c;
+    if (cred_load(&c) == ESP_OK && strcmp(c.ssid, ssid) == 0) {
+        memset(c.ssid, 0, sizeof(c.ssid));
+        memset(c.pass, 0, sizeof(c.pass));
+        cred_save(&c);
+    }
+
+    if (s_current_wifi_idx >= s_wifi_list.count && s_wifi_list.count > 0) {
+        s_current_wifi_idx = (uint8_t)(s_wifi_list.count - 1);
+    }
+
+    if (s_wifi_list.count == 0) {
+        nvs_handle_t h;
+        if (nvs_open(NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
+            nvs_erase_key(h, NVS_KEY_STA_IDX);
+            nvs_commit(h);
+            nvs_close(h);
+        }
+        s_wifi_conn_status = WIFI_STATUS_IDLE;
+        sta_clear_config();
+    } else {
+        sta_current_idx_save();
+        sta_apply_current_wifi();
+    }
+}
+
+/** Giải mã %XX đơn giản (form ngắn). */
+static void json_escape_ssid(const char *in, char *out, size_t outsz)
+{
+    size_t j = 0;
+    if (!in) {
+        in = "";
+    }
+    for (size_t i = 0; in[i] && j + 2 < outsz; i++) {
+        char ch = in[i];
+        if (ch == '"' || ch == '\\') {
+            out[j++] = '\\';
+            out[j++] = ch;
+        } else if ((unsigned char)ch >= 0x20) {
+            out[j++] = ch;
+        }
+    }
+    out[j] = '\0';
 }
 
 /** Giải mã %XX đơn giản (form ngắn). */
@@ -405,13 +533,25 @@ static void url_decode_inplace(char *s)
 
 static int form_get(const char *body, const char *key, char *out, size_t out_len)
 {
-    char prefix[40];
-    snprintf(prefix, sizeof(prefix), "%s=", key);
-    const char *p = strstr(body, prefix);
+    if (!body || !key || !out || out_len == 0) {
+        return -1;
+    }
+    char prefix1[64];
+    snprintf(prefix1, sizeof(prefix1), "%s=", key);
+    char prefix2[64];
+    snprintf(prefix2, sizeof(prefix2), "&%s=", key);
+    const char *p = NULL;
+    if (strncmp(body, prefix1, strlen(prefix1)) == 0) {
+        p = body + strlen(prefix1);
+    } else {
+        p = strstr(body, prefix2);
+        if (p) {
+            p += strlen(prefix2);
+        }
+    }
     if (!p) {
         return -1;
     }
-    p += strlen(prefix);
     size_t i = 0;
     while (i < out_len - 1 && *p && *p != '&') {
         out[i++] = *p++;
@@ -421,95 +561,12 @@ static int form_get(const char *body, const char *key, char *out, size_t out_len
     return 0;
 }
 
-static const char HTML_PAGE[] =
-    "<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
-    "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-    "<title>Cấu hình Thiết Bị</title>"
-    "<style>"
-    "body{font-family:'Segoe UI',Tahoma,sans-serif;background:linear-gradient(135deg,#f5f7fa 0%,#c3cfe2 100%);"
-    "min-height:100vh;margin:0;display:flex;align-items:center;justify-content:center;padding:20px;box-sizing:border-box}"
-    ".card{background:#fff;padding:25px;border-radius:12px;box-shadow:0 8px 24px rgba(0,0,0,0.1);width:100%;max-width:400px}"
-    "h1{text-align:center;color:#333;margin-top:0;font-size:24px;border-bottom:1px solid #eee;padding-bottom:15px}"
-    ".form-group{margin-bottom:15px}"
-    "label{display:block;margin-bottom:5px;font-weight:600;color:#555;font-size:14px}"
-    "input{width:100%;padding:10px;border:1px solid #ccc;border-radius:6px;box-sizing:border-box;font-size:14px;transition:border 0.3s}"
-    "input:focus{border-color:#007bff;outline:none}"
-    ".scan-btn{width:100%;background:#e2e6ea;color:#333;border:1px solid #dae0e5;padding:8px;border-radius:6px;margin-bottom:10px;cursor:pointer;margin-top:5px;font-weight:600}"
-    ".scan-btn:hover{background:#d3d9df}"
-    ".btn{width:100%;padding:12px;background:#007bff;color:#fff;border:none;border-radius:6px;font-size:16px;cursor:pointer;font-weight:bold;margin-top:5px;flex:1}"
-    ".btn:hover{background:#0056b3}"
-    ".footer{margin-top:20px;text-align:center;font-size:13px;color:#777}"
-    ".msg{margin-top:5px;font-size:13px;font-weight:bold;text-align:center;min-height:18px}"
-    "</style></head><body>"
-    "<div class=\"card\">"
-    "<h1> Máy Công Chứng Đi Làm </h1>"
-    
-    "<form id=\"frmWifi\">"
-    "<h3 style=\"color:#007bff;margin-bottom:10px\">1. Mạng WiFi</h3>"
-    "<div class=\"form-group\">"
-    "<label>WiFi SSID</label>"
-    "<input list=\"ssid-list\" id=\"ssid\" name=\"ssid\" maxlength=\"31\" required>"
-    "<datalist id=\"ssid-list\"></datalist>"
-    "<button type=\"button\" class=\"scan-btn\" id=\"scanBtn\" onclick=\"scanWifi()\">🔄 Quét WiFi Lân Cận</button>"
-    "</div>"
-    "<div class=\"form-group\"><label>Mật khẩu WiFi</label><input type=\"password\" name=\"pass\" maxlength=\"63\"></div>"
-    "<div id=\"resWifi\" class=\"msg\"></div>"
-    "<div style=\"display:flex;gap:10px;margin-top:5px\">"
-    "<button type=\"button\" class=\"btn\" onclick=\"sendForm('frmWifi','/save_wifi','resWifi')\">💾 Lưu</button>"
-    "<button type=\"button\" class=\"btn\" style=\"background:#dc3545\" onclick=\"sendForm('frmWifi','/clear','resWifi')\">❌ Clear</button>"
-    "</div>"
-    "</form>"
-    
-    "<hr style=\"border:0;border-top:1px solid #eee;margin:25px 0\">"
-    
-    "<form id=\"frmAzure\">"
-    "<h3 style=\"color:#28a745;margin-bottom:10px\">2. Đám Mây Azure IoT</h3>"
-    "<div class=\"form-group\"><label>HostName</label><input name=\"azure_host\" placeholder=\"vd: abc.azure-devices.net\" maxlength=\"63\"></div>"
-    "<div class=\"form-group\"><label>Device ID</label><input name=\"azure_devid\" placeholder=\"my-esp32\" maxlength=\"31\"></div>"
-    "<div class=\"form-group\"><label>Shared Access Key</label><input type=\"password\" name=\"azure_sas_key\" placeholder=\"Nhập Key\" maxlength=\"127\"></div>"
-    "<div id=\"resAzure\" class=\"msg\"></div>"
-    "<div style=\"display:flex;gap:10px;margin-top:5px\">"
-    "<button type=\"button\" class=\"btn\" style=\"background:#28a745\" onclick=\"sendForm('frmAzure','/save_azure','resAzure')\">☁️ Tích hợp Azure</button>"
-    "<button type=\"button\" class=\"btn\" style=\"background:#dc3545\" onclick=\"sendForm('frmAzure','/clear_azure','resAzure')\">❌ Xóa Azure</button>"
-    "</div>"
-    "</form>"
-    
-    "<div class=\"footer\"><a href=\"/scans\" style=\"color:#6c757d;text-decoration:none\">📋 Nhật ký Thẻ (SD Card)</a></div>"
-    "</div>"
-    "<script>"
-    "function scanWifi(){"
-    "let b=document.getElementById('scanBtn');let l=document.getElementById('ssid-list');"
-    "b.innerText='⏳ Đang quét...';b.disabled=true;"
-    "fetch('/scan').then(r=>r.json()).then(d=>{"
-    "l.innerHTML='';d.forEach(i=>{"
-    "let o=document.createElement('option');o.value=i.ssid;l.appendChild(o);"
-    "});b.innerText='✅ Chọn WiFi từ danh sách sổ xuống';b.disabled=false;"
-    "}).catch(e=>{b.innerText='❌ Lỗi quét mạng';b.disabled=false;});"
-    "}"
-    "function sendForm(fid, u, rid){"
-    "let f=document.getElementById(fid); let r=document.getElementById(rid); let btns=f.querySelectorAll('button');"
-    "btns.forEach(b=>b.disabled=true); r.innerText='⏳ Đang xử lý...'; r.style.color='#007bff';"
-    "let params=new URLSearchParams(new FormData(f));"
-    "if(u=='/clear') params=new URLSearchParams();"
-    "fetch(u, {method:'POST',body:params})"
-    ".then(x=>{ if(x.ok){r.innerText='✅ Cập nhật thành công';r.style.color='#28a745';}else{r.innerText='❌ Lỗi hệ thống';r.style.color='#dc3545'} btns.forEach(b=>b.disabled=false); })"
-    ".catch(e=>{ r.innerText='❌ Mất kết nối'; r.style.color='#dc3545'; btns.forEach(b=>b.disabled=false); });"
-    "}"
-    "</script>"
-    "</body></html>";
-
-static esp_err_t root_get_handler(httpd_req_t *req)
-{
-    if (!portal_auth_ok(req)) {
-        return send_401_basic(req);
-    }
-    httpd_resp_set_type(req, "text/html; charset=utf-8");
-    return httpd_resp_send(req, HTML_PAGE, HTTPD_RESP_USE_STRLEN);
-}
-
 static esp_err_t save_wifi_post_handler(httpd_req_t *req)
 {
-    if (!portal_auth_ok(req)) return send_401_basic(req);
+    if (!portal_auth_section(req, "wifi")) {
+        httpd_resp_set_status(req, "403 Forbidden");
+        return httpd_resp_sendstr(req, "Forbidden");
+    }
 
     char buf[384];
     int rlen = httpd_req_recv(req, buf, sizeof(buf) - 1);
@@ -534,12 +591,17 @@ static esp_err_t save_wifi_post_handler(httpd_req_t *req)
 
 static esp_err_t saved_wifis_get_handler(httpd_req_t *req)
 {
-    if (!portal_auth_ok(req)) return send_401_basic(req);
+    if (!portal_auth_section(req, "wifi")) {
+        httpd_resp_set_status(req, "403 Forbidden");
+        return httpd_resp_sendstr(req, "[]");
+    }
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send_chunk(req, "[", 1);
     char buf[128];
+    char esc[68];
     for (int i = 0; i < s_wifi_list.count; i++) {
-        snprintf(buf, sizeof(buf), "\"%s\"%s", s_wifi_list.wifis[i].ssid, (i < s_wifi_list.count - 1) ? "," : "");
+        json_escape_ssid(s_wifi_list.wifis[i].ssid, esc, sizeof(esc));
+        snprintf(buf, sizeof(buf), "\"%s\"%s", esc, (i < s_wifi_list.count - 1) ? "," : "");
         httpd_resp_send_chunk(req, buf, strlen(buf));
     }
     httpd_resp_send_chunk(req, "]", 1);
@@ -549,12 +611,16 @@ static esp_err_t saved_wifis_get_handler(httpd_req_t *req)
 
 static esp_err_t del_wifi_post_handler(httpd_req_t *req)
 {
-    if (!portal_auth_ok(req)) return send_401_basic(req);
+    if (!portal_auth_section(req, "wifi")) {
+        httpd_resp_set_status(req, "403 Forbidden");
+        return httpd_resp_sendstr(req, "Forbidden");
+    }
     char buf[128];
-    int rlen = httpd_req_recv(req, buf, sizeof(buf) - 1);
-    if (rlen <= 0) return ESP_FAIL;
-    buf[rlen] = '\0';
-    
+    int rlen = portal_recv_small_body(req, buf, sizeof(buf));
+    if (rlen <= 0) {
+        return ESP_FAIL;
+    }
+
     char ssid[32] = {0};
     if (form_get(buf, "ssid", ssid, sizeof(ssid)) == 0 && ssid[0] != '\0') {
         wifi_list_remove(ssid);
@@ -567,7 +633,10 @@ static esp_err_t del_wifi_post_handler(httpd_req_t *req)
 
 static esp_err_t save_azure_post_handler(httpd_req_t *req)
 {
-    if (!portal_auth_ok(req)) return send_401_basic(req);
+    if (!portal_auth_section(req, "azure")) {
+        httpd_resp_set_status(req, "403 Forbidden");
+        return httpd_resp_sendstr(req, "Forbidden");
+    }
 
     char buf[384];
     int rlen = httpd_req_recv(req, buf, sizeof(buf) - 1);
@@ -578,23 +647,38 @@ static esp_err_t save_azure_post_handler(httpd_req_t *req)
     (void)form_get(buf, "azure_host", host, sizeof(host));
     (void)form_get(buf, "azure_devid", devid, sizeof(devid));
     (void)form_get(buf, "azure_sas_key", sas, sizeof(sas));
+    normalize_azure_host(host);
+
+    if (host[0] == '\0' || devid[0] == '\0') {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_sendstr(req, "HostName và Device ID không được để trống!");
+    }
+    if (sas[0] == '\0') {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_sendstr(req, "Cần nhập SAS Key (Primary key)!");
+    }
 
     wifi_cred_t c;
     memset(&c, 0, sizeof(c));
     cred_load(&c); // Giữ info WiFi cũ
+
     c.magic = CRED_MAGIC;
     copy_field(c.azure_host, sizeof(c.azure_host), host);
     copy_field(c.azure_dev, sizeof(c.azure_dev), devid);
     copy_field(c.azure_sas, sizeof(c.azure_sas), sas);
     cred_save(&c);
 
+    app_azure_notify_config_changed();
     httpd_resp_sendstr(req, "OK");
     return ESP_OK;
 }
 
 static esp_err_t clear_azure_post_handler(httpd_req_t *req)
 {
-    if (!portal_auth_ok(req)) return send_401_basic(req);
+    if (!portal_auth_section(req, "azure")) {
+        httpd_resp_set_status(req, "403 Forbidden");
+        return httpd_resp_sendstr(req, "Forbidden");
+    }
     
     wifi_cred_t c;
     memset(&c, 0, sizeof(c));
@@ -606,14 +690,16 @@ static esp_err_t clear_azure_post_handler(httpd_req_t *req)
     cred_save(&c);
     
     ESP_LOGI(TAG, "Da xoa cau hinh Azure khoi NVS");
+    app_azure_notify_config_changed();
     httpd_resp_sendstr(req, "OK");
     return ESP_OK;
 }
 
 static esp_err_t clear_post_handler(httpd_req_t *req)
 {
-    if (!portal_auth_ok(req)) {
-        return send_401_basic(req);
+    if (!portal_auth_section(req, "wifi")) {
+        httpd_resp_set_status(req, "403 Forbidden");
+        return httpd_resp_sendstr(req, "Forbidden");
     }
     char discard[64];
     if (req->content_len > 0) {
@@ -645,16 +731,21 @@ static esp_err_t clear_post_handler(httpd_req_t *req)
 
 static esp_err_t scans_get_handler(httpd_req_t *req)
 {
-    if (!portal_auth_ok(req)) {
-        return send_401_basic(req);
+    if (!portal_auth_section(req, "log")) {
+        httpd_resp_set_status(req, "403 Forbidden");
+        httpd_resp_set_type(req, "text/html; charset=utf-8");
+        return httpd_resp_sendstr(req,
+                                  "<!DOCTYPE html><html><head><meta charset=utf-8></head><body>"
+                                  "<p>Can nhap PIN muc Nhat ky tren trang chu.</p><p><a href=/ >Ve portal</a></p></body></html>");
     }
     return scan_log_send_html_page(req);
 }
 
 static esp_err_t scan_get_handler(httpd_req_t *req)
 {
-    if (!portal_auth_ok(req)) {
-        return send_401_basic(req);
+    if (!portal_auth_section(req, "wifi")) {
+        httpd_resp_set_status(req, "403 Forbidden");
+        return httpd_resp_sendstr(req, "[]");
     }
     wifi_scan_config_t scan_config = {
         .ssid = 0,
@@ -699,14 +790,14 @@ static esp_err_t start_httpd(void)
     /* /scans dung nhieu buffer tren stack; mac dinh 4096 de tran stack overflow -> reset. */
     cfg.stack_size = 8192;
     cfg.lru_purge_enable = true;
-    cfg.max_uri_handlers = 12;
+    cfg.max_uri_handlers = 24;
 
     if (httpd_start(&s_server, &cfg) != ESP_OK) {
         ESP_LOGE(TAG, "httpd_start");
         return ESP_FAIL;
     }
 
-    httpd_uri_t u_root = { .uri = "/", .method = HTTP_GET, .handler = root_get_handler, .user_ctx = NULL };
+    httpd_uri_t u_root = { .uri = "/", .method = HTTP_GET, .handler = portal_root_get_handler, .user_ctx = NULL };
     httpd_uri_t u_save_w = { .uri = "/save_wifi", .method = HTTP_POST, .handler = save_wifi_post_handler, .user_ctx = NULL };
     httpd_uri_t u_save_a = { .uri = "/save_azure", .method = HTTP_POST, .handler = save_azure_post_handler, .user_ctx = NULL };
     httpd_uri_t u_clear_a = { .uri = "/clear_azure", .method = HTTP_POST, .handler = clear_azure_post_handler, .user_ctx = NULL };
@@ -724,8 +815,97 @@ static esp_err_t start_httpd(void)
     httpd_register_uri_handler(s_server, &u_scanwifi);
     httpd_register_uri_handler(s_server, &u_saved_wifis);
     httpd_register_uri_handler(s_server, &u_del_wifi);
-    ESP_LOGI(TAG, "Web: http://192.168.4.1/ va /scans (Basic auth user=%s)", PORTAL_WEB_USER);
+    portal_web_register_handlers(s_server);
+    ESP_LOGI(TAG, "Web: http://192.168.4.1/ — menu trai, PIN theo muc (AP: %s)", AP_SSID);
     return ESP_OK;
+}
+
+static void time_synced_cb(struct timeval *tv);
+
+static bool wall_time_valid(time_t utc)
+{
+    struct tm t;
+    scan_log_wall_tm(utc, &t);
+    return t.tm_year >= (2020 - 1900);
+}
+
+bool wifi_portal_time_is_valid(void)
+{
+    if (s_time_synced) {
+        return true;
+    }
+    return wall_time_valid(time(NULL));
+}
+
+static esp_err_t sntp_pick_server_api(void *arg)
+{
+    (void)arg;
+    const char *srv = s_ntp_servers[s_ntp_server_idx % (sizeof(s_ntp_servers) / sizeof(s_ntp_servers[0]))];
+    esp_sntp_setservername(0, srv);
+    return ESP_OK;
+}
+
+static void sntp_rotate_server(void)
+{
+    s_ntp_server_idx = (uint8_t)((s_ntp_server_idx + 1u) % (sizeof(s_ntp_servers) / sizeof(s_ntp_servers[0])));
+    (void)esp_netif_tcpip_exec(sntp_pick_server_api, NULL);
+}
+
+static void sntp_start_or_restart(void)
+{
+    if (!s_sntp_started) {
+        const char *srv = s_ntp_servers[s_ntp_server_idx % (sizeof(s_ntp_servers) / sizeof(s_ntp_servers[0]))];
+        esp_sntp_config_t cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG(srv);
+        cfg.sync_cb = time_synced_cb;
+        cfg.start = true;
+        esp_err_t e = esp_netif_sntp_init(&cfg);
+        if (e == ESP_OK) {
+            s_sntp_started = true;
+            ESP_LOGI(TAG, "SNTP: %s (co %u may chu du phong)", srv,
+                     (unsigned)(sizeof(s_ntp_servers) / sizeof(s_ntp_servers[0])));
+        } else {
+            ESP_LOGW(TAG, "esp_netif_sntp_init: %s", esp_err_to_name(e));
+        }
+        return;
+    }
+    sntp_rotate_server();
+    esp_err_t e = esp_netif_sntp_start();
+    if (e != ESP_OK) {
+        ESP_LOGW(TAG, "esp_netif_sntp_start: %s", esp_err_to_name(e));
+    } else {
+        ESP_LOGI(TAG, "SNTP retry: %s", s_ntp_servers[s_ntp_server_idx % (sizeof(s_ntp_servers) / sizeof(s_ntp_servers[0]))]);
+    }
+}
+
+/** Thu lai SNTP neu mat mang / AP+STA route sai luc boot. */
+static void sntp_retry_task(void *arg)
+{
+    (void)arg;
+    s_sntp_retry_task_live = false;
+    for (int i = 0; i < 20 && !s_time_synced; i++) {
+        vTaskDelay(pdMS_TO_TICKS(15000));
+        if (s_time_synced || s_wifi_conn_status != WIFI_STATUS_CONNECTED) {
+            break;
+        }
+        ESP_LOGW(TAG, "SNTP chua dong bo, thu lai (%d/20)...", i + 1);
+        sntp_start_or_restart();
+    }
+    if (!s_time_synced) {
+        ESP_LOGW(TAG, "SNTP khong dong bo — kiem tra mang / firewall UDP 123");
+    }
+    vTaskDelete(NULL);
+}
+
+static void schedule_sntp_retry(void)
+{
+    if (s_time_synced || s_sntp_retry_task_live) {
+        return;
+    }
+    s_sntp_retry_task_live = true;
+    if (xTaskCreate(sntp_retry_task, "sntp_retry", 3072, NULL, 3, NULL) != pdPASS) {
+        s_sntp_retry_task_live = false;
+        ESP_LOGW(TAG, "Khong tao duoc task sntp_retry");
+    }
 }
 
 /** Sau khi NTP cap nhat — dung scan_log_wall_tm, khong localtime_r (tranh getenv tren task SNTP). */
@@ -733,6 +913,11 @@ static void time_synced_cb(struct timeval *tv)
 {
     (void)tv;
     time_t now = time(NULL);
+    if (!wall_time_valid(now)) {
+        ESP_LOGW(TAG, "SNTP callback nhung time() chua hop le (%lld)", (long long)now);
+        return;
+    }
+    s_time_synced = true;
     struct tm t;
     scan_log_wall_tm(now, &t);
     ESP_LOGI(TAG, "NTP ok, Real time: %04d-%02d-%02d %02d:%02d:%02d",
@@ -748,27 +933,31 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
         const wifi_event_sta_disconnected_t *d = (const wifi_event_sta_disconnected_t *)ev;
         int reason = d ? (int)d->reason : -1;
         ESP_LOGW(TAG, "STA mat ket noi, reason=%d", reason);
+        s_wifi_conn_status = WIFI_STATUS_FAIL;
         schedule_sta_reconnect();
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         s_sta_reconnect_count = 0;
         sta_current_idx_save();
+        s_wifi_conn_status = WIFI_STATUS_CONNECTED;
+        if (s_pending_ssid[0]) {
+            wifi_list_add(s_pending_ssid, s_pending_pass);
+            s_pending_ssid[0] = '\0';
+        }
         ESP_LOGI(TAG, "STA da co IP");
-        if (!s_sntp_started) {
-            esp_sntp_config_t cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG("vn.pool.ntp.org");
-            cfg.sync_cb = time_synced_cb;
-            esp_err_t e = esp_netif_sntp_init(&cfg);
-            if (e == ESP_OK) {
-                s_sntp_started = true;
-                ESP_LOGI(TAG, "SNTP: vn.pool.ntp.org + DHCP");
-            } else {
-                ESP_LOGW(TAG, "esp_netif_sntp_init: %s", esp_err_to_name(e));
-            }
+        /* AP+STA: route NTP/Internet qua STA, khong qua softAP 192.168.4.x */
+        if (s_sta_netif) {
+            esp_netif_set_default_netif(s_sta_netif);
+        }
+        if (!s_time_synced) {
+            sntp_start_or_restart();
+            schedule_sntp_retry();
         }
     }
 }
 
 esp_err_t wifi_portal_start(void)
 {
+    app_login_pin_init();
     ESP_ERROR_CHECK(esp_netif_init());
     /*
      * Viet Nam UTC+7: tren newlib ESP dung "UTC-7" (giong test IDF: "UTC-8" = UTC+8).
@@ -778,7 +967,7 @@ esp_err_t wifi_portal_start(void)
     tzset();
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     esp_netif_create_default_wifi_ap();
-    esp_netif_create_default_wifi_sta();
+    s_sta_netif = esp_netif_create_default_wifi_sta();
 
     wifi_init_config_t icfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&icfg));
@@ -819,4 +1008,40 @@ esp_err_t wifi_portal_start(void)
     }
 
     return start_httpd();
+}
+
+/* ----------------------------------------------------------------
+ * Brand text (chữ thương hiệu trên màn idle) — NVS key "brand_txt"
+ * ---------------------------------------------------------------- */
+#define BRAND_NVS_KEY "brand_txt"
+#define BRAND_DEFAULT "MEBIECO"
+#define BRAND_MAX_LEN 15  /* không kể '\0' */
+
+void wifi_portal_get_brand_text(char *out, size_t sz)
+{
+    if (!out || sz == 0) return;
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READONLY, &h) == ESP_OK) {
+        size_t bl = sz;
+        esp_err_t e = nvs_get_str(h, BRAND_NVS_KEY, out, &bl);
+        nvs_close(h);
+        if (e == ESP_OK && out[0] != '\0') return;
+    }
+    /* Fallback */
+    snprintf(out, sz, "%s", BRAND_DEFAULT);
+}
+
+esp_err_t wifi_portal_set_brand_text(const char *txt)
+{
+    if (!txt) return ESP_ERR_INVALID_ARG;
+    /* Cắt tối đa BRAND_MAX_LEN ký tự */
+    char tmp[BRAND_MAX_LEN + 1];
+    snprintf(tmp, sizeof(tmp), "%s", txt);
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NVS_NS, NVS_READWRITE, &h);
+    if (err != ESP_OK) return err;
+    err = nvs_set_str(h, BRAND_NVS_KEY, tmp);
+    if (err == ESP_OK) err = nvs_commit(h);
+    nvs_close(h);
+    return err;
 }

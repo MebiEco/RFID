@@ -82,4 +82,6 @@ C:/esp/RFID/build/esp-idf/spiffs/libspiffs.a
 C:/esp/RFID/build/esp-idf/touch_element/libtouch_element.a
 C:/esp/RFID/build/esp-idf/usb/libusb.a
 C:/esp/RFID/build/esp-idf/wifi_provisioning/libwifi_provisioning.a
+C:/esp/RFID/build/esp-idf/espressif__esp_lcd_ili9341/libespressif__esp_lcd_ili9341.a
+C:/esp/RFID/build/esp-idf/lvgl__lvgl/liblvgl__lvgl.a
 C:/esp/RFID/build/esp-idf/main/libmain.a

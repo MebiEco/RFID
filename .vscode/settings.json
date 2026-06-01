@@ -5,7 +5,7 @@
     },
     "cmake.sourceDirectory": "C:/esp/RFID/main",
     "idf.flashType": "UART",
-    "idf.portWin": "COM5",
+    "idf.portWin": "COM6",
     "idf.openOcdConfigs": [
         "board/esp32s3-builtin.cfg"
     ]

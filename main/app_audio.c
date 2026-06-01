@@ -10,26 +10,47 @@
 #include "freertos/queue.h"
 
 #include "esp_check.h"
-#include "esp_heap_caps.h"
 #include "esp_log.h"
 
 #include "driver/i2s_std.h"
 
 #include "board_pins.h"
 #include "sd_card.h"
+#include "nvs_flash.h"
+#include "nvs.h"
 
 static const char *TAG = "app_audio";
 
+static uint8_t s_vol_pct = 100;
+
+void app_audio_set_volume(uint8_t vol_pct)
+{
+    if (vol_pct > 100) vol_pct = 100;
+    s_vol_pct = vol_pct;
+    nvs_handle_t h;
+    if (nvs_open("wifi_portal", NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u8(h, "vol_pct", s_vol_pct);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
+
+uint8_t app_audio_get_volume(void)
+{
+    return s_vol_pct;
+}
+
 #define AUDIO_QUEUE_DEPTH   4
-/* Stack: play_wav — raw lớn + FatFS/stdio; giữ 16K+ an toàn */
-/* Bộ đệm PCM/ stereo cấp phát trên heap — stack chỉ cần cho gọi FatFS/stdio */
-#define AUDIO_TASK_STACK    8192
+/* Stack: play_wav — raw lớn + FatFS/stdio; tăng lên 16K+ để đẩy sang PSRAM */
+#define AUDIO_TASK_STACK    16384
 
 /**
  * Đọc mỗi lần từ SD (byte PCM).
  * Mono: 2048 B = 1024 mẫu → 2048 int16 stereo. Stereo: 4096 B = 1024 frame LR → stereo[2048].
  */
 #define RAW_PCM_MAX_BYTES 4096
+/** Tối đa mẫu stereo ra I2S mỗi chunk (mono 1024 mẫu → 2048 halfword). */
+#define STEREO_SAMPLES_MAX 2048
 
 typedef struct {
     char path[128];
@@ -38,6 +59,14 @@ typedef struct {
 static QueueHandle_t s_audio_q;
 static i2s_chan_handle_t s_tx_chan;
 static uint32_t s_open_rate_hz;
+
+/*
+ * Bộ đệm PCM cố định — tránh malloc(MALLOC_CAP_INTERNAL) khi heap nội đã căng
+ * (WiFi/LCD/Azure) gây "Het RAM dem PCM". Task audio chỉ xử lý tuần tự một file.
+ */
+/* Bộ đệm PCM cố định — chuyển sang SPIRAM để tiết kiệm 8KB RAM nội bộ. */
+static EXT_RAM_ATTR uint8_t s_pcm_raw[RAW_PCM_MAX_BYTES];
+static EXT_RAM_ATTR int16_t s_pcm_stereo[STEREO_SAMPLES_MAX];
 
 static void audio_i2s_teardown(void)
 {
@@ -265,20 +294,8 @@ static esp_err_t play_wav_file(const char *path)
     }
 
     const size_t frame_bytes = (size_t)(bits / 8u) * (size_t)ch;
-    uint8_t *raw = (uint8_t *)heap_caps_malloc(RAW_PCM_MAX_BYTES, MALLOC_CAP_INTERNAL);
-    int16_t *stereo = (int16_t *)heap_caps_malloc(2048u * sizeof(int16_t), MALLOC_CAP_INTERNAL);
-    if (!raw || !stereo) {
-        ESP_LOGE(TAG, "Het RAM dem PCM (raw/stereo)");
-        if (raw) {
-            heap_caps_free(raw);
-        }
-        if (stereo) {
-            heap_caps_free(stereo);
-        }
-        fclose(f);
-        sd_card_unlock();
-        return ESP_ERR_NO_MEM;
-    }
+    uint8_t *raw = s_pcm_raw;
+    int16_t *stereo = s_pcm_stereo;
 
     size_t remaining = data_len;
     esp_err_t out_err = ESP_OK;
@@ -312,15 +329,28 @@ static esp_err_t play_wav_file(const char *path)
         size_t samples_in = got / frame_bytes;
         size_t out_bytes;
 
-        // GIẢM ÂM LƯỢNG SỐ: Chia 2 (hoặc 4) để giảm biên độ, tránh ampli MAX98357A bị vỡ tiếng (clipping) do quá tải.
-        // Nếu âm thanh quá nhỏ, bạn có thể thử đổi thành `val = (mono[i] * 3) / 4` (giảm 25%).
+        if (ch == 1u && samples_in > (STEREO_SAMPLES_MAX / 2u)) {
+            ESP_LOGE(TAG, "PCM mono vuot dem tinh (%u)", (unsigned)samples_in);
+            out_err = ESP_ERR_INVALID_SIZE;
+            break;
+        }
+        if (ch != 1u && samples_in * 2u > STEREO_SAMPLES_MAX) {
+            ESP_LOGE(TAG, "PCM stereo vuot dem tinh (%u)", (unsigned)samples_in);
+            out_err = ESP_ERR_INVALID_SIZE;
+            break;
+        }
+
         if (ch == 1u) {
-            const int16_t *mono = (const int16_t *) (const void *) raw;
+            const int16_t *mono = (const int16_t *)(const void *)raw;
             for (size_t i = 0; i < samples_in; i++) {
-                // Tăng x1.5 bằng số nguyên (nhân 3 chia 2) để CPU xử lý cực nhanh, không bị giật loa
-                int32_t temp = ((int32_t)mono[i] * 3) / 2; 
-                if (temp > 32767) temp = 32767;
-                if (temp < -32768) temp = -32768;
+                int32_t temp = ((int32_t)mono[i] * (int32_t)BOARD_AUDIO_PCM_GAIN_NUM * s_vol_pct) /
+                               ((int32_t)BOARD_AUDIO_PCM_GAIN_DEN * 100);
+                if (temp > 32767) {
+                    temp = 32767;
+                }
+                if (temp < -32768) {
+                    temp = -32768;
+                }
                 int16_t val = (int16_t)temp;
                 stereo[i * 2u] = val;
                 stereo[i * 2u + 1u] = val;
@@ -329,9 +359,14 @@ static esp_err_t play_wav_file(const char *path)
         } else {
             const int16_t *src = (const int16_t *)(const void *)raw;
             for (size_t i = 0; i < samples_in * 2u; i++) {
-                int32_t temp = ((int32_t)src[i] * 3) / 2;
-                if (temp > 32767) temp = 32767;
-                if (temp < -32768) temp = -32768;
+                int32_t temp = ((int32_t)src[i] * (int32_t)BOARD_AUDIO_PCM_GAIN_NUM * s_vol_pct) /
+                               ((int32_t)BOARD_AUDIO_PCM_GAIN_DEN * 100);
+                if (temp > 32767) {
+                    temp = 32767;
+                }
+                if (temp < -32768) {
+                    temp = -32768;
+                }
                 stereo[i] = (int16_t)temp;
             }
             out_bytes = got;
@@ -351,8 +386,6 @@ static esp_err_t play_wav_file(const char *path)
         }
     }
 
-    heap_caps_free(raw);
-    heap_caps_free(stereo);
     fclose(f);
     sd_card_unlock();
     return out_err;
@@ -387,6 +420,11 @@ void app_audio_start(void)
     if (s_audio_q) {
         return;
     }
+    nvs_handle_t h;
+    if (nvs_open("wifi_portal", NVS_READONLY, &h) == ESP_OK) {
+        nvs_get_u8(h, "vol_pct", &s_vol_pct);
+        nvs_close(h);
+    }
     s_audio_q = xQueueCreate(AUDIO_QUEUE_DEPTH, sizeof(audio_msg_t));
     if (!s_audio_q) {
         ESP_LOGE(TAG, "xQueueCreate thất bại");
@@ -399,8 +437,10 @@ void app_audio_start(void)
         s_audio_q = NULL;
         return;
     }
-    ESP_LOGI(TAG, "San sang I2S TX — BCLK=%d LRC=%d DIN=%d (max 1.wav: %s)", (int)BOARD_I2S_BCLK_GPIO,
-             (int)BOARD_I2S_WS_GPIO, (int)BOARD_I2S_DOUT_GPIO, BOARD_SD_AUDIO_1_WAV);
+    ESP_LOGI(TAG, "San sang I2S TX — BCLK=%d LRC=%d DIN=%d | loa %dΩ %.1fW gain %d/%d",
+             (int)BOARD_I2S_BCLK_GPIO, (int)BOARD_I2S_WS_GPIO, (int)BOARD_I2S_DOUT_GPIO,
+             BOARD_SPEAKER_OHM, (float)BOARD_SPEAKER_POWER_W_x10 / 10.f, BOARD_AUDIO_PCM_GAIN_NUM,
+             BOARD_AUDIO_PCM_GAIN_DEN);
 }
 
 esp_err_t app_audio_queue_wav(const char *path)
@@ -421,6 +461,15 @@ esp_err_t app_audio_queue_wav(const char *path)
         return ESP_ERR_NO_MEM;
     }
     return ESP_OK;
+}
+
+void app_audio_play_confirm(void)
+{
+#if BOARD_ENABLE_AUDIO
+    (void)app_audio_queue_wav(BOARD_SD_AUDIO_4_WAV);
+#else
+    (void)0;
+#endif
 }
 
 #if BOARD_ENABLE_AUDIO && BOARD_AUDIO_STRESS_TEST

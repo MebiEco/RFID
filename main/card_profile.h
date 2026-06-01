@@ -17,16 +17,20 @@ esp_err_t card_profile_lookup(const char *uid_hex_nocolon, char *name_out, size_
 /** Ghi lai Name va ID vao file profile (giu nguyen dong UID:). */
 esp_err_t card_profile_save(const char *uid_hex_nocolon, const char *name, const char *id);
 
-/** Xoa file profile. */
+/** Xoa profile + anh; bo UID trong /sdcard/checkin/YYMMDD.txt (lan quet sau = check-in moi). Check-in chi ghi khi quet the da dang ky (app_rfid). */
 esp_err_t card_profile_delete(const char *uid_hex_nocolon);
+
+/** Xoa tat ca the (profiles + anh) */
+void card_profile_delete_all(void);
 
 #define CARD_PROFILE_LIST_MAX 20
 /** So dong hien thi tren mot trang man hinh danh sach the (LCD). */
-#define CARD_PROFILE_PAGE_ROWS 5
+#define CARD_PROFILE_PAGE_ROWS 4
 typedef struct {
     char uid[20];
     char name[48];
     char id[48];
+    char date[24];
     bool registered;
 } CardProfileEntry_t;
 

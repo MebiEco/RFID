@@ -16,6 +16,8 @@
 #endif
 #if BOARD_ENABLE_LCD
 #include "lcd_ui.h"
+#include "lcd_panel_config.h"
+#include "lv_port.h"
 #endif
 #if BOARD_ENABLE_RFID
 #include "mfrc522.h"
@@ -38,20 +40,20 @@ static const char *TAG = "main";
 void app_main(void)
 {
     esp_reset_reason_t rr = esp_reset_reason();
-    const char *rrs = "khac";
-    switch (rr) {
-    case ESP_RST_POWERON: rrs = "BAT_NGUON"; break;
-    case ESP_RST_SW: rrs = "PHAN_MEM(Monitor/ota/esp_restart...)"; break;
-    case ESP_RST_PANIC: rrs = "PANIC/CRASH"; break;
-    case ESP_RST_INT_WDT: rrs = "INT_WDT"; break;
-    case ESP_RST_TASK_WDT: rrs = "TASK_WDT"; break;
-    case ESP_RST_WDT: rrs = "WDT"; break;
-    case ESP_RST_BROWNOUT: rrs = "BROWNOUT(nguon_yeu)"; break;
-    case ESP_RST_USB: rrs = "USB"; break;
-    case ESP_RST_DEEPSLEEP: rrs = "DEEPSLEEP"; break;
-    default: break;
-    }
-    ESP_LOGI(TAG, "Reset reason: %s (%d)", rrs, (int)rr);
+    // const char *rrs = "khac";
+    // switch (rr) {
+    // case ESP_RST_POWERON: rrs = "BAT_NGUON"; break;
+    // case ESP_RST_SW: rrs = "PHAN_MEM(Monitor/ota/esp_restart...)"; break;
+    // case ESP_RST_PANIC: rrs = "PANIC/CRASH"; break;
+    // case ESP_RST_INT_WDT: rrs = "INT_WDT"; break;
+    // case ESP_RST_TASK_WDT: rrs = "TASK_WDT"; break;
+    // case ESP_RST_WDT: rrs = "WDT"; break;
+    // case ESP_RST_BROWNOUT: rrs = "BROWNOUT(nguon_yeu)"; break;
+    // case ESP_RST_USB: rrs = "USB"; break;
+    // case ESP_RST_DEEPSLEEP: rrs = "DEEPSLEEP"; break;
+    // default: break;
+    // }
+    // ESP_LOGI(TAG, "Reset reason: %s (%d)", rrs, (int)rr);
 
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) { 
@@ -60,15 +62,19 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
+#if BOARD_ENABLE_LCD
+    ESP_ERROR_CHECK(lcd_panel_config_init());
+#endif
+
 #if BOARD_ENABLE_WIFI
     /* Bớt log dư (ADDBA, wpa, phy...) — chỉ còn ERROR+ cho các tag ồn hệ thống */
-    esp_log_level_set("wifi", ESP_LOG_ERROR);
-    esp_log_level_set("wpa", ESP_LOG_ERROR);
-    esp_log_level_set("wifi_init", ESP_LOG_ERROR);
-    esp_log_level_set("esp_netif", ESP_LOG_WARN);
-    esp_log_level_set("esp_netif_handlers", ESP_LOG_WARN);
-    esp_log_level_set("phy", ESP_LOG_ERROR);
-    esp_log_level_set("pp", ESP_LOG_WARN);
+    // esp_log_level_set("wifi", ESP_LOG_ERROR);
+    // esp_log_level_set("wpa", ESP_LOG_ERROR);
+    // esp_log_level_set("wifi_init", ESP_LOG_ERROR);
+    // esp_log_level_set("esp_netif", ESP_LOG_WARN);
+    // esp_log_level_set("esp_netif_handlers", ESP_LOG_WARN);
+    // esp_log_level_set("phy", ESP_LOG_ERROR);
+    // esp_log_level_set("pp", ESP_LOG_WARN);
 #endif
 
 #if BOARD_ENABLE_LCD
@@ -78,8 +84,11 @@ void app_main(void)
         return;
     }
     
-    lcd_ui_show_centered("MAY CHAM CONG");
-    vTaskDelay(pdMS_TO_TICKS(500));
+    // Tạm thời ẩn giao diện cũ
+    // vTaskDelay(pdMS_TO_TICKS(500));
+
+    // Khởi tạo LVGL và truyền panel vào
+    lv_port_init(lcd_ui_get_panel());
 #endif
 
     /**

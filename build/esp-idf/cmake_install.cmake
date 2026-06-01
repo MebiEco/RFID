@@ -544,6 +544,21 @@ endif()
 
 if(NOT CMAKE_INSTALL_LOCAL_ONLY)
   # Include the install script for the subdirectory.
+  include("C:/esp/RFID/build/esp-idf/espressif__cmake_utilities/cmake_install.cmake")
+endif()
+
+if(NOT CMAKE_INSTALL_LOCAL_ONLY)
+  # Include the install script for the subdirectory.
+  include("C:/esp/RFID/build/esp-idf/espressif__esp_lcd_ili9341/cmake_install.cmake")
+endif()
+
+if(NOT CMAKE_INSTALL_LOCAL_ONLY)
+  # Include the install script for the subdirectory.
+  include("C:/esp/RFID/build/esp-idf/lvgl__lvgl/cmake_install.cmake")
+endif()
+
+if(NOT CMAKE_INSTALL_LOCAL_ONLY)
+  # Include the install script for the subdirectory.
   include("C:/esp/RFID/build/esp-idf/main/cmake_install.cmake")
 endif()
 

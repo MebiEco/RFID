@@ -21,7 +21,7 @@ void app_rfid_start(void);
 void app_login_pin_init(void);
 /** Dang nhap: neu da luu PIN trong NVS thi chi khop chuoi luu; neu chua thi chap nhan ADMIN hoac 1234. */
 bool app_login_verify_pin(const char *entered);
-/** Luu PIN moi (sau khi da xac minh mat khau cu trong touch_task). */
+/** Luu PIN moi (sau khi da xac minh mat khau cu). */
 esp_err_t app_login_save_new_pin(const char *new_pin);
 
 extern int g_ui_state;
@@ -48,6 +48,12 @@ extern char g_edit_name[48];       // Ten dang nhap
 extern char g_edit_id[48];         // Ma dang nhap
 extern int g_edit_field;           // 0=Name, 1=ID
 extern int g_edit_from_state;      // 9=doi the, 10=them moi
+
+extern int   g_confirm_type;
+extern int   g_confirm_from_state;
+extern char  g_confirm_arg_str[64];
+extern char  g_confirm_arg_str2[64];
+extern bool  g_force_ui_update;
 
 #ifdef __cplusplus
 }

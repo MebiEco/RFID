@@ -1,7 +1,7 @@
 # Bảng phân vùng tùy chỉnh
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
-# Flash thực tế thường 8–16MB; 2MB sẽ không đủ cho factory + spiffs
+# Flash 16MB: factory trong partitions.csv = 3MiB (đủ đệm app LVGL); spiffs 1MiB.
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
 
@@ -14,3 +14,32 @@ CONFIG_SPIRAM_IGNORE_NOTFOUND=y
 CONFIG_SPIRAM_SPEED_80M=y
 CONFIG_SPIRAM_USE_CAPS_ALLOC=y
 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384
+# Giữ thêm RAM nội cho WiFi/DMA/TLS (tránh malloc PSRAM cho buffer nhạy DMA).
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=65536
+# main chạy app_start + nhiều init; mặc định 3584 dễ chậm stack khi gọi sâu (FatFS, UI).
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+# Pool LVGL riêng (widget + style); 32KB có thể chật khi nhiều màn.
+CONFIG_LV_MEM_SIZE_KILOBYTES=48
+# Task WDT: tăng timeout 15s (mặc định 5s) — lvgl_task có thể kẹt SPI flush lâu khi WiFi/SD tranh tài nguyên.
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=15
+# LV_COLOR_16_SWAP: tắt — driver ili9488 đã xử lý đúng thứ tự byte qua BOARD_LCD_COLOR_PIPELINE_BGR.
+# Bật đồng thời cả hai gây "double swap" → màu bị lệch (xanh → vàng/xanh lá).
+# CONFIG_LV_COLOR_16_SWAP is not set
+
+# Azure IoT Hub vẫn có hub dùng chuỗi Baltimore/DigiCert cũ — bật thêm CA deprecated
+# trong bundle để esp_crt_bundle_attach verify được (tránh PK verify failed / -0x3000).
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEPRECATED_LIST=y
+
+# TLS Azure MQTT: sau "Certificate verified" handshake có thể fail -0x2880 (X509_ALLOC_FAILED)
+# do heap nội bộ thấp. Giữ peer cert và buffer SSL cố định 16k + UI/SD dễ hết RAM.
+CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
+# CONFIG_MBEDTLS_SSL_KEEP_PEER_CERTIFICATE is not set
+
+# Man hinh 2.8": GMT028 (mac dinh) hoac ILI9341 legacy — doi trong menuconfig "Man hinh LCD"
+CONFIG_LCD_PANEL_GMT028_28=y
+# CONFIG_LCD_PANEL_ILI9341_LEGACY_28 is not set
+
+# Cho phép cập nhật firmware qua giao thức HTTP thường
+CONFIG_OTA_ALLOW_HTTP=y
+CONFIG_ESP_HTTPS_OTA_ALLOW_HTTP=y
+

@@ -1,3 +1,20 @@
+menu "Man hinh LCD"
+
+    choice LCD_PANEL_PROFILE
+        prompt "Loai man hinh (chon roi build + flash)"
+        default LCD_PANEL_GMT028_28
+        help
+            Hai man 2.8" 320x240 ngang — cung day SPI (39 CLK, 40 MOSI, 9 DC, 10 CS, 8 RST).
+            Doi man: chon profile tuong ung, build lai. Khong tu nhan khi cắm.
+
+        config LCD_PANEL_GMT028_28
+            bool "GMT028 2.8\" ILI9341 IPS (man moi)"
+        config LCD_PANEL_ILI9341_LEGACY_28
+            bool "ILI9341 2.8\" generic (cau hinh cu truoc GMT028)"
+    endchoice
+
+endmenu
+
 menu "SD / SPIFFS WAV"
     config USE_SPIFFS_WAV
         bool "Phat WAV tu SPIFFS (khong can the SD)"

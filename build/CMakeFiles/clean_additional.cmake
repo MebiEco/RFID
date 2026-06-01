@@ -5,6 +5,7 @@ if("${CONFIG}" STREQUAL "" OR "${CONFIG}" STREQUAL "")
   file(REMOVE_RECURSE
   "RFID.bin"
   "RFID.map"
+  "azure_iot_ca.pem.S"
   "bootloader\\bootloader.bin"
   "bootloader\\bootloader.elf"
   "bootloader\\bootloader.map"

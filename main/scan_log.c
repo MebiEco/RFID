@@ -6,6 +6,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "app_azure.h"
 #include "board_pins.h"
 #include "lcd_ui.h"
 #include "esp_http_server.h"
@@ -14,24 +15,46 @@
 #include "freertos/semphr.h"
 #include "nvs.h"
 #include "sd_card.h"
+#include "esp_task_wdt.h"
+#include "lv_port.h"
 #include <sys/stat.h>
 
 static const char *TAG = "scan_log";
 
-/** Chi giu dong log trong khoang ngay nay (gio UTC + offset hien thi), tranh day SD. */
+static int scan_log_row_event_code(int reg, bool is_admin, const char *admin_act)
+{
+    if (is_admin) {
+        if (admin_act && strcmp(admin_act, "SAVE") == 0) {
+            return 603;
+        }
+        if (admin_act && strcmp(admin_act, "DEL") == 0) {
+            return 604;
+        }
+        return 0;
+    }
+    if (reg == 1) {
+        return 602;
+    }
+    if (reg == 0) {
+        return 601;
+    }
+    return 0;
+}
+
+/** Chi giữ nhật ký trong vòng 60 ngày, tránh đầy thẻ SD nhưng vẫn đảm bảo lịch sử. */
 #define SCAN_LOG_KEEP_DAYS 60
 #define SCAN_LOG_KEEP_SEC ((time_t)(SCAN_LOG_KEEP_DAYS * 86400))
-/** Khong quet lai toan bo file qua thuong xuyen (ms moi lan quet). */
+/** Tăng giới hạn dung lượng lên 10MB để ưu tiên giữ đủ 60 ngày. */
+#define SCAN_LOG_TRIM_FORCE_BYTES ((off_t)(10 * 1024 * 1024))
+/** Không quét lại toàn bộ file quá thường xuyên (giây mỗi lần quét). */
 #define SCAN_LOG_TRIM_INTERVAL_SEC (6 * 3600)
-/** Neu file vuot ngay thich — cat bat ky luc nao. */
-#define SCAN_LOG_TRIM_FORCE_BYTES ((off_t)(1536 * 1024))
 
 static time_t s_scan_log_last_trim_sec;
 
 /** Hang doi tam khi khong ghi duoc SD — luu tren NVS, flush FIFO khi SD mount. */
 #define SCAN_PEND_NVS_NS "scan_pend"
 #define SCAN_PEND_NVS_KEY "q"
-#define SCAN_PEND_MAGIC 0x51455244u /* 'QERD' v1 queue */
+#define SCAN_PEND_MAGIC 0x51455245u /* 'QERE' v2 queue with index */
 #define SCAN_PEND_MAX 32
 
 typedef struct {
@@ -40,6 +63,7 @@ typedef struct {
     char id[48];
     int32_t registered;
     int64_t utc_sec;
+    int32_t index;
 } scan_pend_rec_t;
 
 typedef struct {
@@ -94,6 +118,32 @@ static void sanitize_field(const char *in, char *out, size_t outsz)
         }
     }
     out[j] = '\0';
+}
+
+static void csv_strip_line_end(char *buf)
+{
+    if (!buf) {
+        return;
+    }
+    char *nl = strchr(buf, '\n');
+    if (nl) {
+        *nl = '\0';
+    }
+    char *cr = strchr(buf, '\r');
+    if (cr) {
+        *cr = '\0';
+    }
+}
+
+static void csv_strip_field_cr(char *fld)
+{
+    if (!fld) {
+        return;
+    }
+    char *cr = strchr(fld, '\r');
+    if (cr) {
+        *cr = '\0';
+    }
 }
 
 static void format_ts_from_utc(time_t utc, char *ts, size_t ts_len)
@@ -184,6 +234,12 @@ static void scan_log_do_trim(bool bypass_rate_limit)
     size_t dropped = 0;
     size_t kept    = 0;
     while (fgets(buf, sizeof(buf), in)) {
+        /* Feed watchdog mỗi khi đọc/ghi một dòng để tránh trigger TWDT khi file log lớn (>10MB) */
+        lv_port_feed_wdt();
+        if (esp_task_wdt_status(NULL) == ESP_OK) {
+            esp_task_wdt_reset();
+        }
+
         if (log_line_kept(buf, cutoff_ts)) {
             if (fputs(buf, out) == EOF) {
                 ESP_LOGW(TAG, "trim: ghi tmp that bai");
@@ -236,7 +292,7 @@ static void scan_log_do_trim(bool bypass_rate_limit)
 
 /** Ghi mot dong vao CSV; tra ve true neu ghi va fsync ok. */
 static bool write_one_csv_line(time_t event_utc, const char *uid_hex, const char *name, const char *id,
-                               int registered)
+                               int registered, int32_t index)
 {
     char ts[40];
     format_ts_from_utc(event_utc, ts, sizeof(ts));
@@ -256,7 +312,7 @@ static bool write_one_csv_line(time_t event_utc, const char *uid_hex, const char
         return false;
     }
 
-    if (fprintf(fp, "%s|%s|%s|%s|%d\n", ts, uid_s, ns, ids, registered) < 0) {
+    if (fprintf(fp, "%s|%s|%s|%s|%d|%ld\n", ts, uid_s, ns, ids, registered, (long)index) < 0) {
         ESP_LOGW(TAG, "fprintf log: %s", strerror(errno));
         fclose(fp);
         sd_card_unlock();
@@ -271,7 +327,7 @@ static bool write_one_csv_line(time_t event_utc, const char *uid_hex, const char
     }
     fclose(fp);
     sd_card_unlock();
-    ESP_LOGI(TAG, "Ghi nhat ky: %s UID=%s", ts, uid_s);
+    ESP_LOGI(TAG, "Ghi nhat ky: %s UID=%s index=%ld", ts, uid_s, (long)index);
     scan_log_do_trim(false);
     return true;
 }
@@ -319,7 +375,7 @@ static esp_err_t pend_save(void)
     return err;
 }
 
-static void pending_enqueue(const char *uid_hex, const char *name, const char *id, int registered)
+static void pending_enqueue(const char *uid_hex, const char *name, const char *id, int registered, int32_t index)
 {
     if (!uid_hex || !uid_hex[0]) {
         return;
@@ -351,6 +407,7 @@ static void pending_enqueue(const char *uid_hex, const char *name, const char *i
     }
     r->registered = registered;
     r->utc_sec = (int64_t)time(NULL);
+    r->index = index;
     s_pend_blob.count++;
 
     esp_err_t err = pend_save();
@@ -381,7 +438,7 @@ void scan_log_flush_pending(void)
 
         scan_pend_rec_t *head = &s_pend_blob.rec[0];
         time_t ev = (time_t)head->utc_sec;
-        if (!write_one_csv_line(ev, head->uid, head->name, head->id, (int)head->registered)) {
+        if (!write_one_csv_line(ev, head->uid, head->name, head->id, (int)head->registered, head->index)) {
             break;
         }
 
@@ -400,7 +457,7 @@ void scan_log_flush_pending(void)
     pend_mtx_give();
 }
 
-void scan_log_append(const char *uid_hex, const char *name, const char *id, int registered)
+void scan_log_append(const char *uid_hex, const char *name, const char *id, int registered, int32_t msg_idx)
 {
     if (!uid_hex || !uid_hex[0]) {
         return;
@@ -409,12 +466,12 @@ void scan_log_append(const char *uid_hex, const char *name, const char *id, int 
     time_t ev = time(NULL);
 
     if (sd_card_is_mounted()) {
-        if (write_one_csv_line(ev, uid_hex, name, id, registered)) {
+        if (write_one_csv_line(ev, uid_hex, name, id, registered, msg_idx)) {
             return;
         }
     }
 
-    pending_enqueue(uid_hex, name, id, registered);
+    pending_enqueue(uid_hex, name, id, registered, msg_idx);
 }
 
 static void html_escape(const char *in, char *out, size_t outsz)
@@ -455,6 +512,29 @@ static void html_escape(const char *in, char *out, size_t outsz)
     out[j] = '\0';
 }
 
+static void json_escape(const char *in, char *out, size_t outsz)
+{
+    size_t j = 0;
+    if (!in) {
+        in = "";
+    }
+    for (size_t i = 0; in[i] && j + 2 < outsz; i++) {
+        char c = in[i];
+        if (c == '"' || c == '\\') {
+            if (j + 2 >= outsz) {
+                break;
+            }
+            out[j++] = '\\';
+            out[j++] = c;
+        } else if ((unsigned char)c < 0x20) {
+            continue;
+        } else {
+            out[j++] = c;
+        }
+    }
+    out[j] = '\0';
+}
+
 /** ts dang YYYY-MM-DDThh:mm:ss — loc theo ngay dia phuong */
 static int line_matches_today(const char *ts, const char *today_ymd)
 {
@@ -464,27 +544,54 @@ static int line_matches_today(const char *ts, const char *today_ymd)
     return strncmp(ts, today_ymd, 10) == 0;
 }
 
+static const char SCANS_CSS[] =
+    "<style>"
+    "*{box-sizing:border-box;margin:0;padding:0}"
+    "body{font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#090d16;color:#f3f4f6;padding:24px;line-height:1.5}"
+    "h1{font-size:22px;font-weight:600;margin-bottom:16px;color:#fff;border-bottom:1px solid rgba(255,255,255,0.08);padding-bottom:12px}"
+    ".nav{margin-bottom:16px;display:flex;gap:12px}"
+    ".nav a{color:#6366f1;text-decoration:none;font-size:14px;font-weight:500;transition:color .2s}"
+    ".nav a:hover{color:#8b5cf6}"
+    ".hint{font-size:12px;color:#9ca3af;margin:8px 0 16px}"
+    "table{width:100%;border-collapse:collapse;font-size:13px;max-width:800px;border-radius:8px;overflow:hidden;margin-top:10px}"
+    "th{background:#0f172a;color:#9ca3af;font-weight:600;text-transform:uppercase;font-size:11px;letter-spacing:.5px;padding:12px 16px;text-align:left}"
+    "td{padding:12px 16px;border-bottom:1px solid rgba(255,255,255,0.04);color:#e5e7eb}"
+    "tr:last-child td{border-bottom:none}"
+    "tr:nth-child(even){background:rgba(255,255,255,0.01)}"
+    "tr:hover{background:rgba(255,255,255,0.03)}"
+    ".admin-save{background:rgba(16,185,129,0.08)!important;font-style:italic}"
+    ".admin-del{background:rgba(239,68,68,0.08)!important;font-style:italic}"
+    "code{color:#06b6d4}"
+    "</style>";
+
 esp_err_t scan_log_send_html_page(httpd_req_t *req)
 {
     if (!sd_card_is_mounted()) {
         httpd_resp_set_type(req, "text/html; charset=utf-8");
         return httpd_resp_sendstr(req,
-                                  "<!DOCTYPE html><html><head><meta charset=\"utf-8\"></head><body>"
-                                  "<p>SD chua gan hoac chua mount.</p><p><a href=\"/\">Ve trang chu</a></p></body></html>");
+                                  "<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
+                                  "<meta name=\"viewport\" content=\"width=device-width\">"
+                                  "<style>body{font-family:sans-serif;background:#090d16;color:#f3f4f6;padding:24px;text-align:center}"
+                                  "a{color:#6366f1;text-decoration:none}</style></head><body>"
+                                  "<h3>Thẻ SD chưa gắn hoặc chưa mount.</h3>"
+                                  "<p style=\"margin-top:12px\"><a href=\"/\">Về trang chủ</a></p></body></html>");
     }
 
     bool show_all = false;
     char qry[128];
+    char tok[36] = {0};
     if (httpd_req_get_url_query_str(req, qry, sizeof(qry)) == ESP_OK) {
         char v[8];
         if (httpd_query_key_value(qry, "all", v, sizeof(v)) == ESP_OK && v[0] == '1') {
             show_all = true;
         }
+        httpd_query_key_value(qry, "token", tok, sizeof(tok));
     }
 
     time_t now = time(NULL);
     struct tm tloc;
     scan_log_wall_tm(now, &tloc);
+    const bool time_ok = (tloc.tm_year >= (2020 - 1900));
     char today_ymd[48];
     (void)snprintf(today_ymd, sizeof(today_ymd), "%04d-%02d-%02d", (int)(tloc.tm_year + 1900),
                    (int)(tloc.tm_mon + 1), (int)tloc.tm_mday);
@@ -495,34 +602,61 @@ esp_err_t scan_log_send_html_page(httpd_req_t *req)
         sd_card_unlock();
         httpd_resp_set_type(req, "text/html; charset=utf-8");
         return httpd_resp_sendstr(req,
-                                  "<!DOCTYPE html><html><head><meta charset=\"utf-8\"></head><body>"
-                                  "<p>Chua co file nhat ky. Quet the khi SD da mount.</p>"
-                                  "<p><a href=\"/\">Ve trang chu</a></p></body></html>");
+                                  "<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
+                                  "<meta name=\"viewport\" content=\"width=device-width\">"
+                                  "<style>body{font-family:sans-serif;background:#090d16;color:#f3f4f6;padding:24px;text-align:center}"
+                                  "a{color:#6366f1;text-decoration:none}</style></head><body>"
+                                  "<h3>Chưa có file nhật ký. Quét thẻ khi SD đã mount.</h3>"
+                                  "<p style=\"margin-top:12px\"><a href=\"/\">Về trang chủ</a></p></body></html>");
     }
 
     httpd_resp_set_type(req, "text/html; charset=utf-8");
 
-    char head_buf[900];
-    snprintf(head_buf, sizeof(head_buf),
-             "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width\">"
-             "<meta http-equiv=\"refresh\" content=\"8\">"
-             "<title>Nhat ky RFID</title><style>body{font-family:sans-serif;margin:12px}"
-             "table{border-collapse:collapse;width:100%%;font-size:14px;max-width:900px}"
-             "td,th{border:1px solid #ccc;padding:6px;text-align:left}"
-             "tr:nth-child(even){background:#f5f5f5}.nav a{margin-right:12px}"
-             ".admin-save{background:#d4edda!important;font-style:italic}"
-             ".admin-del{background:#f8d7da!important;font-style:italic}</style></head><body>"
-             "<h1>%s</h1>"
-             "<p class=\"nav\"><a href=\"/\">Cau hinh WiFi</a>"
-             "%s"
-             "</p><p><small>Tu tai lai moi 8 giay</small></p>"
-             "<table><tr><th>Thoi gian</th><th>Ten</th><th>Ma / Thao tac</th></tr>",
-             show_all ? "Tat ca nhat ky"
-                      : "Quet the trong ngay",
-             show_all ? "<a href=\"/scans\">&larr; Chi hom nay</a>"
-                      : "<a href=\"/scans?all=1\">Xem tat ca</a>");
+    esp_err_t e = httpd_resp_send_chunk(req, "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width\"><meta http-equiv=\"refresh\" content=\"8\"><title>Nhật ký RFID</title>", HTTPD_RESP_USE_STRLEN);
+    if (e != ESP_OK) {
+        fclose(fp);
+        sd_card_unlock();
+        return e;
+    }
+    e = httpd_resp_send_chunk(req, SCANS_CSS, HTTPD_RESP_USE_STRLEN);
+    if (e != ESP_OK) {
+        fclose(fp);
+        sd_card_unlock();
+        return e;
+    }
+    e = httpd_resp_send_chunk(req, "</head><body>", HTTPD_RESP_USE_STRLEN);
+    if (e != ESP_OK) {
+        fclose(fp);
+        sd_card_unlock();
+        return e;
+    }
 
-    esp_err_t e = httpd_resp_send_chunk(req, head_buf, strlen(head_buf));
+    char link_buf[192];
+    if (show_all) {
+        if (tok[0]) {
+            snprintf(link_buf, sizeof(link_buf), " | <a href=\"/scans?token=%s\">Chỉ hôm nay</a>", tok);
+        } else {
+            strcpy(link_buf, " | <a href=\"/scans\">Chỉ hôm nay</a>");
+        }
+    } else {
+        if (tok[0]) {
+            snprintf(link_buf, sizeof(link_buf), " | <a href=\"/scans?all=1&token=%s\">Xem tất cả</a>", tok);
+        } else {
+            strcpy(link_buf, " | <a href=\"/scans?all=1\">Xem tất cả</a>");
+        }
+    }
+
+    char head_buf[768];
+    snprintf(head_buf, sizeof(head_buf),
+             "<h1>%s</h1>"
+             "<p class=\"nav\"><a href=\"/\">&larr; Về trang chủ</a>"
+             "%s"
+             "</p><p class=\"hint\">Tự động tải lại sau mỗi 8 giây</p>"
+             "<table><tr><th>Code</th><th>Index</th><th>Thời gian</th><th>Tên nhân viên</th><th>Mã / Thao tác</th></tr>",
+             show_all ? "Tất cả nhật ký" : "Quét thẻ trong ngày",
+             link_buf);
+
+    e = httpd_resp_send_chunk(req, head_buf, strlen(head_buf));
     if (e != ESP_OK) {
         fclose(fp);
         sd_card_unlock();
@@ -544,50 +678,66 @@ esp_err_t scan_log_send_html_page(httpd_req_t *req)
     char raw[384];
     int rows_out = 0;
     while (fgets(raw, sizeof(raw), fp)) {
+        lv_port_feed_wdt();
         char buf[384];
         snprintf(buf, sizeof(buf), "%s", raw);
-        char *nl = strchr(buf, '\n');
-        if (nl) {
-            *nl = '\0';
-        }
+        csv_strip_line_end(buf);
 
         char *fld0 = strtok(buf, "|");
         if (!fld0) {
             continue;
         }
-        (void)strtok(NULL, "|"); /* bo qua uid */
+        char *fld1 = strtok(NULL, "|"); /* uid */
         char *fld2 = strtok(NULL, "|"); /* name */
         char *fld3 = strtok(NULL, "|"); /* id */
         char *fld4 = strtok(NULL, "|"); /* registered / "99"=admin */
-        char *fld5 = strtok(NULL, "|"); /* admin action label (SAVE/DEL) neu fld4==99 */
+        char *fld5 = strtok(NULL, "|"); /* admin action label (SAVE/DEL) neu fld4==99, hoac index neu normal */
+        char *fld6 = strtok(NULL, "|"); /* index neu admin, NULL neu cu */
+        csv_strip_field_cr(fld1);
+        csv_strip_field_cr(fld2);
+        csv_strip_field_cr(fld3);
+        csv_strip_field_cr(fld4);
+        csv_strip_field_cr(fld5);
+        csv_strip_field_cr(fld6);
 
         const char *ts = fld0;
+        const char *uidv = fld1 ? fld1 : "";
         const char *nm = fld2 ? fld2 : "";
         const char *idv = fld3 ? fld3 : "";
         int is_admin = (fld4 && strcmp(fld4, "99") == 0);
+        int reg = (fld4 && !is_admin) ? atoi(fld4) : -1;
         const char *admin_act = (is_admin && fld5 && fld5[0]) ? fld5 : "";
+        const char *idx_str = is_admin ? (fld6 ? fld6 : "-") : (fld5 ? fld5 : "-");
+        if (!idx_str || idx_str[0] == '\0') {
+            idx_str = "-";
+        }
+        int event_code = scan_log_row_event_code(reg, is_admin, admin_act);
 
-        if (!show_all && !line_matches_today(ts, today_ymd)) {
+        if (!show_all && time_ok && !line_matches_today(ts, today_ymd)) {
             continue;
         }
 
-        char e_ts[80], e_nm[128], e_id[128], e_act[24];
+        char e_ts[80], e_uid[48], e_nm[128], e_id[128], e_act[24];
         html_escape(ts, e_ts, sizeof(e_ts));
+        html_escape(uidv, e_uid, sizeof(e_uid));
         html_escape(nm, e_nm, sizeof(e_nm));
         html_escape(idv, e_id, sizeof(e_id));
         html_escape(admin_act, e_act, sizeof(e_act));
 
-        char row[600];
+        char row[720];
         if (is_admin) {
             /* Admin row: hien thi ten the va action (SAVE/DEL) voi mau khac */
             const char *css_class = (strcmp(admin_act, "DEL") == 0) ? "admin-del" : "admin-save";
             const char *label = (strcmp(admin_act, "DEL") == 0) ? "[XOA THE]" : "[LUU THE]";
+            const char *who = e_nm[0] ? e_nm : e_uid;
+            const char *detail = e_id[0] ? e_id : e_uid;
             snprintf(row, sizeof(row),
-                     "<tr class=\"%s\"><td>%s</td><td>%s</td><td>%s %s</td></tr>",
-                     css_class, e_ts, e_nm, label, e_id);
+                     "<tr class=\"%s\"><td>%d</td><td>%s</td><td>%s</td><td>%s</td><td>%s %s (%s)</td></tr>",
+                     css_class, event_code, idx_str, e_ts, who, label, detail, e_uid);
         } else {
             snprintf(row, sizeof(row),
-                     "<tr><td>%s</td><td>%s</td><td>%s</td></tr>", e_ts, e_nm, e_id);
+                     "<tr><td>%d</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>",
+                     event_code, idx_str, e_ts, e_nm, e_id);
         }
         e = httpd_resp_send_chunk(req, row, strlen(row));
         if (e != ESP_OK) {
@@ -601,15 +751,15 @@ esp_err_t scan_log_send_html_page(httpd_req_t *req)
     sd_card_unlock();
 
     if (!show_all && rows_out == 0) {
-        const char *empty_row = "<tr><td colspan=\"3\"><em>Chua co lan quet nao trong ngay hom nay.</em></td></tr>";
+        const char *empty_row = "<tr><td colspan=\"5\"><em>Chua co lan quet nao trong ngay hom nay.</em></td></tr>";
         e = httpd_resp_send_chunk(req, empty_row, strlen(empty_row));
         if (e != ESP_OK) {
             return e;
         }
     }
 
-    char tail[256];
-    snprintf(tail, sizeof(tail), "</table><p><small>File: %s</small></p></body></html>", BOARD_SD_RFID_LOG_PATH);
+    char tail[384];
+    snprintf(tail, sizeof(tail), "</table><p><small>File: %s</small></p><script>const tb=document.querySelector('table');const rs=Array.from(tb.rows).slice(1);rs.reverse().forEach(r=>tb.appendChild(r));</script></body></html>", BOARD_SD_RFID_LOG_PATH);
     e = httpd_resp_send_chunk(req, tail, strlen(tail));
     if (e != ESP_OK) {
         return e;
@@ -617,10 +767,160 @@ esp_err_t scan_log_send_html_page(httpd_req_t *req)
     return httpd_resp_send_chunk(req, NULL, 0);
 }
 
-void scan_log_append_admin(const char *uid_hex, const char *name, const char *id, const char *action)
+esp_err_t scan_log_send_json(httpd_req_t *req)
+{
+    bool show_all = false;
+    int limit = 150;
+    char qry[96];
+    if (httpd_req_get_url_query_str(req, qry, sizeof(qry)) == ESP_OK) {
+        char v[12];
+        if (httpd_query_key_value(qry, "all", v, sizeof(v)) == ESP_OK && v[0] == '1') {
+            show_all = true;
+            limit = 999999; // Không giới hạn khi xem tất cả
+        }
+        if (httpd_query_key_value(qry, "limit", v, sizeof(v)) == ESP_OK) {
+            int n = atoi(v);
+            if (n > 0) {
+                limit = n;
+            }
+        }
+    }
+
+    httpd_resp_set_type(req, "application/json; charset=utf-8");
+
+    if (!sd_card_is_mounted()) {
+        return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"SD chua mount\",\"rows\":[]}");
+    }
+
+    time_t now = time(NULL);
+    struct tm tloc;
+    scan_log_wall_tm(now, &tloc);
+    const bool time_ok = (tloc.tm_year >= (2020 - 1900));
+    char today_ymd[48];
+    (void)snprintf(today_ymd, sizeof(today_ymd), "%04d-%02d-%02d", (int)(tloc.tm_year + 1900),
+                   (int)(tloc.tm_mon + 1), (int)tloc.tm_mday);
+
+    sd_card_lock();
+    FILE *fp = fopen(BOARD_SD_RFID_LOG_PATH, "r");
+    if (!fp) {
+        sd_card_unlock();
+        return httpd_resp_sendstr(req, "{\"ok\":true,\"rows\":[]}");
+    }
+
+    char hdr[64];
+    snprintf(hdr, sizeof(hdr), "{\"ok\":true,\"time_ok\":%s,\"rows\":[", time_ok ? "true" : "false");
+    esp_err_t e = httpd_resp_send_chunk(req, hdr, strlen(hdr));
+    if (e != ESP_OK) {
+        fclose(fp);
+        sd_card_unlock();
+        return e;
+    }
+
+    int total_matched = 0;
+    char temp_line[384];
+    while (fgets(temp_line, sizeof(temp_line), fp)) {
+        if (!show_all && time_ok && !line_matches_today(temp_line, today_ymd)) {
+            continue;
+        }
+        total_matched++;
+    }
+
+    rewind(fp);
+    int skip_count = total_matched - limit;
+    if (skip_count < 0) {
+        skip_count = 0;
+    }
+
+    char raw[384];
+    int current_match = 0;
+    int rows_out = 0;
+    bool first = true;
+    while (fgets(raw, sizeof(raw), fp) && rows_out < limit) {
+        lv_port_feed_wdt();
+        char buf[384];
+        snprintf(buf, sizeof(buf), "%s", raw);
+        csv_strip_line_end(buf);
+        char *saveptr = buf;
+        char *fld0 = strsep(&saveptr, "|");
+        if (!fld0) {
+            continue;
+        }
+        char *fld1 = strsep(&saveptr, "|");
+        char *fld2 = strsep(&saveptr, "|");
+        char *fld3 = strsep(&saveptr, "|");
+        char *fld4 = strsep(&saveptr, "|");
+        char *fld5 = strsep(&saveptr, "|"); /* admin action label (SAVE/DEL) neu fld4==99, hoac index neu normal */
+        char *fld6 = strsep(&saveptr, "|"); /* index neu admin, NULL neu cu */
+        csv_strip_field_cr(fld1);
+        csv_strip_field_cr(fld2);
+        csv_strip_field_cr(fld3);
+        csv_strip_field_cr(fld4);
+        csv_strip_field_cr(fld5);
+        csv_strip_field_cr(fld6);
+
+        const char *ts = fld0;
+        const char *uidv = fld1 ? fld1 : "";
+        const char *nm = fld2 ? fld2 : "";
+        const char *idv = fld3 ? fld3 : "";
+        int is_admin = (fld4 && strcmp(fld4, "99") == 0);
+        int reg = (fld4 && !is_admin) ? atoi(fld4) : -1;
+        const char *admin_act = (is_admin && fld5 && fld5[0]) ? fld5 : "";
+        const char *idx_str = is_admin ? (fld6 ? fld6 : "-1") : (fld5 ? fld5 : "-1");
+        long msg_index = -1;
+        if (idx_str && idx_str[0] && strcmp(idx_str, "-") != 0) {
+            msg_index = atol(idx_str);
+        }
+        int event_code = scan_log_row_event_code(reg, is_admin, admin_act);
+
+        if (!show_all && time_ok && !line_matches_today(ts, today_ymd)) {
+            continue;
+        }
+
+        if (current_match < skip_count) {
+            current_match++;
+            continue;
+        }
+
+        char e_ts[80], e_uid[48], e_nm[128], e_id[128], e_ad[24];
+        json_escape(ts, e_ts, sizeof(e_ts));
+        json_escape(uidv, e_uid, sizeof(e_uid));
+        json_escape(nm, e_nm, sizeof(e_nm));
+        json_escape(idv, e_id, sizeof(e_id));
+        json_escape(admin_act, e_ad, sizeof(e_ad));
+
+        char row[640];
+        snprintf(row, sizeof(row),
+                 "%s{\"ts\":\"%s\",\"uid\":\"%s\",\"name\":\"%s\",\"id\":\"%s\",\"admin\":%s,\"action\":\"%s\","
+                 "\"code\":%d,\"index\":%ld}",
+                 first ? "" : ",", e_ts, e_uid, e_nm, e_id, is_admin ? "true" : "false", e_ad, event_code,
+                 msg_index);
+        e = httpd_resp_send_chunk(req, row, strlen(row));
+        if (e != ESP_OK) {
+            fclose(fp);
+            sd_card_unlock();
+            return e;
+        }
+        first = false;
+        rows_out++;
+    }
+    fclose(fp);
+    sd_card_unlock();
+
+    e = httpd_resp_send_chunk(req, "]}", 2);
+    if (e != ESP_OK) {
+        return e;
+    }
+    return httpd_resp_send_chunk(req, NULL, 0);
+}
+
+void scan_log_append_admin(const char *uid_hex, const char *name, const char *id, const char *action,
+                           int32_t msg_idx)
 {
     if (!uid_hex || !uid_hex[0] || !action || !action[0]) {
         return;
+    }
+    if (msg_idx <= 0) {
+        msg_idx = app_azure_get_and_increment_msg_index(MSG_IDX_ADMIN);
     }
 
     time_t ev = time(NULL);
@@ -646,8 +946,8 @@ void scan_log_append_admin(const char *uid_hex, const char *name, const char *id
         return;
     }
 
-    /* Dung truong registered = 99 de danh dau admin action; action nam o cuoi */
-    fprintf(fp, "%s|%s|%s|%s|99|%s\n", ts, uid_s, ns, ids, acts);
+    /* registered=99: admin; SAVE/DEL + index (trung idx_admin / telemetry 603-604) */
+    fprintf(fp, "%s|%s|%s|%s|99|%s|%ld\n", ts, uid_s, ns, ids, acts, (long)msg_idx);
     fflush(fp);
     {
         int fd = fileno(fp);
@@ -657,11 +957,189 @@ void scan_log_append_admin(const char *uid_hex, const char *name, const char *id
     }
     fclose(fp);
     sd_card_unlock();
-    ESP_LOGI(TAG, "Admin log: %s UID=%s name=%s", acts, uid_s, ns);
+    ESP_LOGI(TAG, "Admin log: %s UID=%s name=%s index=%ld", acts, uid_s, ns, (long)msg_idx);
     scan_log_do_trim(false);
+    lcd_ui_invalidate_log_cache();
 }
 
 void scan_log_trim_at_boot(void)
 {
     scan_log_do_trim(true);
+}
+
+static time_t scan_log_ts_string_to_utc(const char *ts_str)
+{
+    int y = 0, mo = 0, d = 0, h = 0, mi = 0, s = 0;
+    if (!ts_str || ts_str[0] == '\0' || strncmp(ts_str, "no-ntp", 6) == 0) {
+        return time(NULL);
+    }
+    if (sscanf(ts_str, "%4d-%2d-%2dT%2d:%2d:%2d", &y, &mo, &d, &h, &mi, &s) != 6) {
+        return time(NULL);
+    }
+    struct tm ti = {0};
+    ti.tm_year = y - 1900;
+    ti.tm_mon = mo - 1;
+    ti.tm_mday = d;
+    ti.tm_hour = h;
+    ti.tm_min = mi;
+    ti.tm_sec = s;
+    ti.tm_isdst = 0;
+    /* Chuoi log = gmtime(utc + BOARD_LOCAL_UTC_OFFSET_SEC) */
+    time_t wall_epoch = mktime(&ti);
+    if (wall_epoch < 0) {
+        return time(NULL);
+    }
+    return wall_epoch - (time_t)BOARD_LOCAL_UTC_OFFSET_SEC;
+}
+
+static bool sync_filter_wants_missing(const scan_log_sync_filter_t *filter, int code, int32_t index)
+{
+    if (!filter || index <= 0) {
+        return false;
+    }
+    for (int i = 0; i < filter->missing_count; i++) {
+        if (filter->missing[i].code == code && filter->missing[i].index == index) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool sync_filter_wants_gap(const scan_log_sync_filter_t *filter, int code, int32_t index)
+{
+    if (!filter || index <= 0) {
+        return false;
+    }
+    if (code == 602 && filter->have_last_swipe && index > filter->last_swipe) {
+        return true;
+    }
+    if (code == 601 && filter->have_last_unkn && index > filter->last_unkn) {
+        return true;
+    }
+    if ((code == 603 || code == 604) && filter->have_last_admin && index > filter->last_admin) {
+        return true;
+    }
+    return false;
+}
+
+esp_err_t scan_log_replay_gaps(const scan_log_sync_filter_t *filter, scan_log_replay_publish_fn publish_fn,
+                               void *ctx, scan_log_replay_stats_t *stats_out)
+{
+    if (!filter || !publish_fn) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    scan_log_replay_stats_t st = {0};
+    if (!sd_card_is_mounted()) {
+        if (stats_out) {
+            *stats_out = st;
+        }
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    sd_card_lock();
+    FILE *fp = fopen(BOARD_SD_RFID_LOG_PATH, "r");
+    if (!fp) {
+        sd_card_unlock();
+        if (stats_out) {
+            *stats_out = st;
+        }
+        return ESP_OK;
+    }
+
+    char raw[384];
+    while (fgets(raw, sizeof(raw), fp)) {
+        char buf[384];
+        snprintf(buf, sizeof(buf), "%s", raw);
+        char *nl = strchr(buf, '\n');
+        if (nl) {
+            *nl = '\0';
+        }
+
+        char *fld0 = strtok(buf, "|");
+        char *fld1 = strtok(NULL, "|");
+        char *fld2 = strtok(NULL, "|");
+        char *fld3 = strtok(NULL, "|");
+        char *fld4 = strtok(NULL, "|");
+        char *fld5 = strtok(NULL, "|");
+        char *fld6 = strtok(NULL, "|");
+        if (!fld0 || !fld1) {
+            continue;
+        }
+
+        int event_code = 0;
+        int32_t msg_index = 0;
+        const char *uid = fld1;
+        const char *nm = fld2 ? fld2 : "";
+        const char *idv = fld3 ? fld3 : "";
+        bool is_admin = (fld4 && strcmp(fld4, "99") == 0);
+
+        if (is_admin) {
+            const char *act = fld5 ? fld5 : "";
+            const char *idx_str = fld6 ? fld6 : "";
+            if (idx_str[0] != '\0') {
+                msg_index = (int32_t)atol(idx_str);
+            }
+            if (strcmp(act, "SAVE") == 0) {
+                event_code = 603;
+            } else if (strcmp(act, "DEL") == 0) {
+                event_code = 604;
+            } else {
+                continue;
+            }
+        } else {
+            if (!fld4 || !fld5) {
+                continue;
+            }
+            msg_index = (int32_t)atol(fld5);
+            int reg = atoi(fld4);
+            if (reg == 1) {
+                event_code = 602;
+            } else if (reg == 0) {
+                event_code = 601;
+            } else {
+                continue;
+            }
+        }
+
+        if (msg_index <= 0 || event_code <= 0) {
+            continue;
+        }
+
+        bool want = sync_filter_wants_missing(filter, event_code, msg_index);
+        if (!want) {
+            want = sync_filter_wants_gap(filter, event_code, msg_index);
+        }
+        if (!want) {
+            continue;
+        }
+
+        scan_log_replay_entry_t ent;
+        memset(&ent, 0, sizeof(ent));
+        ent.event_code = event_code;
+        ent.index = msg_index;
+        ent.timestamp_utc = (int64_t)scan_log_ts_string_to_utc(fld0);
+        strncpy(ent.uid, uid, sizeof(ent.uid) - 1);
+        strncpy(ent.name, nm, sizeof(ent.name) - 1);
+        strncpy(ent.id, idv, sizeof(ent.id) - 1);
+
+        if (publish_fn(&ent, ctx) != 0) {
+            break;
+        }
+        st.resent++;
+        if (event_code == 602) {
+            st.gap_swipe++;
+        } else if (event_code == 601) {
+            st.gap_unkn++;
+        }
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+
+    fclose(fp);
+    sd_card_unlock();
+
+    if (stats_out) {
+        *stats_out = st;
+    }
+    ESP_LOGI(TAG, "Replay tu log: resent=%d (swipe=%d unkn=%d)", st.resent, st.gap_swipe, st.gap_unkn);
+    return ESP_OK;
 }

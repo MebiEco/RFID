@@ -3,12 +3,13 @@
 /**
  * =============================================================================
  * CẤU HÌNH PHẦN CỨNG — CHỈ SỬA GPIO TẠI ĐÂY CHO KHỚP MẠCH ĐÃ HÀN.
- * SD = SPI3 (CS=5…); LCD 3.5" SPI2 — ILI9488 hoặc ILI9486 (`BOARD_LCD_PANEL_PROFILE`).
+ * SD = SPI3 (CS=5…); LCD SPI2 — 2.8" 320×240 (profile: board_lcd_panel.h / menuconfig).
  * =============================================================================
  */
 
 #include "driver/gpio.h"
 #include "hal/spi_types.h"
+#include "board_lcd_panel.h"
 
 /**
  * 1 = chỉ thẻ SD; 0 = không ép chế độ SD-only.
@@ -47,7 +48,7 @@
 #else
 /**
  * Kiosk (mặc định): **ba đường tách** — không tranh `spi_bus` trong IDF:
- *   - LCD → SPI2 (39/40/41…); SD → SPI3 (21/47/48, CS 5); RC522 → bit-bang 11/12/13, CS 4, RST 3.
+ *   - LCD → SPI2 2.8" ngang (39 CLK, 40 SI, 9 DC, 10 CS, 8 RES); profile: menuconfig / board_lcd_panel.h.
  * Chỉ “chung SPI” khi bật BOARD_RC522_SHARE_SD_SPI_BUS (RC522+SD cùng SPI3, hai CS) hoặc BOARD_LCD_SHARE_SPI2_WITH_SD.
  * Quẹt thẻ → tra profile/checkin trên SD. Muốn RC522 chung SPI với SD: #define BOARD_RC522_SHARE_SD_SPI_BUS 1 trước include.
  * Mặc định bật WiFi portal + Azure MQTT; tắt: BOARD_ENABLE_WIFI / BOARD_ENABLE_AZURE 0 trước include.
@@ -153,127 +154,93 @@
 
 /**
  * Tốc độ SPI cho SD (kHz).
+ * 10 MHz dễ CRC/MISO=FF trên dây dài hoặc khi WiFi phát cao — 4 MHz thường ổn hơn.
  */
 #ifndef BOARD_SD_SPI_MAX_FREQ_KHZ
-#define BOARD_SD_SPI_MAX_FREQ_KHZ 10000
+#define BOARD_SD_SPI_MAX_FREQ_KHZ 2000
 #endif
-/** Chờ sau khi CS cao + bus init trước mount (ms); thẻ/module chậm nguồn có thể cần 100–200. */
+/** Chờ sau khi CS cao + bus init trước mount (ms); WiFi/MQTT bật → nguồn dao động: tăng nếu vẫn CRC. */
 #ifndef BOARD_SD_PRE_MOUNT_DELAY_MS
-#define BOARD_SD_PRE_MOUNT_DELAY_MS 100
+#define BOARD_SD_PRE_MOUNT_DELAY_MS 500
 #endif
 
-/**
- * Profile khởi tạo LCD (chip trên màn RPi 3.5" hay nhầm nhãn):
- *   0 = ILI9488 (TFT_eSPI ILI9488_Init.h — Bodmer)
- *   1 = ILI9486 SPI (TFT_eSPI ILI9486_Init.h — fb_ili9486 / nhiều màn “9488” thực tế là 9486)
- */
-#ifndef BOARD_LCD_PANEL_PROFILE
-#define BOARD_LCD_PANEL_PROFILE 1
-#endif
-
-/**
- * 1: đọc RDDID sau init — chỉ có ý nghĩa nếu SDO của chip TFT thật sự nối tới chân MISO bạn dùng.
- * Trên nhiều shield Pi 3.5", header pin 21 (MISO) chỉ nối touch XPT2046, không nối SDO ILI9488 → luôn FF.
- */
-#ifndef BOARD_LCD_TRY_READ_LCD_ID
-#define BOARD_LCD_TRY_READ_LCD_ID 1
+/** 0 = không màn PIN / menu cài đặt (chỉ idle + quẹt thẻ). */
+#ifndef BOARD_ENABLE_LOGIN
+#define BOARD_ENABLE_LOGIN 0
 #endif
 
 #define BOARD_LCD_SPI_HOST SPI2_HOST
 /** ESP32-S3: OK. ESP32 cổ điển: GPIO34–39 chỉ INPUT — không thể làm SCK/MOSI. */
 #define BOARD_LCD_SCK_GPIO GPIO_NUM_39
 #define BOARD_LCD_MOSI_GPIO GPIO_NUM_40
-/** Pi pin 21 thường gọi MISO — kiểm tra schematic: có thể là MISO touch, không phải TFT SDO. */
 #define BOARD_LCD_MISO_GPIO GPIO_NUM_41
 #define BOARD_LCD_DC_GPIO GPIO_NUM_9
+/** Module 2.8" không có CS (nối sẵn GND): ESP vẫn khai CS cho driver SPI. */
 #define BOARD_LCD_CS_GPIO GPIO_NUM_10
 #define BOARD_LCD_RST_GPIO GPIO_NUM_8
-/** 1: LCD và SD cùng SPI2/3 — lcd_ui chấp nhận bus đã init (ESP_ERR_INVALID_STATE). */
+
 #ifndef BOARD_LCD_SHARE_SPI2_WITH_SD
 #define BOARD_LCD_SHARE_SPI2_WITH_SD 0
 #endif
 
-/**
- * Touch resistive (XPT2046 hay tương đương trên bo màn): PIN26→TP_CS→GPIO7, PIN11→TP_IRQ→GPIO6.
- * Chưa có driver trong repo — chỉ khai chân để nối sau.
- */
-#ifndef BOARD_TOUCH_CS_GPIO
-#define BOARD_TOUCH_CS_GPIO GPIO_NUM_7
-#endif
-#ifndef BOARD_TOUCH_IRQ_GPIO
-#define BOARD_TOUCH_IRQ_GPIO GPIO_NUM_6
+/** Hàng đợi SPI color (esp_lcd); 2 đủ khi vẽ đồng bộ — tránh queue full + WiFi. */
+#ifndef BOARD_LCD_SPI_TRANS_QUEUE_DEPTH
+#define BOARD_LCD_SPI_TRANS_QUEUE_DEPTH 2
 #endif
 
-/**
- * Đèn nền LCD (nếu màn có chân BL riêng). GPIO_NUM_NC = không điều khiển từ
- * code (BL nối VCC trên mạch).
- */
-#ifndef BOARD_LCD_BL_GPIO
 #define BOARD_LCD_BL_GPIO GPIO_NUM_NC
-#endif
-#ifndef BOARD_LCD_BL_ACTIVE_HIGH
 #define BOARD_LCD_BL_ACTIVE_HIGH 1
-#endif
-
-/** Bit MX (cột); +BGR trong driver → 0x48 như TFT_eSPI ILI9488_Init.h */
-#ifndef BOARD_ILI9488_MADCTL_BASE
-#define BOARD_ILI9488_MADCTL_BASE 0x40
-#endif
-#ifndef BOARD_ILI9488_COLMOD
-#define BOARD_ILI9488_COLMOD 0x55
-#endif
-
-/**
- * SPI ILI9488: nhiều module chỉ nhận pixel 18-bit (0x3A=0x66), không hiển thị đúng với 0x55.
- * 1: COLMOD 0x66 + chuyển RGB565→RGB666 trong driver (esp_lcd_ili9488 / lovyan).
- * 0: gửi thẳng RGB565 (ít gặp trên SPI).
- */
-/** Màn RPi SPI nhiều lô chạy tốt với 0x55 (RGB565). Chỉ bật 1 nếu 0x55 vẫn sai màu/trắng. */
-#ifndef BOARD_LCD_ILI9488_SPI_RGB666
-#define BOARD_LCD_ILI9488_SPI_RGB666 1
-#endif
-
-/**
- * ILI9488 0xB0 (Interface Mode). Trắng toàn màn: thử 0 rồi 0x80.
- * Đọc RDDID/MISO toàn FF sau init: thử 0x00 — bit 0x80 trên vài bo làm SDO không dùng cho đọc.
- */
-#ifndef BOARD_LCD_ILI9488_B0
-#define BOARD_LCD_ILI9488_B0 0x00
-#endif
-
-/**
- * 1: khi MADCTL có MV (swap_xy), đổi nội dung CASET↔RASET — nhiều màn landscape cần.
- * 0: luôn CASET=X, RASET=Y (thử nếu hình vẫn sai sau bản có swap).
- */
-/** 0 = CASET=X RASET=Y (thử trước nếu màn trắng + MV). 1 = đổi khi swap_xy. */
-#ifndef BOARD_LCD_ILI9488_SWAP_ADDR_WINDOW_WITH_MV
-#define BOARD_LCD_ILI9488_SWAP_ADDR_WINDOW_WITH_MV 0
-#endif
-
-/** 1: gắn MISO LCD vào bus SPI2 (đọc ID / debug); 0 nếu chân không nối. */
-#ifndef BOARD_LCD_SPI_USE_MISO
-#define BOARD_LCD_SPI_USE_MISO 1
-#endif
-
-/** 1: trước DISPON gửi 0x38 IDMOFF (chuỗi Lovyan/atanisoft). */
-#ifndef BOARD_LCD_IDMOFF_BEFORE_DISPON
-#define BOARD_LCD_IDMOFF_BEFORE_DISPON 1
-#endif
-
+#define BOARD_LCD_SPI_USE_MISO 0
 #define BOARD_LCD_H_RES 320
-#define BOARD_LCD_V_RES 480
+#define BOARD_LCD_V_RES 240
+#define BOARD_LCD_USE_ILI9341 1
+#define BOARD_LCD_ENABLE_TOUCH 0
+#define BOARD_LCD_COLOR_PIPELINE_BGR 1
+#define BOARD_LCD_SWAP_XY_AFTER_INIT 1
 
-/** 1: INVON (0x21). Chuỗi Bodmer đã set B4/B6 — thử 1 nếu màn ngả màu / IPS. */
-#ifndef BOARD_LCD_PANEL_INVERT
+/** Profile màn — xem board_lcd_panel.h / menuconfig "Man hinh LCD". */
+#if BOARD_LCD_PANEL_ID == BOARD_LCD_PANEL_GMT028_28
+#define BOARD_LCD_GMT028 1
+#define BOARD_LCD_MIRROR_X_AFTER_INIT 0
+#define BOARD_LCD_MIRROR_Y_AFTER_INIT 0
 #define BOARD_LCD_PANEL_INVERT 1
+#define BOARD_LCD_PCLK_HZ (16 * 1000 * 1000)
+#elif BOARD_LCD_PANEL_ID == BOARD_LCD_PANEL_ILI9341_LEGACY_28
+#define BOARD_LCD_GMT028 0
+#define BOARD_LCD_MIRROR_X_AFTER_INIT 1
+#define BOARD_LCD_MIRROR_Y_AFTER_INIT 1
+#define BOARD_LCD_PANEL_INVERT 0
+#define BOARD_LCD_PCLK_HZ (26 * 1000 * 1000)
+#else
+#error "BOARD_LCD_PANEL_ID: chi ho tro 1 (GMT028) hoac 2 (legacy 2.8)"
+#endif
+#define BOARD_LCD_SPI_MODE 0
+/** 24 dòng/chunk: ít lần ghi SPI hơn → ít răng cưa khi flush LVGL trên 240px. */
+#define BOARD_LCD_SPI_CHUNK_LINES 24
+#define BOARD_LCD_POST_DISPON_DELAY_MS 80
+
+/**
+ * Nền UI (`lcd_ui` UI_BG), xóa màn sau init, viền letterbox JPEG — MỘT nguồn RGB888.
+ * Viền KHÔNG được qua BOARD_SD_IMAGE_SWAP_RB (swap chỉ sửa thứ tự kênh *file ảnh*, ám viền nâu nếu áp nhầm).
+ * Nếu vẫn ám nâu: thử R=G=B (vd. 248,248,248) thay ba số dưới.
+ */
+#ifndef BOARD_UI_BG_R
+#define BOARD_UI_BG_R 235
+#endif
+#ifndef BOARD_UI_BG_G
+#define BOARD_UI_BG_G 238
+#endif
+#ifndef BOARD_UI_BG_B
+#define BOARD_UI_BG_B 242
 #endif
 
 /**
- * 1: nền đỏ thuần sau init — nếu vẫn trắng = RAMWR/init sai; nếu thấy đỏ = căn màu/hướng.
- * 0: nền xanh đậm (sản xuất).
+ * 0: nen toi sau init (san xuat).
+ * 1: nen do thuan sau init — debug: neu thay do = RAMWR OK; neu thay mau khac = sai BGR/invert.
+ * Dat lai ve 0 sau khi debug xong mau.
  */
 #ifndef BOARD_LCD_STARTUP_SOLID_RED_TEST
-#define BOARD_LCD_STARTUP_SOLID_RED_TEST 1
+#define BOARD_LCD_STARTUP_SOLID_RED_TEST 0
 #endif
 #if BOARD_LCD_STARTUP_SOLID_RED_TEST
 #ifndef BOARD_LCD_STARTUP_CLEAR_R
@@ -286,25 +253,11 @@
 #define BOARD_LCD_STARTUP_CLEAR_B 0
 #endif
 #else
-#ifndef BOARD_LCD_STARTUP_CLEAR_R
-#define BOARD_LCD_STARTUP_CLEAR_R 6
+/* Nền sáng #F1F5F9 — khớp màn chờ LVGL (không dùng #0F172A tối). */
+#define BOARD_LCD_STARTUP_CLEAR_R 241
+#define BOARD_LCD_STARTUP_CLEAR_G 245
+#define BOARD_LCD_STARTUP_CLEAR_B 249
 #endif
-#ifndef BOARD_LCD_STARTUP_CLEAR_G
-#define BOARD_LCD_STARTUP_CLEAR_G 10
-#endif
-#ifndef BOARD_LCD_STARTUP_CLEAR_B
-#define BOARD_LCD_STARTUP_CLEAR_B 28
-#endif
-#endif
-
-/**
- * Số dòng mỗi lần ghi SPI RGB565 (480 × N × 2 byte). Giảm (vd. 20) nếu log
- * panel_io_spi_tx_color / ramwr failed khi RAM căng — dễ malloc DMA hơn.
- */
-#ifndef BOARD_LCD_SPI_CHUNK_LINES
-#define BOARD_LCD_SPI_CHUNK_LINES 24
-#endif
-
 
 /**
  * Khi LCD và SD cùng SPI2, DMA khung hình RGB565 có thể > 8192 byte — tăng
@@ -323,36 +276,39 @@
 #endif
 #endif
 
-/**
- * Byte swap for RGB565 (standard for most SPI LCDs).
- */
 #ifndef BOARD_LCD_RGB565_SWAP_BYTES
 #define BOARD_LCD_RGB565_SWAP_BYTES 0
 #endif
 
 /**
- * 1: BGR — IPS panels usually use BGR order.
+ * RGB888 -> RGB565 — dùng qua lcd_color.h / BOARD_RGB565_FROM888 (lcd_ui, sd_png).
  */
-#ifndef BOARD_LCD_USE_BGR_ELEMENT_ORDER
-#define BOARD_LCD_USE_BGR_ELEMENT_ORDER 1
+#ifndef BOARD_RGB565_FROM888
+#define BOARD_RGB565_FROM888(r, g, b)                                                                                  \
+    ((uint16_t)((((uint16_t)(r) & 0xF8U) << 8) | (((uint16_t)(g) & 0xFCU) << 3) | (((uint16_t)(b)) >> 3)))
 #endif
-
 
 /**
- * Sau init: MADCTL swap_xy (= MV). Thứ tự trong lcd_ui: swap_xy trước, mirror sau.
- * Waveshare 3.5" Pi (480×320 vật lý): logic 320×480 — swap=1 để hình phủ hết mặt,
- * tránh chỉ một cụm màu trong khung nhỏ + viền đen.
- * Nếu màn của bạn đã full sẵn: #define BOARD_LCD_SWAP_XY_AFTER_INIT 0 trước include board_pins.h.
+ * Anh JPEG (chi pixel anh, khong anh huong letterbox/UI): hoan R<->B truoc khi RGB565.
+ * Da nguoi xanh troi / anh gan nhu den trang do lech kenh: thu 1 (mac dinh). Neu mau la hon: 0.
  */
-#ifndef BOARD_LCD_SWAP_XY_AFTER_INIT
-#define BOARD_LCD_SWAP_XY_AFTER_INIT 0
+#ifndef BOARD_SD_IMAGE_SWAP_RB_CHANNELS
+#define BOARD_SD_IMAGE_SWAP_RB_CHANNELS 0
 #endif
-/** Viền đen + cụm hình nhỏ: thử tắt gương (0,0) trước; bật từng bit nếu ngược trục. */
-#ifndef BOARD_LCD_MIRROR_X_AFTER_INIT
-#define BOARD_LCD_MIRROR_X_AFTER_INIT 0
+
+/**
+ * Viền letterbox: mặc định = BOARD_UI_BG_* — cùng mã hóa với nền lcd_ui (lcd_color_from888 + to_bus).
+ * Viền đồng bộ nền UI; không qua BOARD_SD_IMAGE_SWAP_RB (chỉ sửa kênh file JPEG).
+ * Đổi riêng (vd. trắng 248,248,248) nếu cần; không qua BOARD_SD_IMAGE_SWAP_RB (chỉ sửa kênh file JPEG).
+ */
+#ifndef BOARD_SD_IMAGE_LETTERBOX_R
+#define BOARD_SD_IMAGE_LETTERBOX_R BOARD_UI_BG_R
 #endif
-#ifndef BOARD_LCD_MIRROR_Y_AFTER_INIT
-#define BOARD_LCD_MIRROR_Y_AFTER_INIT 0
+#ifndef BOARD_SD_IMAGE_LETTERBOX_G
+#define BOARD_SD_IMAGE_LETTERBOX_G BOARD_UI_BG_G
+#endif
+#ifndef BOARD_SD_IMAGE_LETTERBOX_B
+#define BOARD_SD_IMAGE_LETTERBOX_B BOARD_UI_BG_B
 #endif
 
 /**
@@ -370,23 +326,6 @@
  */
 #ifndef BOARD_LCD_TEXT_REVERSE_ORDER
 #define BOARD_LCD_TEXT_REVERSE_ORDER 0
-#endif
-
-/** ms chờ sau DISPON trước khi RAMWR xóa nền (ổn định nguồn / gate) */
-#ifndef BOARD_LCD_POST_DISPON_DELAY_MS
-#define BOARD_LCD_POST_DISPON_DELAY_MS 120
-#endif
-
-/**
- * Xung SPI màn hình. 2 MHz đôi khi gây nhiễu/chấm mép màn (dây dài,
- * breadboard). Thử 1 MHz hoặc 500 kHz nếu thấy sọc / điểm lạ một bên.
- */
-#ifndef BOARD_LCD_PCLK_HZ
-#define BOARD_LCD_PCLK_HZ (20 * 1000 * 1000)
-#endif
-/** SPI mode 0 hầu hết ILI9488; thử 3 nếu nối dây dài / nhiễu. */
-#ifndef BOARD_LCD_SPI_MODE
-#define BOARD_LCD_SPI_MODE 0
 #endif
 
 #if BOARD_RC522_SHARE_SD_SPI_BUS
@@ -409,7 +348,21 @@
 /**
  * MAX98357A (I2S TX) — không trùng SPI LCD / SD / RC522.
  * BCLK=16, LRC(WS)=17, DIN ampli = dout ESP GPIO18.
+ * Loa: 8Ω 1,5W — gain PCM mặc định 2/5 (~40%). To hơn: 4/5; méo: giảm DEN.
  */
+#ifndef BOARD_SPEAKER_OHM
+#define BOARD_SPEAKER_OHM 8
+#endif
+#ifndef BOARD_SPEAKER_POWER_W_x10
+#define BOARD_SPEAKER_POWER_W_x10 15 /* 1,5 W */
+#endif
+/** Biên độ PCM sau decode WAV: sample_out = sample * NUM / DEN (trước clip int16). */
+#ifndef BOARD_AUDIO_PCM_GAIN_NUM
+#define BOARD_AUDIO_PCM_GAIN_NUM 2
+#endif
+#ifndef BOARD_AUDIO_PCM_GAIN_DEN
+#define BOARD_AUDIO_PCM_GAIN_DEN 5
+#endif
 #ifndef BOARD_I2S_BCLK_GPIO
 #define BOARD_I2S_BCLK_GPIO GPIO_NUM_16
 #endif

@@ -101,11 +101,23 @@ esp_err_t sd_card_mount(void)
     slot_config.gpio_cs = BOARD_SD_CS_GPIO;
     slot_config.host_id = host.slot;
 
+    /* Đưa thẻ về idle (CS cao), chờ SPI & nguồn ổn — giảm CID/CRC lỗi sau WiFi/MQTT. */
+    gpio_set_level(BOARD_SD_CS_GPIO, 1);
     vTaskDelay(pdMS_TO_TICKS(BOARD_SD_PRE_MOUNT_DELAY_MS));
 
     ret = esp_vfs_fat_sdspi_mount(BOARD_SD_MOUNT_POINT, &host, &slot_config, &mount_config, &s_card);
+    /* Một lần retry SPI chậm: INVALID_CRC / timeout thường do MHz cao hoặc nhiễu bus. */
+    if (ret != ESP_OK && (ret == ESP_ERR_INVALID_CRC || ret == ESP_ERR_TIMEOUT)) {
+        const uint32_t slow_khz = (BOARD_SD_SPI_MAX_FREQ_KHZ > 2500) ? 2500u : BOARD_SD_SPI_MAX_FREQ_KHZ;
+        ESP_LOGW(TAG, "mount loi %s — thu lai SPI %lu kHz", esp_err_to_name(ret), (unsigned long)slow_khz);
+        gpio_set_level(BOARD_SD_CS_GPIO, 1);
+        vTaskDelay(pdMS_TO_TICKS(120));
+        host.max_freq_khz = (int)slow_khz;
+        ret = esp_vfs_fat_sdspi_mount(BOARD_SD_MOUNT_POINT, &host, &slot_config, &mount_config, &s_card);
+    }
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "mount %s: %s", BOARD_SD_MOUNT_POINT, esp_err_to_name(ret));
+        ESP_LOGE(TAG, "mount %s: %s (the van co the doc duoc tren PC — CRC mount khong xoa FAT)",
+                 BOARD_SD_MOUNT_POINT, esp_err_to_name(ret));
         sd_card_unlock();
         /* Giữ bus SPI3: RC522 có thể đang dùng chung SPI3 với SD (BOARD_RC522_SHARE_SD_SPI_BUS). */
         return ret;
@@ -128,7 +140,9 @@ bool sd_card_is_mounted(void)
 void sd_card_lock(void)
 {
     if (s_sd_mutex) {
-        xSemaphoreTakeRecursive(s_sd_mutex, portMAX_DELAY);
+        if (xSemaphoreTakeRecursive(s_sd_mutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
+            ESP_LOGE("sd_card", "Lock timeout! Mutex held by other task too long.");
+        }
     }
 }
 
