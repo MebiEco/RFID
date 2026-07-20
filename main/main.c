@@ -40,20 +40,20 @@ static const char *TAG = "main";
 void app_main(void)
 {
     esp_reset_reason_t rr = esp_reset_reason();
-    // const char *rrs = "khac";
-    // switch (rr) {
-    // case ESP_RST_POWERON: rrs = "BAT_NGUON"; break;
-    // case ESP_RST_SW: rrs = "PHAN_MEM(Monitor/ota/esp_restart...)"; break;
-    // case ESP_RST_PANIC: rrs = "PANIC/CRASH"; break;
-    // case ESP_RST_INT_WDT: rrs = "INT_WDT"; break;
-    // case ESP_RST_TASK_WDT: rrs = "TASK_WDT"; break;
-    // case ESP_RST_WDT: rrs = "WDT"; break;
-    // case ESP_RST_BROWNOUT: rrs = "BROWNOUT(nguon_yeu)"; break;
-    // case ESP_RST_USB: rrs = "USB"; break;
-    // case ESP_RST_DEEPSLEEP: rrs = "DEEPSLEEP"; break;
-    // default: break;
-    // }
-    // ESP_LOGI(TAG, "Reset reason: %s (%d)", rrs, (int)rr);
+    const char *rrs = "khac";
+    switch (rr) {
+    case ESP_RST_POWERON: rrs = "BAT_NGUON"; break;
+    case ESP_RST_SW: rrs = "PHAN_MEM(Monitor/ota/esp_restart...)"; break;
+    case ESP_RST_PANIC: rrs = "PANIC/CRASH"; break;
+    case ESP_RST_INT_WDT: rrs = "INT_WDT"; break;
+    case ESP_RST_TASK_WDT: rrs = "TASK_WDT"; break;
+    case ESP_RST_WDT: rrs = "WDT"; break;
+    case ESP_RST_BROWNOUT: rrs = "BROWNOUT(nguon_yeu)"; break;
+    case ESP_RST_USB: rrs = "USB"; break;
+    case ESP_RST_DEEPSLEEP: rrs = "DEEPSLEEP"; break;
+    default: break;
+    }
+    ESP_LOGW(TAG, "Reset reason: %s (%d)", rrs, (int)rr);
 
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) { 

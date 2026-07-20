@@ -27,8 +27,7 @@ void scan_log_append_admin(const char *uid_hex, const char *name, const char *id
 void scan_log_flush_pending(void);
 
 /**
- * Cat rfid_log.csv, chi giu khoang 60 ngay gan nhat (goi sau mount SD / flush).
- * May lau khong quet the van xoa ban ghi cu.
+ * Cat rfid_log.csv, chi giu khoang 90 ngay gan nhat (goi sau mount SD / flush).
  */
 void scan_log_trim_at_boot(void);
 
@@ -36,13 +35,15 @@ void scan_log_trim_at_boot(void);
 esp_err_t scan_log_send_html_page(httpd_req_t *req);
 
 /**
- * JSON nhat ky: {"rows":[{"ts","name","id","admin"},...]}
- * Query: all=1 (mac dinh chi hom nay), limit=N (mac dinh 150).
+ * JSON nhat ky: {"rows":[{"ts","name","id","admin","code","index"},...]}
+ * Query: page, limit (mac dinh 50), all=1, days=N, from=YYYY-MM-DD, to=YYYY-MM-DD,
+ *        code=601|602|603|604,
+ *        sort=desc|asc|index_desc|index_asc|id_desc|id_asc (mac dinh desc).
  */
 esp_err_t scan_log_send_json(httpd_req_t *req);
 
 /** Muc tieu resend tu rfid_log.csv (605 sync). */
-#define SCAN_LOG_SYNC_MISSING_MAX 24
+#define SCAN_LOG_SYNC_MISSING_MAX 64
 
 typedef struct {
     bool have_last_swipe;

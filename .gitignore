@@ -1,0 +1,29 @@
+﻿# ESP-IDF build output
+build/
+
+# SDK config backup
+sdkconfig.old
+
+# Python cache
+__pycache__/
+*.pyc
+
+# VS Code local settings
+.vscode/
+
+# IDF managed components (restored by idf.py)
+managed_components/
+
+# Lock file (optional: có thể commit nếu muốn pin version)
+dependencies.lock
+
+# Office / temp docs
+*.bak
+Copy of *.xlsx
+Maychamcong*.docx
+Maychamcong_updated.docx
+Huong_Dan_Su_Dung_Web_Server..html
+
+# OS
+.DS_Store
+Thumbs.db

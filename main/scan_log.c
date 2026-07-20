@@ -2,6 +2,7 @@
 
 #include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
@@ -41,10 +42,11 @@ static int scan_log_row_event_code(int reg, bool is_admin, const char *admin_act
     return 0;
 }
 
-/** Chi giữ nhật ký trong vòng 60 ngày, tránh đầy thẻ SD nhưng vẫn đảm bảo lịch sử. */
-#define SCAN_LOG_KEEP_DAYS 60
+/** Chi giữ nhật ký trong vòng 90 ngày, tránh đầy thẻ SD nhưng vẫn đảm bảo lịch sử. */
+#define SCAN_LOG_AUTO_TRIM 1
+#define SCAN_LOG_KEEP_DAYS 90
 #define SCAN_LOG_KEEP_SEC ((time_t)(SCAN_LOG_KEEP_DAYS * 86400))
-/** Tăng giới hạn dung lượng lên 10MB để ưu tiên giữ đủ 60 ngày. */
+/** Tăng giới hạn dung lượng lên 10MB để ưu tiên giữ đủ 90 ngày. */
 #define SCAN_LOG_TRIM_FORCE_BYTES ((off_t)(10 * 1024 * 1024))
 /** Không quét lại toàn bộ file quá thường xuyên (giây mỗi lần quét). */
 #define SCAN_LOG_TRIM_INTERVAL_SEC (6 * 3600)
@@ -186,6 +188,10 @@ static bool log_line_kept(const char *line, const char *cutoff_ts)
 
 static void scan_log_do_trim(bool bypass_rate_limit)
 {
+    if (!SCAN_LOG_AUTO_TRIM) {
+        (void)bypass_rate_limit;
+        return;
+    }
     if (!sd_card_is_mounted()) {
         return;
     }
@@ -544,6 +550,343 @@ static int line_matches_today(const char *ts, const char *today_ymd)
     return strncmp(ts, today_ymd, 10) == 0;
 }
 
+/** Ghi YYYY-MM-DD (can toi thieu 11 byte); gioi han y/m/d de tranh -Wformat-truncation. */
+static void scan_log_format_ymd(const struct tm *t, char *out, size_t outsz)
+{
+    if (!out || outsz < 11) {
+        return;
+    }
+    if (!t) {
+        out[0] = '\0';
+        return;
+    }
+    int y = (int)(t->tm_year + 1900);
+    int m = (int)(t->tm_mon + 1);
+    int d = (int)t->tm_mday;
+    if (y < 1970) {
+        y = 1970;
+    } else if (y > 9999) {
+        y = 9999;
+    }
+    if (m < 1) {
+        m = 1;
+    } else if (m > 12) {
+        m = 12;
+    }
+    if (d < 1) {
+        d = 1;
+    } else if (d > 31) {
+        d = 31;
+    }
+    snprintf(out, outsz, "%04d-%02d-%02d", y, m, d);
+}
+
+typedef enum {
+    SCAN_LOG_SORT_TIME_DESC = 0,
+    SCAN_LOG_SORT_TIME_ASC,
+    SCAN_LOG_SORT_INDEX_DESC,
+    SCAN_LOG_SORT_INDEX_ASC,
+    SCAN_LOG_SORT_ID_DESC,
+    SCAN_LOG_SORT_ID_ASC,
+} scan_log_sort_mode_t;
+
+typedef struct {
+    bool show_all;
+    scan_log_sort_mode_t sort_mode;
+    int days;
+    int type_code; /* -1 = tat ca */
+    int limit;
+    int page;
+    char from_ymd[11];
+    char to_ymd[11];
+} scan_log_json_query_t;
+
+/** Gioi han khi sap xep theo index/ma NV (can buffer RAM). */
+#define SCAN_LOG_SORT_BUF_MAX 400
+
+typedef struct {
+    char ts[80];
+    char uid[48];
+    char name[96];
+    char id[48];
+    char admin_act[24];
+    int event_code;
+    long msg_index;
+    bool is_admin;
+} scan_log_stored_row_t;
+
+typedef struct {
+    const char *ts;
+    const char *uid;
+    const char *name;
+    const char *id;
+    const char *admin_act;
+    const char *idx_str;
+    int event_code;
+    long msg_index;
+    bool is_admin;
+} scan_log_parsed_row_t;
+
+static bool scan_log_parse_csv_line(char *buf, scan_log_parsed_row_t *out)
+{
+    if (!buf || !out) {
+        return false;
+    }
+    csv_strip_line_end(buf);
+    char *saveptr = buf;
+    char *fld0 = strsep(&saveptr, "|");
+    if (!fld0) {
+        return false;
+    }
+    char *fld1 = strsep(&saveptr, "|");
+    char *fld2 = strsep(&saveptr, "|");
+    char *fld3 = strsep(&saveptr, "|");
+    char *fld4 = strsep(&saveptr, "|");
+    char *fld5 = strsep(&saveptr, "|");
+    char *fld6 = strsep(&saveptr, "|");
+    csv_strip_field_cr(fld1);
+    csv_strip_field_cr(fld2);
+    csv_strip_field_cr(fld3);
+    csv_strip_field_cr(fld4);
+    csv_strip_field_cr(fld5);
+    csv_strip_field_cr(fld6);
+
+    out->ts = fld0;
+    out->uid = fld1 ? fld1 : "";
+    out->name = fld2 ? fld2 : "";
+    out->id = fld3 ? fld3 : "";
+    out->is_admin = (fld4 && strcmp(fld4, "99") == 0);
+    int reg = (fld4 && !out->is_admin) ? atoi(fld4) : -1;
+    out->admin_act = (out->is_admin && fld5 && fld5[0]) ? fld5 : "";
+    out->idx_str = out->is_admin ? (fld6 ? fld6 : "-1") : (fld5 ? fld5 : "-1");
+    out->msg_index = -1;
+    if (out->idx_str && out->idx_str[0] && strcmp(out->idx_str, "-") != 0) {
+        out->msg_index = atol(out->idx_str);
+    }
+    out->event_code = scan_log_row_event_code(reg, out->is_admin, out->admin_act);
+    return true;
+}
+
+static bool scan_log_row_matches_query(const scan_log_parsed_row_t *row, const scan_log_json_query_t *q,
+                                       bool time_ok, const char *today_ymd)
+{
+    if (!row || !q) {
+        return false;
+    }
+    if (q->type_code >= 0 && row->event_code != q->type_code) {
+        return false;
+    }
+    if (q->show_all) {
+        return true;
+    }
+    if (!row->ts || strlen(row->ts) < 10) {
+        return false;
+    }
+    if (!time_ok) {
+        return true;
+    }
+    if (q->from_ymd[0] || q->to_ymd[0]) {
+        if (q->from_ymd[0] && strncmp(row->ts, q->from_ymd, 10) < 0) {
+            return false;
+        }
+        if (q->to_ymd[0] && strncmp(row->ts, q->to_ymd, 10) > 0) {
+            return false;
+        }
+        return true;
+    }
+    return line_matches_today(row->ts, today_ymd) != 0;
+}
+
+static const char *scan_log_sort_mode_str(scan_log_sort_mode_t mode)
+{
+    switch (mode) {
+    case SCAN_LOG_SORT_TIME_ASC:
+        return "asc";
+    case SCAN_LOG_SORT_INDEX_DESC:
+        return "index_desc";
+    case SCAN_LOG_SORT_INDEX_ASC:
+        return "index_asc";
+    case SCAN_LOG_SORT_ID_DESC:
+        return "id_desc";
+    case SCAN_LOG_SORT_ID_ASC:
+        return "id_asc";
+    case SCAN_LOG_SORT_TIME_DESC:
+    default:
+        return "desc";
+    }
+}
+
+static bool scan_log_sort_by_field(scan_log_sort_mode_t mode)
+{
+    return mode >= SCAN_LOG_SORT_INDEX_DESC;
+}
+
+static void scan_log_store_row(const scan_log_parsed_row_t *src, scan_log_stored_row_t *dst)
+{
+    snprintf(dst->ts, sizeof(dst->ts), "%s", src->ts ? src->ts : "");
+    snprintf(dst->uid, sizeof(dst->uid), "%s", src->uid ? src->uid : "");
+    snprintf(dst->name, sizeof(dst->name), "%s", src->name ? src->name : "");
+    snprintf(dst->id, sizeof(dst->id), "%s", src->id ? src->id : "");
+    snprintf(dst->admin_act, sizeof(dst->admin_act), "%s", src->admin_act ? src->admin_act : "");
+    dst->event_code = src->event_code;
+    dst->msg_index = src->msg_index;
+    dst->is_admin = src->is_admin;
+}
+
+static int scan_log_cmp_index_asc(const void *a, const void *b)
+{
+    const scan_log_stored_row_t *ra = (const scan_log_stored_row_t *)a;
+    const scan_log_stored_row_t *rb = (const scan_log_stored_row_t *)b;
+    if (ra->msg_index < rb->msg_index) {
+        return -1;
+    }
+    if (ra->msg_index > rb->msg_index) {
+        return 1;
+    }
+    return strcmp(ra->ts, rb->ts);
+}
+
+static int scan_log_cmp_index_desc(const void *a, const void *b)
+{
+    return scan_log_cmp_index_asc(b, a);
+}
+
+static int scan_log_cmp_id_asc(const void *a, const void *b)
+{
+    const scan_log_stored_row_t *ra = (const scan_log_stored_row_t *)a;
+    const scan_log_stored_row_t *rb = (const scan_log_stored_row_t *)b;
+    const bool ea = (ra->id[0] == '\0');
+    const bool eb = (rb->id[0] == '\0');
+    if (ea && !eb) {
+        return 1;
+    }
+    if (!ea && eb) {
+        return -1;
+    }
+    const int c = strcmp(ra->id, rb->id);
+    if (c != 0) {
+        return c;
+    }
+    return strcmp(ra->ts, rb->ts);
+}
+
+static int scan_log_cmp_id_desc(const void *a, const void *b)
+{
+    return scan_log_cmp_id_asc(b, a);
+}
+
+static esp_err_t scan_log_emit_json_stored(httpd_req_t *req, const scan_log_stored_row_t *row, bool *first)
+{
+    char e_ts[80], e_uid[48], e_nm[128], e_id[128], e_ad[24];
+    json_escape(row->ts, e_ts, sizeof(e_ts));
+    json_escape(row->uid, e_uid, sizeof(e_uid));
+    json_escape(row->name, e_nm, sizeof(e_nm));
+    json_escape(row->id, e_id, sizeof(e_id));
+    json_escape(row->admin_act, e_ad, sizeof(e_ad));
+
+    char chunk[640];
+    snprintf(chunk, sizeof(chunk),
+             "%s{\"ts\":\"%s\",\"uid\":\"%s\",\"name\":\"%s\",\"id\":\"%s\",\"admin\":%s,\"action\":\"%s\","
+             "\"code\":%d,\"index\":%ld}",
+             *first ? "" : ",", e_ts, e_uid, e_nm, e_id, row->is_admin ? "true" : "false", e_ad, row->event_code,
+             row->msg_index);
+    *first = false;
+    return httpd_resp_send_chunk(req, chunk, strlen(chunk));
+}
+
+static void scan_log_json_parse_query(httpd_req_t *req, scan_log_json_query_t *q, bool time_ok,
+                                      const char *today_ymd)
+{
+    memset(q, 0, sizeof(*q));
+    q->type_code = -1;
+    q->limit = 50;
+    q->page = 1;
+    q->sort_mode = SCAN_LOG_SORT_TIME_DESC;
+
+    char query[128];
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK) {
+        return;
+    }
+    char v[16];
+    if (httpd_query_key_value(query, "all", v, sizeof(v)) == ESP_OK && v[0] == '1') {
+        q->show_all = true;
+    }
+    if (httpd_query_key_value(query, "days", v, sizeof(v)) == ESP_OK) {
+        int d = atoi(v);
+        if (d > 0) {
+            q->days = d;
+        }
+    }
+    if (httpd_query_key_value(query, "from", v, sizeof(v)) == ESP_OK && v[0]) {
+        snprintf(q->from_ymd, sizeof(q->from_ymd), "%.10s", v);
+    }
+    if (httpd_query_key_value(query, "to", v, sizeof(v)) == ESP_OK && v[0]) {
+        snprintf(q->to_ymd, sizeof(q->to_ymd), "%.10s", v);
+    }
+    if (httpd_query_key_value(query, "code", v, sizeof(v)) == ESP_OK && v[0]) {
+        int c = atoi(v);
+        if (c == 601 || c == 602 || c == 603 || c == 604) {
+            q->type_code = c;
+        }
+    }
+    if (httpd_query_key_value(query, "sort", v, sizeof(v)) == ESP_OK && v[0]) {
+        if (strcmp(v, "asc") == 0) {
+            q->sort_mode = SCAN_LOG_SORT_TIME_ASC;
+        } else if (strcmp(v, "index_desc") == 0) {
+            q->sort_mode = SCAN_LOG_SORT_INDEX_DESC;
+        } else if (strcmp(v, "index_asc") == 0) {
+            q->sort_mode = SCAN_LOG_SORT_INDEX_ASC;
+        } else if (strcmp(v, "id_desc") == 0) {
+            q->sort_mode = SCAN_LOG_SORT_ID_DESC;
+        } else if (strcmp(v, "id_asc") == 0) {
+            q->sort_mode = SCAN_LOG_SORT_ID_ASC;
+        } else {
+            q->sort_mode = SCAN_LOG_SORT_TIME_DESC;
+        }
+    }
+    if (httpd_query_key_value(query, "limit", v, sizeof(v)) == ESP_OK) {
+        int n = atoi(v);
+        if (n > 0 && n <= 200) {
+            q->limit = n;
+        }
+    }
+    if (httpd_query_key_value(query, "page", v, sizeof(v)) == ESP_OK) {
+        int p = atoi(v);
+        if (p > 0) {
+            q->page = p;
+        }
+    }
+
+    if (q->days > 0 && time_ok && !q->show_all) {
+        time_t now = time(NULL);
+        time_t from_t = now - (time_t)q->days * 86400;
+        struct tm tfrom;
+        scan_log_wall_tm(from_t, &tfrom);
+        scan_log_format_ymd(&tfrom, q->from_ymd, sizeof(q->from_ymd));
+        strncpy(q->to_ymd, today_ymd, sizeof(q->to_ymd) - 1);
+        q->to_ymd[sizeof(q->to_ymd) - 1] = '\0';
+    }
+}
+
+static esp_err_t scan_log_emit_json_row(httpd_req_t *req, const scan_log_parsed_row_t *row, bool *first)
+{
+    char e_ts[80], e_uid[48], e_nm[128], e_id[128], e_ad[24];
+    json_escape(row->ts, e_ts, sizeof(e_ts));
+    json_escape(row->uid, e_uid, sizeof(e_uid));
+    json_escape(row->name, e_nm, sizeof(e_nm));
+    json_escape(row->id, e_id, sizeof(e_id));
+    json_escape(row->admin_act, e_ad, sizeof(e_ad));
+
+    char chunk[640];
+    snprintf(chunk, sizeof(chunk),
+             "%s{\"ts\":\"%s\",\"uid\":\"%s\",\"name\":\"%s\",\"id\":\"%s\",\"admin\":%s,\"action\":\"%s\","
+             "\"code\":%d,\"index\":%ld}",
+             *first ? "" : ",", e_ts, e_uid, e_nm, e_id, row->is_admin ? "true" : "false", e_ad, row->event_code,
+             row->msg_index);
+    *first = false;
+    return httpd_resp_send_chunk(req, chunk, strlen(chunk));
+}
+
 static const char SCANS_CSS[] =
     "<style>"
     "*{box-sizing:border-box;margin:0;padding:0}"
@@ -592,9 +935,8 @@ esp_err_t scan_log_send_html_page(httpd_req_t *req)
     struct tm tloc;
     scan_log_wall_tm(now, &tloc);
     const bool time_ok = (tloc.tm_year >= (2020 - 1900));
-    char today_ymd[48];
-    (void)snprintf(today_ymd, sizeof(today_ymd), "%04d-%02d-%02d", (int)(tloc.tm_year + 1900),
-                   (int)(tloc.tm_mon + 1), (int)tloc.tm_mday);
+    char today_ymd[16];
+    scan_log_format_ymd(&tloc, today_ymd, sizeof(today_ymd));
 
     sd_card_lock();
     FILE *fp = fopen(BOARD_SD_RFID_LOG_PATH, "r");
@@ -767,25 +1109,31 @@ esp_err_t scan_log_send_html_page(httpd_req_t *req)
     return httpd_resp_send_chunk(req, NULL, 0);
 }
 
+static void scan_log_page_range(const scan_log_json_query_t *jq, int total_matched, int *start_idx, int *end_idx)
+{
+    if (jq->sort_mode == SCAN_LOG_SORT_TIME_DESC) {
+        *start_idx = total_matched - (jq->page * jq->limit);
+        if (*start_idx < 0) {
+            *start_idx = 0;
+        }
+        *end_idx = total_matched - ((jq->page - 1) * jq->limit);
+        if (*end_idx < 0) {
+            *end_idx = 0;
+        }
+        return;
+    }
+    *start_idx = (jq->page - 1) * jq->limit;
+    if (*start_idx > total_matched) {
+        *start_idx = total_matched;
+    }
+    *end_idx = *start_idx + jq->limit;
+    if (*end_idx > total_matched) {
+        *end_idx = total_matched;
+    }
+}
+
 esp_err_t scan_log_send_json(httpd_req_t *req)
 {
-    bool show_all = false;
-    int limit = 150;
-    char qry[96];
-    if (httpd_req_get_url_query_str(req, qry, sizeof(qry)) == ESP_OK) {
-        char v[12];
-        if (httpd_query_key_value(qry, "all", v, sizeof(v)) == ESP_OK && v[0] == '1') {
-            show_all = true;
-            limit = 999999; // Không giới hạn khi xem tất cả
-        }
-        if (httpd_query_key_value(qry, "limit", v, sizeof(v)) == ESP_OK) {
-            int n = atoi(v);
-            if (n > 0) {
-                limit = n;
-            }
-        }
-    }
-
     httpd_resp_set_type(req, "application/json; charset=utf-8");
 
     if (!sd_card_is_mounted()) {
@@ -796,9 +1144,11 @@ esp_err_t scan_log_send_json(httpd_req_t *req)
     struct tm tloc;
     scan_log_wall_tm(now, &tloc);
     const bool time_ok = (tloc.tm_year >= (2020 - 1900));
-    char today_ymd[48];
-    (void)snprintf(today_ymd, sizeof(today_ymd), "%04d-%02d-%02d", (int)(tloc.tm_year + 1900),
-                   (int)(tloc.tm_mon + 1), (int)tloc.tm_mday);
+    char today_ymd[16];
+    scan_log_format_ymd(&tloc, today_ymd, sizeof(today_ymd));
+
+    scan_log_json_query_t jq;
+    scan_log_json_parse_query(req, &jq, time_ok, today_ymd);
 
     sd_card_lock();
     FILE *fp = fopen(BOARD_SD_RFID_LOG_PATH, "r");
@@ -807,103 +1157,138 @@ esp_err_t scan_log_send_json(httpd_req_t *req)
         return httpd_resp_sendstr(req, "{\"ok\":true,\"rows\":[]}");
     }
 
-    char hdr[64];
-    snprintf(hdr, sizeof(hdr), "{\"ok\":true,\"time_ok\":%s,\"rows\":[", time_ok ? "true" : "false");
-    esp_err_t e = httpd_resp_send_chunk(req, hdr, strlen(hdr));
-    if (e != ESP_OK) {
-        fclose(fp);
-        sd_card_unlock();
-        return e;
+    const bool field_sort = scan_log_sort_by_field(jq.sort_mode);
+    scan_log_stored_row_t *stored = NULL;
+    int stored_count = 0;
+    int full_filtered = 0;
+    bool sort_truncated = false;
+
+    if (field_sort) {
+        stored = (scan_log_stored_row_t *)calloc(SCAN_LOG_SORT_BUF_MAX, sizeof(scan_log_stored_row_t));
+        if (!stored) {
+            fclose(fp);
+            sd_card_unlock();
+            return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"Out of memory\",\"rows\":[]}");
+        }
     }
 
     int total_matched = 0;
     char temp_line[384];
     while (fgets(temp_line, sizeof(temp_line), fp)) {
-        if (!show_all && time_ok && !line_matches_today(temp_line, today_ymd)) {
+        lv_port_feed_wdt();
+        char buf[384];
+        snprintf(buf, sizeof(buf), "%s", temp_line);
+        scan_log_parsed_row_t row;
+        if (!scan_log_parse_csv_line(buf, &row)) {
+            continue;
+        }
+        if (!scan_log_row_matches_query(&row, &jq, time_ok, today_ymd)) {
+            continue;
+        }
+        if (field_sort) {
+            full_filtered++;
+            if (stored_count < SCAN_LOG_SORT_BUF_MAX) {
+                scan_log_store_row(&row, &stored[stored_count++]);
+            } else {
+                sort_truncated = true;
+            }
             continue;
         }
         total_matched++;
     }
 
-    rewind(fp);
-    int skip_count = total_matched - limit;
-    if (skip_count < 0) {
-        skip_count = 0;
+    if (field_sort) {
+        if (full_filtered > SCAN_LOG_SORT_BUF_MAX) {
+            sort_truncated = true;
+        }
+        total_matched = stored_count;
+        int (*cmp_fn)(const void *, const void *) = scan_log_cmp_index_desc;
+        if (jq.sort_mode == SCAN_LOG_SORT_INDEX_ASC) {
+            cmp_fn = scan_log_cmp_index_asc;
+        } else if (jq.sort_mode == SCAN_LOG_SORT_ID_ASC) {
+            cmp_fn = scan_log_cmp_id_asc;
+        } else if (jq.sort_mode == SCAN_LOG_SORT_ID_DESC) {
+            cmp_fn = scan_log_cmp_id_desc;
+        }
+        if (stored_count > 1) {
+            qsort(stored, (size_t)stored_count, sizeof(scan_log_stored_row_t), cmp_fn);
+        }
     }
 
-    char raw[384];
-    int current_match = 0;
+    int start_idx = 0;
+    int end_idx = 0;
+    scan_log_page_range(&jq, total_matched, &start_idx, &end_idx);
+    const int items_to_read = end_idx - start_idx;
+
+    char hdr[224];
+    if (field_sort && sort_truncated) {
+        snprintf(hdr, sizeof(hdr),
+                 "{\"ok\":true,\"time_ok\":%s,\"total\":%d,\"total_filtered\":%d,\"page\":%d,\"limit\":%d,"
+                 "\"sort\":\"%s\",\"sort_truncated\":true,\"rows\":[",
+                 time_ok ? "true" : "false", total_matched, full_filtered, jq.page, jq.limit,
+                 scan_log_sort_mode_str(jq.sort_mode));
+    } else {
+        snprintf(hdr, sizeof(hdr),
+                 "{\"ok\":true,\"time_ok\":%s,\"total\":%d,\"page\":%d,\"limit\":%d,\"sort\":\"%s\","
+                 "\"sort_truncated\":false,\"rows\":[",
+                 time_ok ? "true" : "false", total_matched, jq.page, jq.limit,
+                 scan_log_sort_mode_str(jq.sort_mode));
+    }
+    esp_err_t e = httpd_resp_send_chunk(req, hdr, strlen(hdr));
+    if (e != ESP_OK) {
+        fclose(fp);
+        free(stored);
+        sd_card_unlock();
+        return e;
+    }
+
     int rows_out = 0;
     bool first = true;
-    while (fgets(raw, sizeof(raw), fp) && rows_out < limit) {
-        lv_port_feed_wdt();
-        char buf[384];
-        snprintf(buf, sizeof(buf), "%s", raw);
-        csv_strip_line_end(buf);
-        char *saveptr = buf;
-        char *fld0 = strsep(&saveptr, "|");
-        if (!fld0) {
-            continue;
-        }
-        char *fld1 = strsep(&saveptr, "|");
-        char *fld2 = strsep(&saveptr, "|");
-        char *fld3 = strsep(&saveptr, "|");
-        char *fld4 = strsep(&saveptr, "|");
-        char *fld5 = strsep(&saveptr, "|"); /* admin action label (SAVE/DEL) neu fld4==99, hoac index neu normal */
-        char *fld6 = strsep(&saveptr, "|"); /* index neu admin, NULL neu cu */
-        csv_strip_field_cr(fld1);
-        csv_strip_field_cr(fld2);
-        csv_strip_field_cr(fld3);
-        csv_strip_field_cr(fld4);
-        csv_strip_field_cr(fld5);
-        csv_strip_field_cr(fld6);
 
-        const char *ts = fld0;
-        const char *uidv = fld1 ? fld1 : "";
-        const char *nm = fld2 ? fld2 : "";
-        const char *idv = fld3 ? fld3 : "";
-        int is_admin = (fld4 && strcmp(fld4, "99") == 0);
-        int reg = (fld4 && !is_admin) ? atoi(fld4) : -1;
-        const char *admin_act = (is_admin && fld5 && fld5[0]) ? fld5 : "";
-        const char *idx_str = is_admin ? (fld6 ? fld6 : "-1") : (fld5 ? fld5 : "-1");
-        long msg_index = -1;
-        if (idx_str && idx_str[0] && strcmp(idx_str, "-") != 0) {
-            msg_index = atol(idx_str);
+    if (field_sort) {
+        for (int i = start_idx; i < end_idx && rows_out < items_to_read; i++) {
+            e = scan_log_emit_json_stored(req, &stored[i], &first);
+            if (e != ESP_OK) {
+                fclose(fp);
+                free(stored);
+                sd_card_unlock();
+                return e;
+            }
+            rows_out++;
         }
-        int event_code = scan_log_row_event_code(reg, is_admin, admin_act);
+    } else {
+        rewind(fp);
+        int current_match = 0;
+        char raw[384];
+        while (fgets(raw, sizeof(raw), fp) && rows_out < items_to_read) {
+            lv_port_feed_wdt();
+            char buf[384];
+            snprintf(buf, sizeof(buf), "%s", raw);
+            scan_log_parsed_row_t row;
+            if (!scan_log_parse_csv_line(buf, &row)) {
+                continue;
+            }
+            if (!scan_log_row_matches_query(&row, &jq, time_ok, today_ymd)) {
+                continue;
+            }
+            if (current_match < start_idx) {
+                current_match++;
+                continue;
+            }
 
-        if (!show_all && time_ok && !line_matches_today(ts, today_ymd)) {
-            continue;
-        }
-
-        if (current_match < skip_count) {
+            e = scan_log_emit_json_row(req, &row, &first);
+            if (e != ESP_OK) {
+                fclose(fp);
+                sd_card_unlock();
+                return e;
+            }
             current_match++;
-            continue;
+            rows_out++;
         }
-
-        char e_ts[80], e_uid[48], e_nm[128], e_id[128], e_ad[24];
-        json_escape(ts, e_ts, sizeof(e_ts));
-        json_escape(uidv, e_uid, sizeof(e_uid));
-        json_escape(nm, e_nm, sizeof(e_nm));
-        json_escape(idv, e_id, sizeof(e_id));
-        json_escape(admin_act, e_ad, sizeof(e_ad));
-
-        char row[640];
-        snprintf(row, sizeof(row),
-                 "%s{\"ts\":\"%s\",\"uid\":\"%s\",\"name\":\"%s\",\"id\":\"%s\",\"admin\":%s,\"action\":\"%s\","
-                 "\"code\":%d,\"index\":%ld}",
-                 first ? "" : ",", e_ts, e_uid, e_nm, e_id, is_admin ? "true" : "false", e_ad, event_code,
-                 msg_index);
-        e = httpd_resp_send_chunk(req, row, strlen(row));
-        if (e != ESP_OK) {
-            fclose(fp);
-            sd_card_unlock();
-            return e;
-        }
-        first = false;
-        rows_out++;
     }
+
     fclose(fp);
+    free(stored);
     sd_card_unlock();
 
     e = httpd_resp_send_chunk(req, "]}", 2);
@@ -971,10 +1356,10 @@ static time_t scan_log_ts_string_to_utc(const char *ts_str)
 {
     int y = 0, mo = 0, d = 0, h = 0, mi = 0, s = 0;
     if (!ts_str || ts_str[0] == '\0' || strncmp(ts_str, "no-ntp", 6) == 0) {
-        return time(NULL);
+        return 0;
     }
     if (sscanf(ts_str, "%4d-%2d-%2dT%2d:%2d:%2d", &y, &mo, &d, &h, &mi, &s) != 6) {
-        return time(NULL);
+        return 0;
     }
     struct tm ti = {0};
     ti.tm_year = y - 1900;
@@ -987,7 +1372,7 @@ static time_t scan_log_ts_string_to_utc(const char *ts_str)
     /* Chuoi log = gmtime(utc + BOARD_LOCAL_UTC_OFFSET_SEC) */
     time_t wall_epoch = mktime(&ti);
     if (wall_epoch < 0) {
-        return time(NULL);
+        return 0;
     }
     return wall_epoch - (time_t)BOARD_LOCAL_UTC_OFFSET_SEC;
 }

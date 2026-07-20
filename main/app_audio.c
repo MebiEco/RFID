@@ -80,6 +80,29 @@ static void audio_i2s_teardown(void)
 
 volatile bool g_audio_abort = false;
 
+/** Ghi im lặng vài chunk để thay mẫu PCM cuối trong DMA — tránh rè "nnn". */
+static void audio_i2s_flush_silence(void)
+{
+    if (!s_tx_chan) {
+        return;
+    }
+    int16_t silence[256];
+    memset(silence, 0, sizeof(silence));
+    for (int i = 0; i < 6; i++) {
+        size_t written = 0;
+        esp_err_t err = i2s_channel_write(s_tx_chan, silence, sizeof(silence), &written, pdMS_TO_TICKS(20));
+        if (err != ESP_OK) {
+            break;
+        }
+    }
+}
+
+static void audio_abort_teardown(void)
+{
+    audio_i2s_flush_silence();
+    audio_i2s_teardown();
+}
+
 /**
  * Ra hiệu dừng phát nhạc ngay lập tức.
  * Gọi từ rfid_task khi quẹt thẻ để nhường quyền truy cập SD.
@@ -89,7 +112,20 @@ void app_audio_pause(void)
     g_audio_abort = true;
 }
 
-/** Tiếp tục I2S sau khi ghi SD xong (hiện tại không làm gì, task tự xử lý). */
+void app_audio_clear_queue(void)
+{
+    if (s_audio_q) {
+        xQueueReset(s_audio_q);
+    }
+}
+
+void app_audio_stop_and_clear(void)
+{
+    g_audio_abort = true;
+    app_audio_clear_queue();
+}
+
+/** Giữ tương thích — I2S được bật lại trong play_wav_file khi phát tiếp. */
 void app_audio_resume(void)
 {
 }
@@ -388,6 +424,9 @@ static esp_err_t play_wav_file(const char *path)
 
     fclose(f);
     sd_card_unlock();
+    if (g_audio_abort) {
+        audio_abort_teardown();
+    }
     return out_err;
 }
 
@@ -430,7 +469,7 @@ void app_audio_start(void)
         ESP_LOGE(TAG, "xQueueCreate thất bại");
         return;
     }
-    BaseType_t ok = xTaskCreate(app_audio_task, "app_audio", AUDIO_TASK_STACK, NULL, BOARD_AUDIO_TASK_PRIO, NULL);
+    BaseType_t ok = xTaskCreatePinnedToCore(app_audio_task, "app_audio", AUDIO_TASK_STACK, NULL, BOARD_AUDIO_TASK_PRIO, NULL, 0);
     if (ok != pdPASS) {
         ESP_LOGE(TAG, "Khong tao duoc task app_audio");
         vQueueDelete(s_audio_q);

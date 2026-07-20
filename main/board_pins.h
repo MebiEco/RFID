@@ -358,7 +358,7 @@
 #endif
 /** Biên độ PCM sau decode WAV: sample_out = sample * NUM / DEN (trước clip int16). */
 #ifndef BOARD_AUDIO_PCM_GAIN_NUM
-#define BOARD_AUDIO_PCM_GAIN_NUM 2
+#define BOARD_AUDIO_PCM_GAIN_NUM 5
 #endif
 #ifndef BOARD_AUDIO_PCM_GAIN_DEN
 #define BOARD_AUDIO_PCM_GAIN_DEN 5
@@ -393,7 +393,7 @@
 #endif
 /** Khi bật audio: ưu tiên thấp hơn màn/ảnh/RFID (FreeRTOS, số càng lớn càng ưu). Mặc định 3. */
 #ifndef BOARD_AUDIO_TASK_PRIO
-#define BOARD_AUDIO_TASK_PRIO 3
+#define BOARD_AUDIO_TASK_PRIO 7
 #endif
 /**
  * Số ms nghỉ trước khi xếp hàng 2/3.wav sau khi vẽ ảnh (decode + SPI) — 0 = không trễ.

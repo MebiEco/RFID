@@ -38,6 +38,23 @@ extern void lcd_ui_invalidate_card_cache(void);
 
 static const char *TAG = "azure_iot";
 
+/** 2020-01-01 UTC — duoi nguong nay = chua NTP / epoch sai, khong gui backend. */
+#define AZURE_TS_MIN_UTC 1577836800LL
+
+static bool azure_ts_valid(int64_t ts)
+{
+    return ts >= AZURE_TS_MIN_UTC;
+}
+
+/** Timestamp da luu hop le, hoac time() hien tai neu NTP vua sync; 0 = chua gui duoc. */
+static time_t azure_resolve_timestamp(int64_t stored)
+{
+    if (azure_ts_valid(stored)) {
+        return (time_t)stored;
+    }
+    return wifi_portal_get_utc_sec();
+}
+
 /** Trim NVS/WiFi portal strings — trailing spaces break TLS hostname verify (CN/SNI). */
 static void trim_inplace(char *s)
 {
@@ -155,6 +172,11 @@ static int azure_publish_event_entry(esp_mqtt_client_handle_t client, const char
     if (!client || !dev_id || !ent || dev_id[0] == '\0' || ent->uid[0] == '\0') {
         return -1;
     }
+    time_t ts = azure_resolve_timestamp(ent->timestamp_utc);
+    if (ts == 0) {
+        ESP_LOGW(TAG, "Replay bo qua index=%ld — chua co timestamp hop le", (long)ent->index);
+        return 0;
+    }
     char topic[128];
     snprintf(topic, sizeof(topic), "devices/%s/messages/events/", dev_id);
 
@@ -162,7 +184,7 @@ static int azure_publish_event_entry(esp_mqtt_client_handle_t client, const char
     snprintf(payload, sizeof(payload),
              "{\"Code\":%d,\"Index\":%ld,\"TimeStamp\":%lld,\"Data\":{\"DeviceName\":\"RFID_Scanner\","
              "\"UID\":\"%s\",\"Name\":\"%s\",\"ID\":\"%s\"}}",
-             ent->event_code, (long)ent->index, (long long)ent->timestamp_utc, ent->uid, ent->name, ent->id);
+             ent->event_code, (long)ent->index, (long long)ts, ent->uid, ent->name, ent->id);
 
     int pub_ret = esp_mqtt_client_publish(client, topic, payload, 0, 1, 0);
     if (pub_ret < 0) {
@@ -225,6 +247,24 @@ static void azure_parse_sync_data(cJSON *root, azure_sync_req_t *out)
             }
         }
     }
+    
+    cJSON *s = cJSON_GetObjectItem(data, "StartIdx");
+    cJSON *e = cJSON_GetObjectItem(data, "EndIdx");
+    if (s && cJSON_IsNumber(s) && e && cJSON_IsNumber(e)) {
+        int32_t start_idx = (int32_t)s->valuedouble;
+        int32_t end_idx = (int32_t)e->valuedouble;
+        if (start_idx > 0 && end_idx >= start_idx) {
+            cJSON *code_obj = cJSON_GetObjectItem(data, "CodeRange");
+            int range_code = (code_obj && cJSON_IsNumber(code_obj)) ? code_obj->valueint : 602;
+            
+            for (int32_t idx = start_idx; idx <= end_idx && out->missing_count < SCAN_LOG_SYNC_MISSING_MAX; idx++) {
+                out->missing[out->missing_count].code = range_code;
+                out->missing[out->missing_count].index = idx;
+                out->missing_count++;
+            }
+        }
+    }
+    
     if (out->have_last_swipe || out->have_last_unkn || out->have_last_admin || out->missing_count > 0) {
         out->active = true;
         out->defer_response = true;
@@ -490,7 +530,7 @@ static void pending_enqueue(const char *uid, const char *name, const char *id, i
     strncpy(r.name, name ? name : "", sizeof(r.name) - 1);
     strncpy(r.id,   id   ? id   : "", sizeof(r.id)   - 1);
     r.event_code    = (int32_t)event_code;
-    r.timestamp_utc = (int64_t)time(NULL);
+    r.timestamp_utc = (int64_t)wifi_portal_get_utc_sec();
     r.index         = msg_idx;
 
     xSemaphoreTake(s_sd_pend_mtx, portMAX_DELAY);
@@ -566,6 +606,24 @@ static int flush_pending_queue(esp_mqtt_client_handle_t client, const char *dev_
             xSemaphoreGive(s_sd_pend_mtx);
             continue;
         }
+
+        time_t ts = azure_resolve_timestamp(rec.timestamp_utc);
+        if (ts == 0) {
+            ESP_LOGW(TAG, "SD queue: chua co NTP — giu lai code=%d index=%ld", (int)rec.event_code,
+                     (long)rec.index);
+            had_error = true;
+            xSemaphoreTake(s_sd_pend_mtx, portMAX_DELAY);
+            sd_card_lock();
+            FILE *rf = fopen(AZURE_PEND_SD_FILE, "ab");
+            if (rf) {
+                fwrite(&rec, sizeof(rec), 1, rf);
+                fclose(rf);
+            }
+            sd_card_unlock();
+            xSemaphoreGive(s_sd_pend_mtx);
+            continue;
+        }
+        rec.timestamp_utc = (int64_t)ts;
 
         /* Dùng static để giảm áp lực lên stack của task */
         static char payload[384];
@@ -843,7 +901,6 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                                         app_azure_send_card_event(uid_str, nm, idd, 603, msg_idx);
                                         scan_log_append_admin(uid_str, nm, idd, "SAVE", msg_idx);
                                         lcd_ui_invalidate_card_cache();
-                                        app_audio_play_confirm();
                                         ESP_LOGI(TAG, "603: Da cap nhat profile UID=%s", uid_str);
                                         if (rid[0] != '\0') {
                                             char res_payload[320];
@@ -851,7 +908,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                                                      "{\"status\":200,\"payload\":{\"Code\":603,\"TimeStamp\":%lld,"
                                                      "\"Message\":\"Updated UID %s\"}}",
                                                      (long long)time(NULL), uid_str);
-                                                    azure_dm_response(event->client, rid, 200, res_payload);
+                                            azure_dm_response(event->client, rid, 200, res_payload);
                                         }
                                     } else {
                                         ESP_LOGE(TAG, "603: Luu profile loi UID=%s", uid_str);
@@ -878,7 +935,6 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                                     } else {
                                         ESP_LOGW(TAG, "604: Xoa profile UID=%s (file co the khong ton tai)", uid_str);
                                     }
-                                    app_audio_play_confirm();
                                     if (rid[0] != '\0') {
                                         char res_payload[320];
                                         snprintf(res_payload, sizeof(res_payload),
@@ -1063,6 +1119,7 @@ static void azure_task(void *arg)
                 },
                 .task = {
                     .priority = 6,
+                    .stack_size = 10240,
                 },
             };
 
@@ -1131,11 +1188,24 @@ static void azure_task(void *arg)
     }
 }
 
+static void azure_try_flush_pending(void)
+{
+    if (!s_azure_connected || !s_mqtt_client || !wifi_portal_time_is_valid()) {
+        return;
+    }
+    wifi_cred_t cred;
+    if (!azure_load_cred(&cred)) {
+        return;
+    }
+    (void)flush_pending_queue(s_mqtt_client, cred.azure_dev);
+}
+
 void app_azure_notify_sntp_synced(void)
 {
     if (s_ntp_done_sem) {
         (void)xSemaphoreGive(s_ntp_done_sem);
     }
+    azure_try_flush_pending();
 }
 
 void app_azure_notify_config_changed(void)
@@ -1168,6 +1238,14 @@ void app_azure_send_telemetry(const char *uid, const char *name, const char *id,
     if (!uid || !uid[0]) return;
 
     int code_val = is_registered ? 602 : 601;
+    time_t now = wifi_portal_get_utc_sec();
+
+    /* Chua NTP: xep hang, gui sau khi dong bo (timestamp=0 -> gan lai luc flush). */
+    if (now == 0) {
+        pending_enqueue(uid, name, id, code_val, msg_idx);
+        ESP_LOGW(TAG, "Chua co NTP — xep hang telemetry: UID=%s index=%ld", uid, (long)msg_idx);
+        return;
+    }
 
     /* Nếu chưa kết nối: lưu vào hàng đợi offline (SD), đợi flush khi có mạng */
     if (!s_azure_connected || !s_mqtt_client) {
@@ -1193,8 +1271,6 @@ void app_azure_send_telemetry(const char *uid, const char *name, const char *id,
     snprintf(topic, sizeof(topic), "devices/%s/messages/events/", cred.azure_dev);
 
     char payload[320];
-    time_t now = time(NULL);
-
     snprintf(payload, sizeof(payload),
              "{\"Code\":%d,\"Index\":%ld,\"TimeStamp\":%lld,\"Data\":{\"DeviceName\":\"RFID_Scanner\",\"UID\":\"%s\",\"Name\":\"%s\",\"ID\":\"%s\"}}",
              code_val, (long)msg_idx, (long long)now, uid, name ? name : "", id ? id : "");
@@ -1207,6 +1283,13 @@ void app_azure_send_card_event(const char *uid, const char *name, const char *id
                                int32_t msg_idx)
 {
     if (!uid || !uid[0] || msg_idx <= 0) {
+        return;
+    }
+
+    time_t now = wifi_portal_get_utc_sec();
+    if (now == 0) {
+        pending_enqueue(uid, name, id, event_code, msg_idx);
+        ESP_LOGW(TAG, "Chua co NTP — xep hang event %d: UID=%s index=%ld", event_code, uid, (long)msg_idx);
         return;
     }
 
@@ -1234,14 +1317,47 @@ void app_azure_send_card_event(const char *uid, const char *name, const char *id
     snprintf(topic, sizeof(topic), "devices/%s/messages/events/", cred.azure_dev);
 
     char payload[320];
-    time_t now = time(NULL);
-
     snprintf(payload, sizeof(payload),
              "{\"Code\":%d,\"Index\":%ld,\"TimeStamp\":%lld,\"Data\":{\"DeviceName\":\"RFID_Scanner\",\"UID\":\"%s\",\"Name\":\"%s\",\"ID\":\"%s\"}}",
              event_code, (long)msg_idx, (long long)now, uid, name ? name : "", id ? id : "");
 
     int pub_id = esp_mqtt_client_publish(s_mqtt_client, topic, payload, 0, 1, 0);
     ESP_LOGI(TAG, "Da day event %d len Azure (msg_id=%d, index=%ld): %s", event_code, pub_id, (long)msg_idx, payload);
+}
+
+int app_azure_resend_range(int code, int32_t start_idx, int32_t end_idx)
+{
+    if (start_idx > end_idx || start_idx <= 0) return 0;
+    if (!s_mqtt_client || !s_azure_connected) return 0;
+
+    wifi_cred_t cred;
+    if (!azure_load_cred(&cred)) return 0;
+
+    int total_resent = 0;
+    int32_t current = start_idx;
+    
+    struct {
+        esp_mqtt_client_handle_t client;
+        const char *dev_id;
+    } rctx = { .client = s_mqtt_client, .dev_id = cred.azure_dev };
+
+    while (current <= end_idx) {
+        scan_log_sync_filter_t filt;
+        memset(&filt, 0, sizeof(filt));
+        
+        while (current <= end_idx && filt.missing_count < SCAN_LOG_SYNC_MISSING_MAX) {
+            filt.missing[filt.missing_count].code = code;
+            filt.missing[filt.missing_count].index = current;
+            filt.missing_count++;
+            current++;
+        }
+        
+        scan_log_replay_stats_t st;
+        if (scan_log_replay_gaps(&filt, azure_replay_publish_cb, &rctx, &st) == ESP_OK) {
+            total_resent += st.resent;
+        }
+    }
+    return total_resent;
 }
 
 int app_azure_is_connected(void)

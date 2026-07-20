@@ -146,6 +146,7 @@ void app_rfid_start(void)
 #include "sd_png.h"
 #include "scan_log.h"
 #include "app_azure.h"
+#include "app_ota.h"
 #if BOARD_ENABLE_AUDIO
 #include "app_audio.h"
 #endif
@@ -446,7 +447,7 @@ static void rfid_task(void *arg)
     const bool wdt_ok = (esp_task_wdt_add(NULL) == ESP_OK);
 
     static uint64_t last_sd_retry_us;
-    static bool s_queued_ready_1_wav; /* 1.wav: mot lan = WiFi STA ok + thoi gian thuc (NTP) + SD */
+    static bool s_queued_ready_1_wav; /* 1.wav: mot lan sau boot (bo qua lan dau neu vua OTA) */
     uint64_t last_idle_update_us = 0;
 
     for (;;) {
@@ -529,14 +530,21 @@ static void rfid_task(void *arg)
                 wifi_portal_time_is_valid()) {
                 s_queued_ready_1_wav = true;
 #if BOARD_ENABLE_AUDIO && !BOARD_AUDIO_STRESS_TEST
-                if (BOARD_AUDIO_MS_AFTER_IDLE_PAINT > 0) {
-                    vTaskDelay(pdMS_TO_TICKS(BOARD_AUDIO_MS_AFTER_IDLE_PAINT));
-                }
-                if (sd_file_exists(BOARD_SD_AUDIO_1_WAV)) {
-                    (void)app_audio_queue_wav(BOARD_SD_AUDIO_1_WAV);
+                if (app_ota_take_skip_welcome()) {
+                    ESP_LOGI(TAG, "Bo qua 1.wav sau OTA reboot");
                 } else {
-                    ESP_LOGW(TAG, "Thieu %s (tren the: thu muc /audio/, PCM 16-bit mono/stereo)", BOARD_SD_AUDIO_1_WAV);
+                    if (BOARD_AUDIO_MS_AFTER_IDLE_PAINT > 0) {
+                        vTaskDelay(pdMS_TO_TICKS(BOARD_AUDIO_MS_AFTER_IDLE_PAINT));
+                    }
+                    if (sd_file_exists(BOARD_SD_AUDIO_1_WAV)) {
+                        (void)app_audio_queue_wav(BOARD_SD_AUDIO_1_WAV);
+                    } else {
+                        ESP_LOGW(TAG, "Thieu %s (tren the: thu muc /audio/, PCM 16-bit mono/stereo)",
+                                 BOARD_SD_AUDIO_1_WAV);
+                    }
                 }
+#else
+                (void)app_ota_take_skip_welcome();
 #endif
             }
         }
@@ -594,7 +602,9 @@ static void rfid_task(void *arg)
 
         if (!had_card || strcmp(uid_colon, last_uid) != 0) {
 #if BOARD_ENABLE_AUDIO && !BOARD_AUDIO_STRESS_TEST
-            app_audio_pause(); /* quẹt mới: ngưng phát lần trước, ưu tiên xử lý thẻ */
+            /* Dừng sạch + xóa hàng đợi — tránh 1.wav/2.wav chồng → "xin xin xin". */
+            app_audio_stop_and_clear();
+            vTaskDelay(pdMS_TO_TICKS(15));
 #endif
             format_datetime_line_for_lcd(dtline, sizeof(dtline));
             memset(name, 0, sizeof(name));
@@ -620,10 +630,6 @@ static void rfid_task(void *arg)
 
             /* --- BLOCK 1: Đọc SD lấy thông tin thẻ --- */
             if (sd_card_is_mounted()) {
-                
-#if BOARD_ENABLE_AUDIO && !BOARD_AUDIO_STRESS_TEST
-                app_audio_pause(); /* dừng amp trước khi ghi SD */
-#endif
 
                 sd_card_lock();
                 bool reg = false;
@@ -637,9 +643,6 @@ static void rfid_task(void *arg)
                     log_reg = -2;
                 }
                 sd_card_unlock();
-#if BOARD_ENABLE_AUDIO && !BOARD_AUDIO_STRESS_TEST
-                app_audio_resume(); /* cho amp hoạt động lại */
-#endif
 
                 /* Định dạng văn bản tên và mã */
                 if (log_reg >= 0) {
@@ -661,24 +664,17 @@ static void rfid_task(void *arg)
                     int32_t msg_idx = app_azure_get_and_increment_msg_index(
                         log_reg == 1 ? MSG_IDX_SWIPE : MSG_IDX_UNKNOWN);
 
-                    /* Ghi log trước khi phát — tránh pause(trước log) cắt ngay bài vừa xếp hàng */
-#if BOARD_ENABLE_AUDIO && !BOARD_AUDIO_STRESS_TEST
-                    app_audio_pause();
-#endif
+                    /* Ghi log trước khi phát — audio đã dừng ở đầu quẹt thẻ */
                     sd_card_lock();
                     scan_log_append(uid_nc, name, id, log_reg, msg_idx);
                     sd_card_unlock();
-#if BOARD_ENABLE_AUDIO && !BOARD_AUDIO_STRESS_TEST
-                    app_audio_resume();
-#endif
 
                     ESP_LOGI(TAG, "The %s type=%d id=%s | %s | %s", uid_nc, check_type, id, line1, dtline);
                     app_azure_send_telemetry(uid_nc, name, id, log_reg == 1 ? 1 : 0, msg_idx);
 
 #if BOARD_ENABLE_AUDIO
                     {
-                        const char *wav_path = (check_type == 1) ? BOARD_SD_AUDIO_2_WAV
-                                             : (check_type == 2) ? BOARD_SD_AUDIO_3_WAV : NULL;
+                        const char *wav_path = (check_type == 1 || check_type == 2) ? BOARD_SD_AUDIO_2_WAV : NULL;
 #if !BOARD_AUDIO_STRESS_TEST
                         if (wav_path && BOARD_AUDIO_MS_AFTER_IMAGE > 0) {
                             vTaskDelay(pdMS_TO_TICKS(BOARD_AUDIO_MS_AFTER_IMAGE));

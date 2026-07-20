@@ -10,6 +10,7 @@
 #include "esp_event.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_netif.h"
@@ -17,6 +18,8 @@
 #include "esp_sntp.h"
 #include "esp_wifi.h"
 #include "nvs.h"
+#include "lwip/inet.h"
+#include "lwip/sockets.h"
 
 #include "scan_log.h"
 #include "app_azure.h"
@@ -27,6 +30,7 @@ static const char *TAG = "wifi_portal";
 
 #define NVS_NS "wifi_portal"
 #define NVS_KEY "cred"
+#define NVS_KEY_WALL_UTC "wall_utc"
 #define CRED_MAGIC 0x57494649u
 
 typedef struct __attribute__((packed)) {
@@ -164,6 +168,13 @@ void wifi_list_get_item(int idx, char *ssid, char *pass) {
 #define AP_PASS "12345678"
 #define AP_CHANNEL 1
 #define AP_MAX_CONN 4
+
+/** Tu kiem tra portal; chi restart httpd khi mat phan hoi (khong reboot ESP). */
+#define PORTAL_HEALTH_INTERVAL_SEC      3600
+#define PORTAL_HEALTH_INITIAL_DELAY_SEC  600
+#define PORTAL_HEALTH_FAIL_RESTART       1
+/* LWIP_MAX_SOCKETS=10 → httpd can dung toi da 7 (7+3 noi bo). */
+#define PORTAL_HTTP_MAX_SOCKETS           7
 
 static httpd_handle_t s_server;
 static bool s_sntp_started;
@@ -741,46 +752,224 @@ static esp_err_t scans_get_handler(httpd_req_t *req)
     return scan_log_send_html_page(req);
 }
 
+#define WIFI_SCAN_CACHE_MAX   32
+#define WIFI_SCAN_CACHE_TTL_US (30LL * 1000000)
+
+#define WIFI_SCAN_TIMEOUT_US (15LL * 1000000)
+
+typedef struct {
+    bool valid;
+    bool scanning;
+    int64_t cache_us;
+    int64_t scan_start_us;
+    uint16_t count;
+    wifi_ap_record_t aps[WIFI_SCAN_CACHE_MAX];
+} wifi_scan_cache_t;
+
+static wifi_scan_cache_t s_wifi_scan;
+
+static void wifi_scan_cache_fill(void)
+{
+    uint16_t ap_count = 0;
+    if (esp_wifi_scan_get_ap_num(&ap_count) != ESP_OK) {
+        s_wifi_scan.valid = false;
+        s_wifi_scan.scanning = false;
+        return;
+    }
+    if (ap_count > WIFI_SCAN_CACHE_MAX) {
+        ap_count = WIFI_SCAN_CACHE_MAX;
+    }
+    s_wifi_scan.count = ap_count;
+    if (ap_count > 0) {
+        (void)esp_wifi_scan_get_ap_records(&ap_count, s_wifi_scan.aps);
+        s_wifi_scan.count = ap_count;
+    }
+    s_wifi_scan.valid = true;
+    s_wifi_scan.scanning = false;
+    s_wifi_scan.cache_us = esp_timer_get_time();
+}
+
+static esp_err_t wifi_scan_send_cached(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "application/json");
+    esp_err_t e = httpd_resp_send_chunk(req, "[", 1);
+    if (e != ESP_OK) {
+        return e;
+    }
+    char buf[128];
+    for (int i = 0; i < (int)s_wifi_scan.count; i++) {
+        snprintf(buf, sizeof(buf), "{\"ssid\":\"%s\",\"rssi\":%d}%s",
+                 (char *)s_wifi_scan.aps[i].ssid, s_wifi_scan.aps[i].rssi,
+                 (i < (int)s_wifi_scan.count - 1) ? "," : "");
+        e = httpd_resp_send_chunk(req, buf, strlen(buf));
+        if (e != ESP_OK) {
+            return e;
+        }
+    }
+    e = httpd_resp_send_chunk(req, "]", 1);
+    if (e != ESP_OK) {
+        return e;
+    }
+    return httpd_resp_send_chunk(req, NULL, 0);
+}
+
 static esp_err_t scan_get_handler(httpd_req_t *req)
 {
     if (!portal_auth_section(req, "wifi")) {
         httpd_resp_set_status(req, "403 Forbidden");
         return httpd_resp_sendstr(req, "[]");
     }
+
+    bool force_fresh = false;
+    char qry[16];
+    if (httpd_req_get_url_query_str(req, qry, sizeof(qry)) == ESP_OK) {
+        char v[4];
+        if (httpd_query_key_value(qry, "fresh", v, sizeof(v)) == ESP_OK && v[0] == '1') {
+            force_fresh = true;
+        }
+    }
+
+    const int64_t now_us = esp_timer_get_time();
+    if (!force_fresh && s_wifi_scan.valid && !s_wifi_scan.scanning &&
+        (now_us - s_wifi_scan.cache_us) < WIFI_SCAN_CACHE_TTL_US) {
+        return wifi_scan_send_cached(req);
+    }
+
+    if (s_wifi_scan.scanning) {
+        if ((now_us - s_wifi_scan.scan_start_us) > WIFI_SCAN_TIMEOUT_US) {
+            ESP_LOGW(TAG, "WiFi scan timeout — huy va tra cache");
+            (void)esp_wifi_scan_stop();
+            wifi_scan_cache_fill();
+        } else {
+            httpd_resp_set_type(req, "application/json");
+            return httpd_resp_sendstr(req, "{\"scanning\":true}");
+        }
+    }
+
     wifi_scan_config_t scan_config = {
         .ssid = 0,
         .bssid = 0,
         .channel = 0,
         .show_hidden = false
     };
-    esp_err_t scan_err = esp_wifi_scan_start(&scan_config, true);
-    if(scan_err != ESP_OK) {
+    esp_err_t scan_err = esp_wifi_scan_start(&scan_config, false);
+    if (scan_err == ESP_ERR_WIFI_STATE) {
+        s_wifi_scan.scanning = true;
+        s_wifi_scan.scan_start_us = now_us;
+        httpd_resp_set_type(req, "application/json");
+        return httpd_resp_sendstr(req, "{\"scanning\":true}");
+    }
+    if (scan_err != ESP_OK) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Scan failed");
         return ESP_FAIL;
     }
-    
-    uint16_t ap_count = 0;
-    esp_wifi_scan_get_ap_num(&ap_count);
-    
-    wifi_ap_record_t *ap_info = (wifi_ap_record_t *)malloc(sizeof(wifi_ap_record_t) * ap_count);
-    if (ap_info == NULL) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
-        return ESP_FAIL;
-    }
-    esp_wifi_scan_get_ap_records(&ap_count, ap_info);
-    
+
+    s_wifi_scan.scanning = true;
+    s_wifi_scan.valid = false;
+    s_wifi_scan.scan_start_us = now_us;
     httpd_resp_set_type(req, "application/json");
-    httpd_resp_send_chunk(req, "[", 1);
-    char buf[128];
-    for (int i = 0; i < ap_count; i++) {
-        snprintf(buf, sizeof(buf), "{\"ssid\":\"%s\",\"rssi\":%d}%s", (char *)ap_info[i].ssid, ap_info[i].rssi, (i < ap_count - 1) ? "," : "");
-        httpd_resp_send_chunk(req, buf, strlen(buf));
+    return httpd_resp_sendstr(req, "{\"scanning\":true}");
+}
+
+static esp_err_t ping_get_handler(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_set_hdr(req, "Connection", "close");
+    return httpd_resp_sendstr(req, "ok");
+}
+
+static bool portal_http_probe(void)
+{
+    int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (sock < 0) {
+        return false;
     }
-    httpd_resp_send_chunk(req, "]", 1);
-    httpd_resp_send_chunk(req, NULL, 0);
-    
-    free(ap_info);
-    return ESP_OK;
+
+    struct timeval tv = { .tv_sec = 3, .tv_usec = 0 };
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    struct sockaddr_in addr = { 0 };
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(80);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+    bool ok = false;
+    if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
+        static const char req[] =
+            "GET /api/ping HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+        if (send(sock, req, sizeof(req) - 1, 0) > 0) {
+            char buf[32];
+            int n = recv(sock, buf, sizeof(buf) - 1, 0);
+            if (n > 0) {
+                buf[n] = '\0';
+                ok = (strstr(buf, "200") != NULL);
+            }
+        }
+    }
+    close(sock);
+    return ok;
+}
+
+static esp_err_t stop_httpd(void)
+{
+    if (!s_server) {
+        return ESP_OK;
+    }
+    esp_err_t e = httpd_stop(s_server);
+    s_server = NULL;
+    return e;
+}
+
+static esp_err_t restart_httpd(void);
+
+static void portal_health_task(void *arg)
+{
+    (void)arg;
+    vTaskDelay(pdMS_TO_TICKS((uint32_t)PORTAL_HEALTH_INITIAL_DELAY_SEC * 1000U));
+
+    int fail_streak = 0;
+    for (;;) {
+        if (portal_http_probe()) {
+            if (fail_streak > 0) {
+                ESP_LOGI(TAG, "Portal health OK (truoc do fail %d lan)", fail_streak);
+            }
+            fail_streak = 0;
+        } else {
+            fail_streak++;
+            ESP_LOGW(TAG, "Portal health FAIL (%d/%d)", fail_streak, PORTAL_HEALTH_FAIL_RESTART);
+            if (fail_streak >= PORTAL_HEALTH_FAIL_RESTART) {
+                ESP_LOGW(TAG, "Restart httpd — portal khong phan hoi");
+                if (restart_httpd() == ESP_OK) {
+                    vTaskDelay(pdMS_TO_TICKS(2000));
+                    if (portal_http_probe()) {
+                        ESP_LOGI(TAG, "Portal phuc hoi sau restart httpd");
+                        fail_streak = 0;
+                    } else {
+                        ESP_LOGE(TAG, "Portal van loi sau restart httpd");
+                        fail_streak = 1;
+                    }
+                } else {
+                    ESP_LOGE(TAG, "restart httpd that bai");
+                }
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS((uint32_t)PORTAL_HEALTH_INTERVAL_SEC * 1000U));
+    }
+}
+
+static bool s_portal_health_started;
+
+static void portal_health_start(void)
+{
+    if (s_portal_health_started) {
+        return;
+    }
+    if (xTaskCreate(portal_health_task, "portal_hlth", 3072, NULL, 2, NULL) != pdPASS) {
+        ESP_LOGW(TAG, "Khong tao duoc portal health task");
+        return;
+    }
+    s_portal_health_started = true;
 }
 
 static esp_err_t start_httpd(void)
@@ -790,13 +979,18 @@ static esp_err_t start_httpd(void)
     /* /scans dung nhieu buffer tren stack; mac dinh 4096 de tran stack overflow -> reset. */
     cfg.stack_size = 8192;
     cfg.lru_purge_enable = true;
-    cfg.max_uri_handlers = 24;
+    cfg.max_uri_handlers = 32;
+    cfg.max_open_sockets = PORTAL_HTTP_MAX_SOCKETS;
+    cfg.keep_alive_enable = false;
 
-    if (httpd_start(&s_server, &cfg) != ESP_OK) {
-        ESP_LOGE(TAG, "httpd_start");
-        return ESP_FAIL;
+    esp_err_t err = httpd_start(&s_server, &cfg);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "httpd_start that bai: %s (max_open_sockets=%u)", esp_err_to_name(err),
+                 (unsigned)cfg.max_open_sockets);
+        return err;
     }
 
+    httpd_uri_t u_ping = { .uri = "/api/ping", .method = HTTP_GET, .handler = ping_get_handler, .user_ctx = NULL };
     httpd_uri_t u_root = { .uri = "/", .method = HTTP_GET, .handler = portal_root_get_handler, .user_ctx = NULL };
     httpd_uri_t u_save_w = { .uri = "/save_wifi", .method = HTTP_POST, .handler = save_wifi_post_handler, .user_ctx = NULL };
     httpd_uri_t u_save_a = { .uri = "/save_azure", .method = HTTP_POST, .handler = save_azure_post_handler, .user_ctx = NULL };
@@ -806,6 +1000,7 @@ static esp_err_t start_httpd(void)
     httpd_uri_t u_scanwifi = { .uri = "/scan", .method = HTTP_GET, .handler = scan_get_handler, .user_ctx = NULL };
     httpd_uri_t u_saved_wifis = { .uri = "/saved_wifis", .method = HTTP_GET, .handler = saved_wifis_get_handler, .user_ctx = NULL };
     httpd_uri_t u_del_wifi = { .uri = "/del_wifi", .method = HTTP_POST, .handler = del_wifi_post_handler, .user_ctx = NULL };
+    httpd_register_uri_handler(s_server, &u_ping);
     httpd_register_uri_handler(s_server, &u_root);
     httpd_register_uri_handler(s_server, &u_save_w);
     httpd_register_uri_handler(s_server, &u_save_a);
@@ -820,7 +1015,15 @@ static esp_err_t start_httpd(void)
     return ESP_OK;
 }
 
+static esp_err_t restart_httpd(void)
+{
+    (void)stop_httpd();
+    vTaskDelay(pdMS_TO_TICKS(300));
+    return start_httpd();
+}
+
 static void time_synced_cb(struct timeval *tv);
+static void sntp_adopt_wall_time_if_valid(void);
 
 static bool wall_time_valid(time_t utc)
 {
@@ -829,12 +1032,80 @@ static bool wall_time_valid(time_t utc)
     return t.tm_year >= (2020 - 1900);
 }
 
+/* Sau mat dien: gio khoi phuc tu NVS >= 2020 nhung KHONG phai gio NTP that.
+ * Dung de chan cham cong "sai gio" cho den khi SNTP that su cap nhat. */
+static bool    s_wall_from_nvs = false;
+static int64_t s_wall_nvs_epoch = 0;      /* UTC khoi phuc tu NVS */
+static int64_t s_wall_nvs_uptime_us = 0;  /* esp_timer luc khoi phuc */
+/* Nguong (giay) coi la "dong ho da nhay" -> SNTP that da hieu chinh. */
+#define WALL_NTP_JUMP_MIN_SEC 5
+
+/** Luu UTC lan NTP cuoi — sau reset khoi phuc tam cho den khi SNTP cap nhat lai. */
+static void wall_time_nvs_save(time_t utc)
+{
+    if (!wall_time_valid(utc)) {
+        return;
+    }
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) {
+        return;
+    }
+    nvs_set_i64(h, NVS_KEY_WALL_UTC, (int64_t)utc);
+    nvs_commit(h);
+    nvs_close(h);
+}
+
+/** Sau mat nguon: dat time() tu NVS (co the lech bang thoi gian tat may); SNTP se hieu chinh. */
+static void wall_time_nvs_restore(void)
+{
+    if (wall_time_valid(time(NULL))) {
+        return;
+    }
+    nvs_handle_t h;
+    int64_t saved = 0;
+    if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) {
+        return;
+    }
+    esp_err_t e = nvs_get_i64(h, NVS_KEY_WALL_UTC, &saved);
+    nvs_close(h);
+    if (e != ESP_OK || !wall_time_valid((time_t)saved)) {
+        return;
+    }
+    struct timeval tv = {.tv_sec = (time_t)saved, .tv_usec = 0};
+    if (settimeofday(&tv, NULL) != 0) {
+        ESP_LOGW(TAG, "Khoi phuc gio NVS that bai");
+        return;
+    }
+    /* Danh dau: gio nay tu NVS (tam, hien thi) — chua duoc phep cham cong. */
+    s_wall_from_nvs = true;
+    s_wall_nvs_epoch = saved;
+    s_wall_nvs_uptime_us = esp_timer_get_time();
+    struct tm t;
+    scan_log_wall_tm((time_t)saved, &t);
+    ESP_LOGI(TAG, "Khoi phuc gio NVS (tam, cho NTP): %04d-%02d-%02d %02d:%02d:%02d",
+             (int)(t.tm_year + 1900), (int)(t.tm_mon + 1), (int)t.tm_mday, (int)t.tm_hour, (int)t.tm_min,
+             (int)t.tm_sec);
+}
+
 bool wifi_portal_time_is_valid(void)
 {
-    if (s_time_synced) {
-        return true;
+    if (!s_time_synced) {
+        sntp_adopt_wall_time_if_valid();
     }
-    return wall_time_valid(time(NULL));
+    return s_time_synced;
+}
+
+/** UTC cho backend — chi sau NTP that (khong dung gio NVS tam). */
+time_t wifi_portal_get_utc_sec(void)
+{
+    if (!s_time_synced) {
+        return 0;
+    }
+    time_t now = time(NULL);
+    if (!wall_time_valid(now)) {
+        return 0;
+    }
+    return now;
 }
 
 static esp_err_t sntp_pick_server_api(void *arg)
@@ -851,48 +1122,119 @@ static void sntp_rotate_server(void)
     (void)esp_netif_tcpip_exec(sntp_pick_server_api, NULL);
 }
 
+/** NTP da cap nhat time() nhung callback cham — danh dau synced de UI/Azure khong treo. */
+static void sntp_adopt_wall_time_if_valid(void)
+{
+    if (s_time_synced) {
+        return;
+    }
+    time_t now = time(NULL);
+    if (!wall_time_valid(now)) {
+        return;
+    }
+    /* Sau mat dien, time() la gio khoi phuc tu NVS (chua chinh xac).
+     * Chi chap nhan khi phat hien SNTP that su da hieu chinh: time() nhay
+     * khoi quy dao du doan (NVS_epoch + uptime). Neu chua nhay -> cho callback NTP,
+     * KHONG cham cong bang gio NVS de tranh sai gio. */
+    if (s_wall_from_nvs) {
+        int64_t elapsed_s = (esp_timer_get_time() - s_wall_nvs_uptime_us) / 1000000;
+        int64_t predicted = s_wall_nvs_epoch + elapsed_s;
+        int64_t diff = (int64_t)now - predicted;
+        if (diff < 0) {
+            diff = -diff;
+        }
+        if (diff < WALL_NTP_JUMP_MIN_SEC) {
+            return;
+        }
+        ESP_LOGI(TAG, "SNTP hieu chinh gio NVS (nhay %lld s)", (long long)diff);
+    }
+    s_time_synced = true;
+    struct tm t;
+    scan_log_wall_tm(now, &t);
+    wall_time_nvs_save(now);
+    ESP_LOGI(TAG, "NTP ok (poll), Real time: %04d-%02d-%02d %02d:%02d:%02d",
+             (int)(t.tm_year + 1900), (int)(t.tm_mon + 1), (int)t.tm_mday,
+             (int)t.tm_hour, (int)t.tm_min, (int)t.tm_sec);
+    app_azure_notify_sntp_synced();
+}
+
 static void sntp_start_or_restart(void)
 {
     if (!s_sntp_started) {
+#if CONFIG_LWIP_SNTP_MAX_SERVERS >= 3
+        esp_sntp_config_t cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG_MULTIPLE(3, ESP_SNTP_SERVER_LIST(
+            "time.google.com", "pool.ntp.org", "vn.pool.ntp.org"));
+#else
         const char *srv = s_ntp_servers[s_ntp_server_idx % (sizeof(s_ntp_servers) / sizeof(s_ntp_servers[0]))];
         esp_sntp_config_t cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG(srv);
+#endif
+        cfg.server_from_dhcp = true;
+        cfg.renew_servers_after_new_IP = true;
+        cfg.ip_event_to_renew = IP_EVENT_STA_GOT_IP;
         cfg.sync_cb = time_synced_cb;
         cfg.start = true;
         esp_err_t e = esp_netif_sntp_init(&cfg);
         if (e == ESP_OK) {
             s_sntp_started = true;
-            ESP_LOGI(TAG, "SNTP: %s (co %u may chu du phong)", srv,
+            ESP_LOGI(TAG, "SNTP init (DHCP+NTP, %u may chu tinh)",
                      (unsigned)(sizeof(s_ntp_servers) / sizeof(s_ntp_servers[0])));
         } else {
             ESP_LOGW(TAG, "esp_netif_sntp_init: %s", esp_err_to_name(e));
         }
         return;
     }
+#if CONFIG_LWIP_SNTP_MAX_SERVERS < 3
     sntp_rotate_server();
+#endif
     esp_err_t e = esp_netif_sntp_start();
     if (e != ESP_OK) {
         ESP_LOGW(TAG, "esp_netif_sntp_start: %s", esp_err_to_name(e));
     } else {
-        ESP_LOGI(TAG, "SNTP retry: %s", s_ntp_servers[s_ntp_server_idx % (sizeof(s_ntp_servers) / sizeof(s_ntp_servers[0]))]);
+#if CONFIG_LWIP_SNTP_MAX_SERVERS < 3
+        ESP_LOGI(TAG, "SNTP retry: %s",
+                 s_ntp_servers[s_ntp_server_idx % (sizeof(s_ntp_servers) / sizeof(s_ntp_servers[0]))]);
+#else
+        ESP_LOGI(TAG, "SNTP retry (restart)");
+#endif
     }
 }
 
-/** Thu lai SNTP neu mat mang / AP+STA route sai luc boot. */
+/**
+ * Co WiFi + IP thi thu SNTP lien tuc (khong gioi han 20 lan) cho den khi dong bo.
+ * Thoat khi mat WiFi; GOT_IP se tao task moi.
+ */
 static void sntp_retry_task(void *arg)
 {
     (void)arg;
-    s_sntp_retry_task_live = false;
-    for (int i = 0; i < 20 && !s_time_synced; i++) {
-        vTaskDelay(pdMS_TO_TICKS(15000));
-        if (s_time_synced || s_wifi_conn_status != WIFI_STATUS_CONNECTED) {
+    int attempt = 0;
+
+    /* Cho DNS/router on dinh sau GOT_IP */
+    vTaskDelay(pdMS_TO_TICKS(2000));
+
+    while (!s_time_synced && s_wifi_conn_status == WIFI_STATUS_CONNECTED) {
+        sntp_adopt_wall_time_if_valid();
+        if (s_time_synced) {
             break;
         }
-        ESP_LOGW(TAG, "SNTP chua dong bo, thu lai (%d/20)...", i + 1);
+
+        if (attempt > 0) {
+            const TickType_t dly = (attempt <= 4) ? pdMS_TO_TICKS(5000) : pdMS_TO_TICKS(10000);
+            vTaskDelay(dly);
+            if (s_time_synced || s_wifi_conn_status != WIFI_STATUS_CONNECTED) {
+                break;
+            }
+            sntp_adopt_wall_time_if_valid();
+            if (s_time_synced) {
+                break;
+            }
+        }
+
+        ESP_LOGW(TAG, "SNTP chua dong bo, thu lai (lan %d)...", attempt + 1);
         sntp_start_or_restart();
+        attempt++;
     }
-    if (!s_time_synced) {
-        ESP_LOGW(TAG, "SNTP khong dong bo — kiem tra mang / firewall UDP 123");
-    }
+
+    s_sntp_retry_task_live = false;
     vTaskDelete(NULL);
 }
 
@@ -920,6 +1262,7 @@ static void time_synced_cb(struct timeval *tv)
     s_time_synced = true;
     struct tm t;
     scan_log_wall_tm(now, &t);
+    wall_time_nvs_save(now);
     ESP_LOGI(TAG, "NTP ok, Real time: %04d-%02d-%02d %02d:%02d:%02d",
              (int)(t.tm_year + 1900), (int)(t.tm_mon + 1), (int)t.tm_mday,
              (int)t.tm_hour, (int)t.tm_min, (int)t.tm_sec);
@@ -929,7 +1272,9 @@ static void time_synced_cb(struct timeval *tv)
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *ev)
 {
     (void)arg;
-    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+    if (base == WIFI_EVENT && id == WIFI_EVENT_SCAN_DONE) {
+        wifi_scan_cache_fill();
+    } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         const wifi_event_sta_disconnected_t *d = (const wifi_event_sta_disconnected_t *)ev;
         int reason = d ? (int)d->reason : -1;
         ESP_LOGW(TAG, "STA mat ket noi, reason=%d", reason);
@@ -965,6 +1310,7 @@ esp_err_t wifi_portal_start(void)
      */
     setenv("TZ", "UTC-7", 1);
     tzset();
+    wall_time_nvs_restore();
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     esp_netif_create_default_wifi_ap();
     s_sta_netif = esp_netif_create_default_wifi_sta();
@@ -1007,14 +1353,18 @@ esp_err_t wifi_portal_start(void)
         sta_apply_current_wifi();
     }
 
-    return start_httpd();
+    esp_err_t ret = start_httpd();
+    if (ret == ESP_OK) {
+        portal_health_start();
+    }
+    return ret;
 }
 
 /* ----------------------------------------------------------------
  * Brand text (chữ thương hiệu trên màn idle) — NVS key "brand_txt"
  * ---------------------------------------------------------------- */
 #define BRAND_NVS_KEY "brand_txt"
-#define BRAND_DEFAULT "MEBIECO"
+#define BRAND_DEFAULT "MEBISOFT"
 #define BRAND_MAX_LEN 15  /* không kể '\0' */
 
 void wifi_portal_get_brand_text(char *out, size_t sz)

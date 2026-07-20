@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <time.h>
 
 #include "esp_err.h"
 
@@ -28,9 +29,12 @@ void wifi_portal_get_azure(char *host, size_t host_sz, char *devid, size_t dev_s
 /** true sau khi SNTP cap nhat time() hop le (nam >= 2020, gio VN). */
 bool wifi_portal_time_is_valid(void);
 
+/** Giay UTC (time_t); 0 neu chua dong bo NTP hop le — dung cho TimeStamp gui backend. */
+time_t wifi_portal_get_utc_sec(void);
+
 /**
  * @brief Đọc/ghi chữ thương hiệu hiển thị trên màn idle (NVS key "brand_txt").
- *        Mặc định "MEBIECO" nếu chưa có giá trị.
+ *        Mặc định "MEBISOFT" nếu chưa có giá trị.
  *        @p out tối đa 16 ký tự (bao gồm '\\0').
  */
 void wifi_portal_get_brand_text(char *out, size_t sz);

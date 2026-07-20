@@ -556,17 +556,80 @@ typedef struct {
     time_t mtime;
 } sorted_entry_t;
 
-static int compare_entries(const void *a, const void *b)
+static int compare_entries_mtime_desc(const void *a, const void *b)
 {
     time_t ta = ((const sorted_entry_t *)a)->mtime;
     time_t tb = ((const sorted_entry_t *)b)->mtime;
-    if (ta < tb) return 1;
-    if (ta > tb) return -1;
+    if (ta < tb) {
+        return 1;
+    }
+    if (ta > tb) {
+        return -1;
+    }
     return 0;
 }
 
+/** DS thẻ đã đăng ký: sắp mã NV A→Z (trống xuống cuối). */
+static int compare_entries_id_asc(const void *a, const void *b)
+{
+    const sorted_entry_t *ra = (const sorted_entry_t *)a;
+    const sorted_entry_t *rb = (const sorted_entry_t *)b;
+    const bool ea = (ra->entry.id[0] == '\0');
+    const bool eb = (rb->entry.id[0] == '\0');
+    if (ea && !eb) {
+        return 1;
+    }
+    if (!ea && eb) {
+        return -1;
+    }
+    const int c = strcmp(ra->entry.id, rb->entry.id);
+    if (c != 0) {
+        return c;
+    }
+    return strcmp(ra->entry.uid, rb->entry.uid);
+}
+
+static bool id_matches_filter(const char *id, const char *filter)
+{
+    if (!filter || !filter[0]) {
+        return true;
+    }
+    if (!id) {
+        id = "";
+    }
+    const size_t nlen = strlen(filter);
+    const size_t hlen = strlen(id);
+    if (nlen == 0) {
+        return true;
+    }
+    if (nlen > hlen) {
+        return false;
+    }
+    for (size_t i = 0; i + nlen <= hlen; i++) {
+        bool ok = true;
+        for (size_t j = 0; j < nlen; j++) {
+            char a = id[i + j];
+            char b = filter[j];
+            if (a >= 'A' && a <= 'Z') {
+                a = (char)(a - 'A' + 'a');
+            }
+            if (b >= 'A' && b <= 'Z') {
+                b = (char)(b - 'A' + 'a');
+            }
+            if (a != b) {
+                ok = false;
+                break;
+            }
+        }
+        if (ok) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static int scan_profile_txt(int mode, int skip_first, CardProfileEntry_t *entries, int max_entries,
-                            bool count_all)
+                            bool count_all, const char *id_filter)
 {
     card_profile_cleanup_unregistered();
     migrate_legacy_profiles_once();
@@ -643,6 +706,9 @@ static int scan_profile_txt(int mode, int skip_first, CardProfileEntry_t *entrie
         if (mode == 2 && !reg) {
             continue;
         }
+        if (!id_matches_filter(id, id_filter)) {
+            continue;
+        }
 
         struct stat st;
         time_t mtime = 0;
@@ -677,7 +743,9 @@ static int scan_profile_txt(int mode, int skip_first, CardProfileEntry_t *entrie
     closedir(dir);
 
     if (matched_count > 1) {
-        qsort(temp, matched_count, sizeof(sorted_entry_t), compare_entries);
+        int (*cmp)(const void *, const void *) =
+            (mode == 2) ? compare_entries_id_asc : compare_entries_mtime_desc;
+        qsort(temp, matched_count, sizeof(sorted_entry_t), cmp);
     }
 
     int filled = 0;
@@ -695,19 +763,20 @@ static int scan_profile_txt(int mode, int skip_first, CardProfileEntry_t *entrie
     return filled;
 }
 
-int card_profile_count_matched(bool only_unregistered)
+int card_profile_count_matched(bool only_unregistered, const char *id_q)
 {
-    return scan_profile_txt(only_unregistered ? 1 : 2, 0, NULL, 0, true);
+    return scan_profile_txt(only_unregistered ? 1 : 2, 0, NULL, 0, true, id_q);
 }
 
-int card_profile_list_page(CardProfileEntry_t *entries, int max_entries, bool only_unregistered, int skip_first)
+int card_profile_list_page(CardProfileEntry_t *entries, int max_entries, bool only_unregistered, int skip_first,
+                           const char *id_q)
 {
-    return scan_profile_txt(only_unregistered ? 1 : 2, skip_first, entries, max_entries, false);
+    return scan_profile_txt(only_unregistered ? 1 : 2, skip_first, entries, max_entries, false, id_q);
 }
 
 int card_profile_list(CardProfileEntry_t *entries, int max_entries, bool only_unregistered)
 {
-    return card_profile_list_page(entries, max_entries, only_unregistered, 0);
+    return card_profile_list_page(entries, max_entries, only_unregistered, 0, NULL);
 }
 
 void card_profile_delete_all(void)

@@ -49,6 +49,11 @@ void app_azure_send_card_event(const char *uid, const char *name, const char *id
  */
 int app_azure_is_connected(void);
 
+/**
+ * @brief Gửi lại dữ liệu (từ file CSV cục bộ) lên Azure trong một khoảng Index
+ */
+int app_azure_resend_range(int code, int32_t start_idx, int32_t end_idx);
+
 #ifdef __cplusplus
 }
 #endif

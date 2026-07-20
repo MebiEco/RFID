@@ -38,10 +38,14 @@ typedef struct {
  * Liet ke tat ca file .txt tren SD (toi da max_entries), bo qua skip_first ban ghi khop bo loc.
  * only_unregistered=true -> chi lay the chua co name/id (the la).
  */
-int card_profile_list_page(CardProfileEntry_t *entries, int max_entries, bool only_unregistered, int skip_first);
+/**
+ * id_q: loc ma nhan vien (chuoi con, khong phan biet hoa thuong); NULL hoac rong = khong loc.
+ */
+int card_profile_list_page(CardProfileEntry_t *entries, int max_entries, bool only_unregistered, int skip_first,
+                           const char *id_q);
 
 /** Dem so file .txt khop bo loc (dung cho phan trang). */
-int card_profile_count_matched(bool only_unregistered);
+int card_profile_count_matched(bool only_unregistered, const char *id_q);
 
 /**
  * Liet ke tat ca file .txt tren SD (toi da CARD_PROFILE_LIST_MAX), tuong duong list_page(..., 0).

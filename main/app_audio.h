@@ -20,10 +20,18 @@ void app_audio_stress_queue_all_three(void);
 #endif
 
 /**
- * Dừng I2S channel (disable DMA) trước khi ghi SD — tránh amp kéo dòng
- * trong lúc SPI đang ghi FAT. Gọi app_audio_resume() sau khi ghi xong.
+ * Dừng phát ngay (abort + xả I2S im lặng + tắt DMA). Gọi trước khi rfid_task
+ * cần khóa SD — tránh loa giữ mẫu PCM cuối (tiếng "nnn"/"xin xin" lặp).
  */
 void app_audio_pause(void);
+
+/** Xóa WAV đang chờ trong hàng đợi (không abort bài đang phát). */
+void app_audio_clear_queue(void);
+
+/** Dừng phát + xóa hàng đợi — dùng trước khi xếp 2/3.wav mới sau quẹt thẻ. */
+void app_audio_stop_and_clear(void);
+
+/** Giữ tương thích — hiện không cần gọi sau pause (I2S tự bật lại khi phát tiếp). */
 void app_audio_resume(void);
 
 /** Lay/Chinh am luong (%) (0-100) */
