@@ -1,4 +1,4 @@
-﻿# 🪪 ESP32-S3 RFID Attendance Kiosk
+# 🪪 ESP32-S3 RFID Attendance Kiosk
 
 <div align="center">
 
@@ -265,6 +265,7 @@ Thiết bị gửi **telemetry JSON** lên Azure IoT Hub qua MQTT:
 | `602` | Quẹt thẻ hợp lệ |
 | `603` | Lưu / Sửa thẻ |
 | `604` | Xóa thẻ |
+| `605` | Đồng bộ dữ liệu / Phản hồi Sync từ SD lên Azure |
 
 > Cấu hình **Hostname**, **Device ID** và **SAS Token** qua Web Portal (`/azure`).
 > Token được lưu trong NVS — không mất khi reset.
