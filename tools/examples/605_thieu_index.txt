@@ -1,0 +1,363 @@
+================================================================================
+                    CODE 605 — ĐỒNG BỘ INDEX (ĐẦY ĐỦ)
+                         RFID Scanner ↔ Azure IoT Hub
+================================================================================
+
+
+1. MỤC ĐÍCH
+--------------------------------------------------------------------------------
+
+Backend phát hiện thiếu message (gap Index) → gọi lệnh 605 xuống thiết bị
+→ Thiết bị gửi lại telemetry bù (601/602/603/604) lên IoT Hub
+→ Backend nhận qua Event Hub, dedupe và cập nhật DB.
+
+QUAN TRỌNG:
+  • 605 là lệnh Backend → Thiết bị (Direct Method).
+  • Thiết bị KHÔNG gửi Code 605 lên telemetry / Event Hub.
+  • Dữ liệu bù lên Hub là Code 601, 602, 603 hoặc 604 — mỗi Index thiếu 1 message.
+
+
+2. LUỒNG TỔNG QUAN
+--------------------------------------------------------------------------------
+
+  [Backend]                          [Thiết bị ESP32]                [Azure Hub]
+      |                                      |                              |
+      |  1. invoke Direct Method "Control"   |                              |
+      |     body Code 605 + Data             |                              |
+      |------------------------------------->|                              |
+      |                                      |  2a. Flush az_pend.bin       |
+      |                                      |      (queue offline chưa gửi)  |
+      |                                      |  2b. Đọc rfid_log.csv         |
+      |                                      |      gửi Index thiếu         |
+      |                                      |----------------------------->|
+      |                                      |   telemetry 602 Index 31..   |
+      |                                      |   (nhiều message, cách 500ms)|
+      |                                      |                              |
+      |  3. Direct Method response           |                              |
+      |     Code 605, ResentFromLog=N        |                              |
+      |<-------------------------------------|                              |
+      |                                      |                              |
+      |  4. Nhận telemetry bù qua Event Hub  |                              |
+      |<---------------------------------------------------------------------|
+
+
+3. BACKEND GỌI 605 NHƯ THẾ NÀO
+--------------------------------------------------------------------------------
+
+Cơ chế : Azure IoT Hub Direct Method
+Method : Control  (khuyến nghị; firmware cũng nhận nếu body có Code 605)
+Timeout: 60–90 giây khi có Data (sync có thể mất 30s+)
+         30 giây khi chỉ flush queue (không có Data)
+
+Topic thiết bị trả lời:
+  $iothub/methods/res/{httpStatus}/?$rid={requestId}
+
+
+4. BACKEND GỬI XUỐNG — PAYLOAD
+--------------------------------------------------------------------------------
+
+4.1. Có đối chiếu Index (KHUYẾN NGHỊ)
+--------------------------------------
+
+{
+  "Code": 605,
+  "TimeStamp": 1765036309,
+  "Data": {
+    "LastIdxSwipe": 30,
+    "LastIdxUnkn": 5,
+    "LastIdxAdmin": 8,
+    "Missing": [
+      { "Code": 602, "Index": 31 }
+    ]
+  }
+}
+
+Trường Data          | Backend gửi gì                        | Thiết bị làm gì
+---------------------|---------------------------------------|----------------------------------
+LastIdxSwipe         | Max Index Code 602 backend đã lưu     | Gửi lại 602 có Index > LastIdxSwipe
+LastIdxUnkn          | Max Index Code 601 backend đã lưu     | Gửi lại 601 có Index > LastIdxUnkn
+LastIdxAdmin         | Max Index Code 603/604 backend lưu    | Gửi lại 603/604 có Index > LastIdxAdmin
+Missing[]            | Danh sách {Code, Index} thiếu cụ thể  | Gửi lại đúng từng cặp Code+Index
+                     | (vd thiếu Index 31 giữa 30 và 32)    | (kể cả khi không > LastIdx)
+
+Ghi chú:
+  • Có thể gửi chỉ LastIdx* HOẶC chỉ Missing[] HOẶC cả hai.
+  • LastIdx* : thiết bị gửi mọi Index LỚN HƠN giá trị đó trong rfid_log.csv.
+  • Missing[]: thiết bị gửi đúng Index được liệt kê (bù lỗ hổng giữa khoảng).
+
+4.2. Legacy — chỉ flush queue (KHÔNG đọc log SD)
+-------------------------------------------------
+
+{
+  "Code": 605,
+  "TimeStamp": 1765036309
+}
+
+  • Không có Data → chỉ flush /sdcard/az_pend.bin (message offline chưa publish).
+  • KHÔNG đọc rfid_log.csv, KHÔNG gửi telemetry bù từ log.
+  • Trả response ngay: Message = "Flush trigger accepted".
+
+
+5. THIẾT BỊ XỬ LÝ SAU KHI NHẬN 605
+--------------------------------------------------------------------------------
+
+Bước 1 — Flush az_pend.bin
+  File    : /sdcard/az_pend.bin
+  Nội dung: message quẹt thẻ khi mất mạng, chưa kịp publish Hub
+  Gửi lên : telemetry 601/602/603/604 với TimeStamp lúc quẹt (đã lưu sẵn)
+
+Bước 2 — Replay rfid_log.csv (chỉ khi payload có Data)
+  File    : /sdcard/rfid_log.csv
+  Đọc từng dòng log → lọc Index thiếu → publish telemetry bù
+  Khoảng cách giữa mỗi message: 500 ms
+
+Ba bộ đếm Index riêng trên thiết bị (NVS):
+  Code 602 (quẹt đã ĐK)  → idx_swipe
+  Code 601 (thẻ lạ)      → idx_unkn
+  Code 603/604 (admin)   → idx_admin
+  KHÔNG gộp Index 601 và 602 vào một dãy.
+
+
+6. THIẾT BỊ GỬI LÊN HUB — TELEMETRY BÙ
+--------------------------------------------------------------------------------
+
+Topic publish:
+  devices/{DeviceId}/messages/events/
+
+Backend nhận qua:
+  Event Hub / Service Bus / Azure Function (tùy kiến trúc)
+
+Cấu trúc mỗi message (Code KHÔNG phải 605):
+
+{
+  "Code": 602,
+  "Index": 31,
+  "TimeStamp": 1765036001,
+  "Data": {
+    "DeviceName": "RFID_Scanner",
+    "UID": "09F8D21E",
+    "Name": "Nguyen Van A",
+    "ID": "NV01"
+  }
+}
+
+Quy tắc:
+  • Mỗi Index thiếu = 1 message telemetry riêng.
+  • Index GIỮ NGUYÊN — không tạo Index mới khi bù.
+  • TimeStamp = giờ quẹt GỐC (đọc từ rfid_log.csv), KHÔNG phải lúc sync.
+  • Backend dedupe theo (DeviceId, Code, Index) trước khi insert DB.
+
+Bảng Code telemetry bù:
+
+  Code | Ý nghĩa              | Data.Name / Data.ID
+  -----|----------------------|---------------------------
+  601  | Thẻ chưa đăng ký     | Rỗng ("", "")
+  602  | Chấm công (đã ĐK)    | Tên + Mã NV từ profile SD
+  603  | Xác nhận lưu thẻ     | Tên + Mã NV
+  604  | Xác nhận xóa thẻ     | Tên + Mã NV (trước khi xóa)
+
+
+7. TIMESTAMP — CHI TIẾT
+--------------------------------------------------------------------------------
+
+Telemetry bù (601/602/603/604):
+  • Trường   : TimeStamp
+  • Kiểu     : Unix epoch, đơn vị GIÂY
+  • Múi giờ  : UTC (chuẩn IoT Hub)
+  • Ý nghĩa  : Thời điểm QUẸT THẺ gốc
+
+  Ví dụ:
+    Quẹt lúc 14:30:01 giờ Việt Nam (UTC+7), ngày 06/12/2025
+    Log SD ghi : 2025-12-06T14:30:01
+    TimeStamp gửi lên Hub : 1733473801  (= 07:30:01 UTC)
+    Backend convert +7  → 14:30:01 VN  (đúng giờ chấm công)
+
+Response Direct Method 605:
+  • TimeStamp trong payload = lúc thiết bị HOÀN TẤT sync
+  • KHÔNG dùng làm giờ chấm công
+
+Thiết bị chặn quẹt cho đến khi NTP đồng bộ → TimeStamp thường luôn đúng.
+Ngoại lệ hiếm: log ghi "no-ntp" → replay dùng time() lúc sync (sai giờ gốc).
+
+
+8. THIẾT BỊ TRẢ — DIRECT METHOD RESPONSE
+--------------------------------------------------------------------------------
+
+8.1. Sync có Data — sau khi flush + replay xong
+------------------------------------------------
+
+{
+  "status": 200,
+  "payload": {
+    "Code": 605,
+    "TimeStamp": 1765036400,
+    "IdxSwipe": 35,
+    "IdxUnkn": 5,
+    "IdxAdmin": 8,
+    "LastIdxSwipe": 30,
+    "LastIdxUnkn": 5,
+    "LastIdxAdmin": 8,
+    "PendingFlushed": 0,
+    "ResentFromLog": 5,
+    "Message": "Sync done"
+  }
+}
+
+Trường response     | Ý nghĩa
+--------------------|--------------------------------------------------
+IdxSwipe/Unkn/Admin | Counter hiện tại trên thiết bị (max Index đã cấp)
+LastIdxSwipe/...    | Giá trị LastIdx backend đã gửi xuống (-1 nếu không gửi)
+PendingFlushed      | Số message gửi từ az_pend.bin
+ResentFromLog       | Số message telemetry bù từ rfid_log.csv
+Message             | "Sync done"
+TimeStamp           | Lúc thiết bị trả response (UTC epoch giây)
+
+8.2. Chỉ flush queue — không có Data
+-------------------------------------
+
+{
+  "status": 200,
+  "payload": {
+    "Code": 605,
+    "TimeStamp": 1765036309,
+    "PendingFlushed": 2,
+    "Message": "Flush trigger accepted"
+  }
+}
+
+
+9. BACKEND PHẢI LÀM GÌ — CHECKLIST
+--------------------------------------------------------------------------------
+
+  [1] Lưu 3 counter riêng: last_idx_swipe (602), last_idx_unkn (601), last_idx_admin (603/604)
+  [2] Phát hiện gap Index → invoke Direct Method Control, body Code 605 + Data
+  [3] Timeout ≥ 60 giây khi có Data
+  [4] Đọc Direct Method response → kiểm tra ResentFromLog
+  [5] Đọc telemetry bù trên Event Hub — filter Code IN (601,602,603,604), KHÔNG tìm Code 605
+  [6] Dedupe (DeviceId, Code, Index) trước insert DB
+  [7] Cập nhật last_idx_* sau khi nhận đủ
+  [8] ResentFromLog = 0 → không có gì trong log SD (không phải lỗi MQTT)
+
+
+10. EDGE CASES
+--------------------------------------------------------------------------------
+
+  • 605 không Data        → chỉ flush az_pend, response ngay, không replay log
+  • 605 có Data           → response TRỄ (sau flush + replay), cần timeout dài
+  • ResentFromLog = 0     → Index thiếu không có trong rfid_log.csv (chưa quẹt / log trim)
+  • SD chưa mount         → không replay được, ResentFromLog = 0
+  • Trùng DeviceId        → Azure error 400027, không nhận được gì (đóng IoT Explorer)
+  • Parse response        → TimeStamp/Code nằm trong payload.payload (SDK Azure)
+
+
+================================================================================
+11. VÍ DỤ 1 — Backend max 602=30, thiết bị có đến 35 (thiếu 31–35)
+================================================================================
+
+Backend GỬI XUỐNG:
+{
+  "Code": 605,
+  "TimeStamp": 1765036309,
+  "Data": {
+    "LastIdxSwipe": 30,
+    "LastIdxUnkn": 5,
+    "LastIdxAdmin": 8
+  }
+}
+
+Thiết bị GỬI LÊN Hub — 5 message telemetry (KHÔNG phải Code 605):
+
+  {"Code":602,"Index":31,"TimeStamp":1765036001,"Data":{"DeviceName":"RFID_Scanner","UID":"09F8D21E","Name":"Nguyen Van A","ID":"NV01"}}
+  {"Code":602,"Index":32,"TimeStamp":1765036050,"Data":{"DeviceName":"RFID_Scanner","UID":"09F8D21E","Name":"Nguyen Van A","ID":"NV01"}}
+  {"Code":602,"Index":33,"TimeStamp":1765036100,"Data":{"DeviceName":"RFID_Scanner","UID":"09F8D21E","Name":"Nguyen Van A","ID":"NV01"}}
+  {"Code":602,"Index":34,"TimeStamp":1765036200,"Data":{"DeviceName":"RFID_Scanner","UID":"09F8D21E","Name":"Nguyen Van A","ID":"NV01"}}
+  {"Code":602,"Index":35,"TimeStamp":1765036280,"Data":{"DeviceName":"RFID_Scanner","UID":"09F8D21E","Name":"Nguyen Van A","ID":"NV01"}}
+
+Thiết bị TRẢ Direct Method response:
+  {"status":200,"payload":{"Code":605,"TimeStamp":1765036400,"IdxSwipe":35,"IdxUnkn":5,"IdxAdmin":8,"LastIdxSwipe":30,"LastIdxUnkn":5,"LastIdxAdmin":8,"PendingFlushed":0,"ResentFromLog":5,"Message":"Sync done"}}
+
+
+================================================================================
+12. VÍ DỤ 2 — Thiếu 1 Index giữa khoảng (có 30 và 32, thiếu 31)
+================================================================================
+
+Backend GỬI XUỐNG:
+{
+  "Code": 605,
+  "TimeStamp": 1765036309,
+  "Data": {
+    "Missing": [
+      { "Code": 602, "Index": 31 }
+    ]
+  }
+}
+
+Thiết bị GỬI LÊN Hub — 1 message:
+  {"Code":602,"Index":31,"TimeStamp":1765036001,"Data":{"DeviceName":"RFID_Scanner","UID":"09F8D21E","Name":"Nguyen Van A","ID":"NV01"}}
+
+Thiết bị TRẢ Direct Method response:
+  {"status":200,"payload":{"Code":605,"TimeStamp":1765036400,"IdxSwipe":35,"IdxUnkn":5,"IdxAdmin":8,"PendingFlushed":0,"ResentFromLog":1,"Message":"Sync done"}}
+
+
+================================================================================
+13. VÍ DỤ 3 — Thiếu nhiều loại Code (602 + 601 + 603)
+================================================================================
+
+Backend GỬI XUỐNG:
+{
+  "Code": 605,
+  "TimeStamp": 1765036309,
+  "Data": {
+    "LastIdxSwipe": 30,
+    "LastIdxUnkn": 5,
+    "LastIdxAdmin": 8,
+    "Missing": [
+      { "Code": 602, "Index": 31 },
+      { "Code": 601, "Index": 6 },
+      { "Code": 603, "Index": 9 }
+    ]
+  }
+}
+
+Thiết bị GỬI LÊN Hub — 3 message:
+  {"Code":602,"Index":31,"TimeStamp":1765036001,"Data":{"DeviceName":"RFID_Scanner","UID":"09F8D21E","Name":"Nguyen Van A","ID":"NV01"}}
+  {"Code":601,"Index":6,"TimeStamp":1765035900,"Data":{"DeviceName":"RFID_Scanner","UID":"A1B2C3D4","Name":"","ID":""}}
+  {"Code":603,"Index":9,"TimeStamp":1765035950,"Data":{"DeviceName":"RFID_Scanner","UID":"09F8D21E","Name":"Nguyen Van A","ID":"NV01"}}
+
+Thiết bị TRẢ Direct Method response:
+  {"status":200,"payload":{"Code":605,"TimeStamp":1765036400,"IdxSwipe":35,"IdxUnkn":6,"IdxAdmin":9,"PendingFlushed":0,"ResentFromLog":3,"Message":"Sync done"}}
+
+
+================================================================================
+14. TEST NHANH (Azure CLI)
+================================================================================
+
+az iot hub invoke-device-method \
+  --hub-name {IoTHubName} \
+  --device-id {DeviceId} \
+  --method-name Control \
+  --method-payload '{"Code":605,"TimeStamp":1765036309,"Data":{"LastIdxSwipe":30,"LastIdxUnkn":0,"LastIdxAdmin":0}}' \
+  --timeout 90
+
+Bù Index 31 cụ thể:
+  --method-payload '{"Code":605,"Data":{"Missing":[{"Code":602,"Index":31}]}}'
+
+
+================================================================================
+15. BẢNG TÓM TẮT NHANH
+================================================================================
+
+  Backend thiếu           → Thiết bị gửi lên Hub
+  ------------------------|------------------------------------------------
+  Index 602 = 31          | 1 telemetry Code 602, Index 31, TimeStamp giờ quẹt
+  Index 602 = 31,32,33    | 3 telemetry Code 602 riêng biệt
+  Index 601 = 6           | 1 telemetry Code 601, Name/ID rỗng
+  Index 603 = 9           | 1 telemetry Code 603
+  Index 604 = 10          | 1 telemetry Code 604
+  ResentFromLog = N       | Đã gửi N message bù từ rfid_log.csv
+
+  KHÔNG có Code 605 trên Event Hub.
+  TimeStamp telemetry = giờ quẹt gốc (UTC epoch giây, +7 khi hiển thị VN).
+  TimeStamp response 605 = lúc thiết bị hoàn tất sync.
+
+================================================================================
