@@ -60,6 +60,10 @@ void lv_port_feed_wdt(void);
  */
 void lv_port_set_brand_text(const char *txt);
 
+/** OTA: tam dung LVGL task de giam tai RAM/CPU. */
+void lv_port_suspend_for_ota(void);
+void lv_port_resume_after_ota(void);
+
 /** Hiển thị JPEG (RGB888 decode → RGB565) — parent = `lv_obj_t*` hoặc NULL = màn hiện tại. */
 bool lv_port_show_jpeg_file(void *parent, const char *path, int x, int y, int max_w, int max_h);
 

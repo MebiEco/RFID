@@ -17,6 +17,9 @@ extern "C" {
  */
 void app_rfid_start(void);
 
+/** OTA: tam dung quet the (task van chay, chi sleep). */
+void app_rfid_set_paused(bool paused);
+
 /** PIN NVS: goi mot lan khi boot task UI (truoc khi dang nhap). */
 void app_login_pin_init(void);
 /** Dang nhap: neu da luu PIN trong NVS thi chi khop chuoi luu; neu chua thi chap nhan ADMIN hoac 1234. */

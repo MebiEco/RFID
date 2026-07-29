@@ -5,6 +5,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/idf_additions.h"
 #include "freertos/semphr.h"
 #include "app_rfid.h"
 #include "board_pins.h"
@@ -731,6 +732,7 @@ static lv_disp_draw_buf_t disp_buf;
 static lv_color_t *buf1;
 /** lvgl_task đã esp_task_wdt_add — feed WDT trong disp_flush khi vẽ nhiều vùng liền (tránh TWDT >5s). */
 static volatile bool s_lvgl_wdt_ok;
+static TaskHandle_t s_lvgl_task;
 static uint64_t g_last_activity_us = 0;
 
 /* Hàm xả dữ liệu từ LVGL xuống màn hình */
@@ -992,15 +994,19 @@ void lv_port_init(esp_lcd_panel_handle_t panel)
     g_last_activity_us = esp_timer_get_time();
 
 
-    /* Buffer LVGL: ưu tiên RAM nội DMA (ổn định hơn SPIRAM khi WiFi/Azure tranh bus). */
+    /* Buffer LVGL: DMA Internal bat buoc cho SPI flush; thu double-buffer de UI muot. */
     uint32_t buf_size = BOARD_LCD_H_RES * (uint32_t)BOARD_LCD_SPI_CHUNK_LINES;
     const size_t buf_bytes = buf_size * sizeof(lv_color_t);
     buf1 = heap_caps_malloc(buf_bytes, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
     if (!buf1) {
         buf1 = heap_caps_malloc(buf_bytes, MALLOC_CAP_DMA);
     }
-    
-    lv_disp_draw_buf_init(&disp_buf, buf1, NULL, buf_size);
+    void *buf2 = heap_caps_malloc(buf_bytes, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    if (!buf2) {
+        buf2 = heap_caps_malloc(buf_bytes, MALLOC_CAP_DMA);
+    }
+
+    lv_disp_draw_buf_init(&disp_buf, buf1, buf2, buf_size);
 
     /* Đăng ký Display driver (Màn hình) */
     static lv_disp_drv_t disp_drv;
@@ -1036,8 +1042,36 @@ void lv_port_init(esp_lcd_panel_handle_t panel)
     build_idle_screen();
     update_ui_timer_cb(NULL);
 
-    /* Tăng stack lên 12KB để an toàn khi dùng nhiều font/widget phức tạp */
-    xTaskCreatePinnedToCore(lvgl_task, "lvgl_task", 12288, NULL, 5, NULL, 1);
+    /* Stack 24KB tren SPIRAM — PSRAM con nhieu, UI/JPEG an toan. */
+    BaseType_t ok = xTaskCreatePinnedToCoreWithCaps(lvgl_task, "lvgl_task", 24576, NULL, 5, &s_lvgl_task, 1,
+                                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (ok != pdPASS) {
+        xTaskCreatePinnedToCore(lvgl_task, "lvgl_task", 24576, NULL, 5, &s_lvgl_task, 1);
+    }
+}
+
+void lv_port_suspend_for_ota(void)
+{
+    if (s_lvgl_task) {
+        ESP_LOGI(TAG, "OTA: suspend lvgl_task (bo WDT)");
+        /* Suspend xong task khong the esp_task_wdt_reset → TWDT panic giữa OTA. */
+        if (esp_task_wdt_status(s_lvgl_task) == ESP_OK) {
+            (void)esp_task_wdt_delete(s_lvgl_task);
+        }
+        s_lvgl_wdt_ok = false;
+        vTaskSuspend(s_lvgl_task);
+    }
+}
+
+void lv_port_resume_after_ota(void)
+{
+    if (s_lvgl_task) {
+        ESP_LOGI(TAG, "OTA fail: resume lvgl_task");
+        vTaskResume(s_lvgl_task);
+        if (esp_task_wdt_add(s_lvgl_task) == ESP_OK) {
+            s_lvgl_wdt_ok = true;
+        }
+    }
 }
 
 /* ----------------------------------------------------------------

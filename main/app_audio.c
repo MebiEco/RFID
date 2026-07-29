@@ -8,9 +8,12 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include "freertos/idf_additions.h"
 
 #include "esp_check.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
+#include "esp_attr.h"
 
 #include "driver/i2s_std.h"
 
@@ -41,16 +44,13 @@ uint8_t app_audio_get_volume(void)
 }
 
 #define AUDIO_QUEUE_DEPTH   4
-/* Stack: play_wav — raw lớn + FatFS/stdio; tăng lên 16K+ để đẩy sang PSRAM */
 #define AUDIO_TASK_STACK    16384
-
-/**
- * Đọc mỗi lần từ SD (byte PCM).
- * Mono: 2048 B = 1024 mẫu → 2048 int16 stereo. Stereo: 4096 B = 1024 frame LR → stereo[2048].
- */
-#define RAW_PCM_MAX_BYTES 4096
-/** Tối đa mẫu stereo ra I2S mỗi chunk (mono 1024 mẫu → 2048 halfword). */
-#define STEREO_SAMPLES_MAX 2048
+/** I2S luon 48 kHz — ESP32-S3 clock on dinh; 44.1 file se resample. */
+#define AUDIO_OUT_RATE_HZ   48000u
+/** Chunk Internal day DMA (stereo int16). */
+#define STEREO_SAMPLES_MAX  4096
+/** Raw WAV preload (PSRAM); convert stereo 48k co the ~2x. */
+#define AUDIO_PRELOAD_MAX_BYTES (512 * 1024)
 
 typedef struct {
     char path[128];
@@ -60,13 +60,7 @@ static QueueHandle_t s_audio_q;
 static i2s_chan_handle_t s_tx_chan;
 static uint32_t s_open_rate_hz;
 
-/*
- * Bộ đệm PCM cố định — tránh malloc(MALLOC_CAP_INTERNAL) khi heap nội đã căng
- * (WiFi/LCD/Azure) gây "Het RAM dem PCM". Task audio chỉ xử lý tuần tự một file.
- */
-/* Bộ đệm PCM cố định — chuyển sang SPIRAM để tiết kiệm 8KB RAM nội bộ. */
-static EXT_RAM_ATTR uint8_t s_pcm_raw[RAW_PCM_MAX_BYTES];
-static EXT_RAM_ATTR int16_t s_pcm_stereo[STEREO_SAMPLES_MAX];
+static DRAM_ATTR int16_t s_pcm_stereo[STEREO_SAMPLES_MAX] __attribute__((aligned(4)));
 
 static void audio_i2s_teardown(void)
 {
@@ -76,6 +70,51 @@ static void audio_i2s_teardown(void)
         s_tx_chan = NULL;
         s_open_rate_hz = 0;
     }
+}
+
+/** DMA descriptor phải nằm trong internal DMA-capable RAM (không dùng được PSRAM). */
+static esp_err_t audio_i2s_init_channel(uint32_t sample_rate_hz, int dma_desc_num, int dma_frame_num)
+{
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+    chan_cfg.dma_desc_num = dma_desc_num;
+    chan_cfg.dma_frame_num = dma_frame_num;
+    /* Underrun → silence thay vi lap mau cu (tieng "nnn"/vap). */
+    chan_cfg.auto_clear_after_cb = true;
+
+    esp_err_t err = i2s_new_channel(&chan_cfg, &s_tx_chan, NULL);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    i2s_std_config_t std_cfg = {
+        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(sample_rate_hz),
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
+        .gpio_cfg = {
+            .mclk = I2S_GPIO_UNUSED,
+            .bclk = BOARD_I2S_BCLK_GPIO,
+            .ws = BOARD_I2S_WS_GPIO,
+            .dout = BOARD_I2S_DOUT_GPIO,
+            .din = I2S_GPIO_UNUSED,
+            .invert_flags = {
+                .mclk_inv = false,
+                .bclk_inv = false,
+                .ws_inv = false,
+            },
+        },
+    };
+
+    err = i2s_channel_init_std_mode(s_tx_chan, &std_cfg);
+    if (err != ESP_OK) {
+        audio_i2s_teardown();
+        return err;
+    }
+
+    err = i2s_channel_enable(s_tx_chan);
+    if (err != ESP_OK) {
+        audio_i2s_teardown();
+        return err;
+    }
+    return ESP_OK;
 }
 
 volatile bool g_audio_abort = false;
@@ -99,8 +138,8 @@ static void audio_i2s_flush_silence(void)
 
 static void audio_abort_teardown(void)
 {
+    /* Chi xa silence — giu I2S 48 kHz de lan sau khong re-init. */
     audio_i2s_flush_silence();
-    audio_i2s_teardown();
 }
 
 /**
@@ -132,57 +171,33 @@ void app_audio_resume(void)
 
 static esp_err_t audio_i2s_prepare(uint32_t sample_rate_hz)
 {
-    if (sample_rate_hz < 8000u || sample_rate_hz > 48000u) {
-        ESP_LOGE(TAG, "Sample rate khong ho tro: %" PRIu32, sample_rate_hz);
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    if (s_tx_chan && s_open_rate_hz == sample_rate_hz) {
+    (void)sample_rate_hz;
+    /* Luon 48 kHz — tranh doi clock 44.1↔48 (nghe cham/kho chiu). */
+    if (s_tx_chan && s_open_rate_hz == AUDIO_OUT_RATE_HZ) {
         return ESP_OK;
     }
 
     audio_i2s_teardown();
 
-    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
-    chan_cfg.dma_desc_num = 12;
-    /* ~12 * 512 frame stereo 16-bit: đệm sâu hơn trước lúc hụt khi SD/WiFi tranh tài nguyên */
-    chan_cfg.dma_frame_num = 512;
-
-    ESP_RETURN_ON_ERROR(i2s_new_channel(&chan_cfg, &s_tx_chan, NULL), TAG, "i2s_new_channel");
-
-    i2s_std_config_t std_cfg = {
-        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(sample_rate_hz),
-        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
-        .gpio_cfg = {
-            .mclk = I2S_GPIO_UNUSED,
-            .bclk = BOARD_I2S_BCLK_GPIO,
-            .ws = BOARD_I2S_WS_GPIO,
-            .dout = BOARD_I2S_DOUT_GPIO,
-            .din = I2S_GPIO_UNUSED,
-            .invert_flags = {
-                .mclk_inv = false,
-                .bclk_inv = false,
-                .ws_inv = false,
-            },
-        },
-    };
-
-    esp_err_t err = i2s_channel_init_std_mode(s_tx_chan, &std_cfg);
+    /* 8×960 ≈ 30KB DMA (~160 ms @48k stereo). */
+    esp_err_t err = audio_i2s_init_channel(AUDIO_OUT_RATE_HZ, 8, 960);
+    if (err == ESP_ERR_NO_MEM) {
+        size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_DMA);
+        ESP_LOGW(TAG, "I2S DMA 8x960 fail (largest=%u) — thu 8x512", (unsigned)largest);
+        err = audio_i2s_init_channel(AUDIO_OUT_RATE_HZ, 8, 512);
+    }
+    if (err == ESP_ERR_NO_MEM) {
+        err = audio_i2s_init_channel(AUDIO_OUT_RATE_HZ, 6, 240);
+    }
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "i2s_channel_init_std_mode: %s", esp_err_to_name(err));
-        audio_i2s_teardown();
+        ESP_LOGE(TAG, "i2s init: %s (free_internal=%u largest_dma=%u)", esp_err_to_name(err),
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
         return err;
     }
 
-    err = i2s_channel_enable(s_tx_chan);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "i2s_channel_enable: %s", esp_err_to_name(err));
-        audio_i2s_teardown();
-        return err;
-    }
-
-    s_open_rate_hz = sample_rate_hz;
-    ESP_LOGI(TAG, "I2S TX %" PRIu32 " Hz (BCLK=%d WS=%d DOUT=%d)", sample_rate_hz,
+    s_open_rate_hz = AUDIO_OUT_RATE_HZ;
+    ESP_LOGI(TAG, "I2S TX %" PRIu32 " Hz fixed (BCLK=%d WS=%d DOUT=%d)", AUDIO_OUT_RATE_HZ,
              (int)BOARD_I2S_BCLK_GPIO, (int)BOARD_I2S_WS_GPIO, (int)BOARD_I2S_DOUT_GPIO);
     return ESP_OK;
 }
@@ -291,10 +306,121 @@ static esp_err_t wav_parse(FILE *f, uint32_t *rate_hz, uint16_t *channels, uint1
     return ESP_OK;
 }
 
+static inline int16_t audio_apply_gain(int16_t s)
+{
+    int32_t t = ((int32_t)s * (int32_t)BOARD_AUDIO_PCM_GAIN_NUM * (int32_t)s_vol_pct) /
+                ((int32_t)BOARD_AUDIO_PCM_GAIN_DEN * 100);
+    if (t > 32767) {
+        t = 32767;
+    }
+    if (t < -32768) {
+        t = -32768;
+    }
+    return (int16_t)t;
+}
+
+static int16_t audio_src_at(const int16_t *pcm, size_t nframes, uint16_t ch, size_t idx, int which)
+{
+    if (nframes == 0) {
+        return 0;
+    }
+    if (idx >= nframes) {
+        idx = nframes - 1;
+    }
+    if (ch == 1u) {
+        return pcm[idx];
+    }
+    return pcm[idx * 2u + (size_t)which];
+}
+
+/** Convert PCM 16-bit → stereo int16 @ 48 kHz (PSRAM). */
+static esp_err_t audio_convert_to_48k_stereo(const uint8_t *src, size_t src_bytes, uint32_t src_rate,
+                                             uint16_t src_ch, int16_t **out_stereo, size_t *out_bytes)
+{
+    if (!src || src_rate < 8000u || src_rate > 48000u || (src_ch != 1u && src_ch != 2u)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    const size_t src_frames = src_bytes / (sizeof(int16_t) * (size_t)src_ch);
+    if (src_frames == 0) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    size_t out_frames =
+        (size_t)(((uint64_t)src_frames * (uint64_t)AUDIO_OUT_RATE_HZ + (uint64_t)src_rate / 2u) / (uint64_t)src_rate);
+    if (out_frames == 0) {
+        out_frames = 1;
+    }
+    const size_t nbytes = out_frames * 2u * sizeof(int16_t);
+    int16_t *dst = (int16_t *)heap_caps_malloc(nbytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!dst) {
+        dst = (int16_t *)malloc(nbytes);
+    }
+    if (!dst) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    const int16_t *pcm = (const int16_t *)(const void *)src;
+    if (src_rate == AUDIO_OUT_RATE_HZ) {
+        for (size_t i = 0; i < src_frames; i++) {
+            int16_t L = audio_apply_gain(src_ch == 1u ? pcm[i] : pcm[i * 2u]);
+            int16_t R = audio_apply_gain(src_ch == 1u ? pcm[i] : pcm[i * 2u + 1u]);
+            dst[i * 2u] = L;
+            dst[i * 2u + 1u] = R;
+        }
+    } else {
+        uint64_t pos = 0;
+        const uint64_t step = ((uint64_t)src_rate << 32) / (uint64_t)AUDIO_OUT_RATE_HZ;
+        for (size_t i = 0; i < out_frames; i++) {
+            size_t idx = (size_t)(pos >> 32);
+            uint32_t frac = (uint32_t)((pos >> 16) & 0xffffu);
+            size_t idx2 = (idx + 1u < src_frames) ? (idx + 1u) : idx;
+            int32_t l0 = audio_src_at(pcm, src_frames, src_ch, idx, 0);
+            int32_t l1 = audio_src_at(pcm, src_frames, src_ch, idx2, 0);
+            int32_t r0 = (src_ch == 1u) ? l0 : audio_src_at(pcm, src_frames, src_ch, idx, 1);
+            int32_t r1 = (src_ch == 1u) ? l1 : audio_src_at(pcm, src_frames, src_ch, idx2, 1);
+            int32_t L = l0 + (((l1 - l0) * (int32_t)frac) >> 16);
+            int32_t R = r0 + (((r1 - r0) * (int32_t)frac) >> 16);
+            dst[i * 2u] = audio_apply_gain((int16_t)L);
+            dst[i * 2u + 1u] = audio_apply_gain((int16_t)R);
+            pos += step;
+        }
+    }
+
+    *out_stereo = dst;
+    *out_bytes = nbytes;
+    return ESP_OK;
+}
+
+/** Day stereo 48k tu PSRAM → Internal chunk → I2S DMA. */
+static esp_err_t audio_feed_stereo_48k(const int16_t *stereo, size_t nbytes)
+{
+    size_t off = 0;
+    while (off < nbytes) {
+        if (g_audio_abort) {
+            return ESP_ERR_INVALID_STATE;
+        }
+        size_t n = nbytes - off;
+        const size_t max_b = sizeof(s_pcm_stereo);
+        if (n > max_b) {
+            n = max_b;
+        }
+        n &= ~(size_t)3u;
+        if (n == 0) {
+            break;
+        }
+        memcpy(s_pcm_stereo, (const uint8_t *)stereo + off, n);
+        size_t written = 0;
+        esp_err_t e = i2s_channel_write(s_tx_chan, s_pcm_stereo, n, &written, portMAX_DELAY);
+        if (e != ESP_OK) {
+            return e;
+        }
+        off += n;
+    }
+    return ESP_OK;
+}
+
 static esp_err_t play_wav_file(const char *path)
 {
-    /* Chỉ khóa khi dùng FILE* trên thẻ; tách khỏi i2s_channel_write (dài) để RFID/ghi
-     * log không chặn cả bài. */
     sd_card_lock();
     FILE *f = fopen(path, "rb");
     if (!f) {
@@ -315,119 +441,72 @@ static esp_err_t play_wav_file(const char *path)
         sd_card_unlock();
         return err;
     }
-
-    if (fseek(f, data_off, SEEK_SET) != 0) {
+    if (bits != 16u || fseek(f, data_off, SEEK_SET) != 0) {
         fclose(f);
         sd_card_unlock();
         return ESP_FAIL;
     }
 
-    err = audio_i2s_prepare(rate_hz);
-    if (err != ESP_OK) {
+    ESP_LOGI(TAG, "WAV %s: %" PRIu32 " Hz → %" PRIu32 " Hz out, %u ch, PCM %u B", path, rate_hz, AUDIO_OUT_RATE_HZ,
+             (unsigned)ch, (unsigned)data_len);
+
+    if (data_len == 0 || data_len > AUDIO_PRELOAD_MAX_BYTES) {
         fclose(f);
         sd_card_unlock();
+        ESP_LOGE(TAG, "File qua lon/rong (%u) — can <= %u B", (unsigned)data_len, (unsigned)AUDIO_PRELOAD_MAX_BYTES);
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    uint8_t *preload = (uint8_t *)heap_caps_malloc(data_len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!preload) {
+        preload = (uint8_t *)malloc(data_len);
+    }
+    if (!preload) {
+        fclose(f);
+        sd_card_unlock();
+        ESP_LOGE(TAG, "Het RAM preload");
+        return ESP_ERR_NO_MEM;
+    }
+
+    size_t got = fread(preload, 1, data_len, f);
+    fclose(f);
+    f = NULL;
+    sd_card_unlock();
+
+    const size_t frame_bytes = sizeof(int16_t) * (size_t)ch;
+    if (got < frame_bytes) {
+        heap_caps_free(preload);
+        return ESP_FAIL;
+    }
+    got -= got % frame_bytes;
+    ESP_LOGI(TAG, "Preload %u B — convert+phat @%" PRIu32, (unsigned)got, AUDIO_OUT_RATE_HZ);
+
+    int16_t *stereo48 = NULL;
+    size_t stereo_bytes = 0;
+    err = audio_convert_to_48k_stereo(preload, got, rate_hz, ch, &stereo48, &stereo_bytes);
+    heap_caps_free(preload);
+    preload = NULL;
+    if (err != ESP_OK || !stereo48) {
+        ESP_LOGE(TAG, "Convert 48k fail: %s", esp_err_to_name(err));
+        return err != ESP_OK ? err : ESP_FAIL;
+    }
+
+    err = audio_i2s_prepare(AUDIO_OUT_RATE_HZ);
+    if (err != ESP_OK) {
+        heap_caps_free(stereo48);
         return err;
     }
 
-    const size_t frame_bytes = (size_t)(bits / 8u) * (size_t)ch;
-    uint8_t *raw = s_pcm_raw;
-    int16_t *stereo = s_pcm_stereo;
+    esp_err_t out_err = audio_feed_stereo_48k(stereo48, stereo_bytes);
+    heap_caps_free(stereo48);
 
-    size_t remaining = data_len;
-    esp_err_t out_err = ESP_OK;
-    while (remaining > 0) {
-        if (g_audio_abort) {
-            break;
-        }
-
-        size_t nread = remaining > RAW_PCM_MAX_BYTES ? RAW_PCM_MAX_BYTES : remaining;
-        /* Mono: 2048 B/đợt = 2× chunk cũ; stereo: 4096 B/đợt */
-        if (ch == 1u) {
-            if (nread > 2048u) {
-                nread = 2048u;
-            }
-        } else {
-            if (nread > 4096u) {
-                nread = 4096u;
-            }
-        }
-        nread -= nread % frame_bytes;
-        if (nread == 0) {
-            break;
-        }
-
-        size_t got = fread(raw, 1, nread, f);
-        if (got == 0) {
-            break;
-        }
-        got -= got % frame_bytes;
-
-        size_t samples_in = got / frame_bytes;
-        size_t out_bytes;
-
-        if (ch == 1u && samples_in > (STEREO_SAMPLES_MAX / 2u)) {
-            ESP_LOGE(TAG, "PCM mono vuot dem tinh (%u)", (unsigned)samples_in);
-            out_err = ESP_ERR_INVALID_SIZE;
-            break;
-        }
-        if (ch != 1u && samples_in * 2u > STEREO_SAMPLES_MAX) {
-            ESP_LOGE(TAG, "PCM stereo vuot dem tinh (%u)", (unsigned)samples_in);
-            out_err = ESP_ERR_INVALID_SIZE;
-            break;
-        }
-
-        if (ch == 1u) {
-            const int16_t *mono = (const int16_t *)(const void *)raw;
-            for (size_t i = 0; i < samples_in; i++) {
-                int32_t temp = ((int32_t)mono[i] * (int32_t)BOARD_AUDIO_PCM_GAIN_NUM * s_vol_pct) /
-                               ((int32_t)BOARD_AUDIO_PCM_GAIN_DEN * 100);
-                if (temp > 32767) {
-                    temp = 32767;
-                }
-                if (temp < -32768) {
-                    temp = -32768;
-                }
-                int16_t val = (int16_t)temp;
-                stereo[i * 2u] = val;
-                stereo[i * 2u + 1u] = val;
-            }
-            out_bytes = samples_in * 2u * sizeof(int16_t);
-        } else {
-            const int16_t *src = (const int16_t *)(const void *)raw;
-            for (size_t i = 0; i < samples_in * 2u; i++) {
-                int32_t temp = ((int32_t)src[i] * (int32_t)BOARD_AUDIO_PCM_GAIN_NUM * s_vol_pct) /
-                               ((int32_t)BOARD_AUDIO_PCM_GAIN_DEN * 100);
-                if (temp > 32767) {
-                    temp = 32767;
-                }
-                if (temp < -32768) {
-                    temp = -32768;
-                }
-                stereo[i] = (int16_t)temp;
-            }
-            out_bytes = got;
-        }
-
-        size_t written = 0;
-        err = i2s_channel_write(s_tx_chan, stereo, out_bytes, &written, portMAX_DELAY);
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "i2s_channel_write: %s", esp_err_to_name(err));
-            out_err = err;
-            break;
-        }
-
-        remaining -= got;
-        if (got < nread) {
-            break;
-        }
+    if (out_err != ESP_OK && out_err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "i2s feed: %s", esp_err_to_name(out_err));
     }
-
-    fclose(f);
-    sd_card_unlock();
     if (g_audio_abort) {
         audio_abort_teardown();
     }
-    return out_err;
+    return (out_err == ESP_ERR_INVALID_STATE) ? ESP_OK : out_err;
 }
 
 static void app_audio_task(void *arg)
@@ -469,7 +548,17 @@ void app_audio_start(void)
         ESP_LOGE(TAG, "xQueueCreate thất bại");
         return;
     }
-    BaseType_t ok = xTaskCreatePinnedToCore(app_audio_task, "app_audio", AUDIO_TASK_STACK, NULL, BOARD_AUDIO_TASK_PRIO, NULL, 0);
+    BaseType_t ok = xTaskCreatePinnedToCoreWithCaps(app_audio_task, "app_audio", AUDIO_TASK_STACK, NULL,
+                                                    BOARD_AUDIO_TASK_PRIO, NULL, 1,
+                                                    MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (ok != pdPASS) {
+        ok = xTaskCreatePinnedToCoreWithCaps(app_audio_task, "app_audio", AUDIO_TASK_STACK, NULL,
+                                            BOARD_AUDIO_TASK_PRIO, NULL, 1,
+                                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    }
+    if (ok != pdPASS) {
+        ok = xTaskCreatePinnedToCore(app_audio_task, "app_audio", AUDIO_TASK_STACK, NULL, BOARD_AUDIO_TASK_PRIO, NULL, 1);
+    }
     if (ok != pdPASS) {
         ESP_LOGE(TAG, "Khong tao duoc task app_audio");
         vQueueDelete(s_audio_q);
@@ -500,6 +589,14 @@ esp_err_t app_audio_queue_wav(const char *path)
         return ESP_ERR_NO_MEM;
     }
     return ESP_OK;
+}
+
+bool app_audio_is_queue_full(void)
+{
+    if (!s_audio_q) {
+        return false;
+    }
+    return uxQueueSpacesAvailable(s_audio_q) == 0;
 }
 
 void app_audio_play_confirm(void)

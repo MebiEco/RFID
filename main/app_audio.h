@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stdbool.h>
 #include "esp_err.h"
 
 /** Khởi tạo task âm thanh + hàng đợi (gọi một lần sau khi NVS/init cơ bản). */
@@ -10,6 +11,9 @@ void app_audio_start(void);
  * Không block; SD phải đã mount nếu path nằm trên /sdcard.
  */
 esp_err_t app_audio_queue_wav(const char *path);
+
+/** Kiểm tra xem hàng đợi âm thanh đã đầy chưa. */
+bool app_audio_is_queue_full(void);
 
 /** 4.wav — xác nhận lệnh thành công (LCD / web / Azure Direct Method). */
 void app_audio_play_confirm(void);

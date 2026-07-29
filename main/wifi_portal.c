@@ -13,6 +13,8 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/idf_additions.h"
+#include "esp_heap_caps.h"
 #include "esp_netif.h"
 #include "esp_netif_sntp.h"
 #include "esp_sntp.h"
@@ -182,6 +184,7 @@ static bool s_time_synced;
 static esp_netif_t *s_sta_netif;
 static bool s_sntp_retry_task_live;
 static uint8_t s_ntp_server_idx;
+static volatile bool s_httpd_ota_hold;
 
 /** Xoay vong khi retry (LWIP chi cho 1 server trong config). */
 static const char *s_ntp_servers[] = {
@@ -298,7 +301,12 @@ static void schedule_sta_reconnect(void)
     }
     s_sta_reconnect_count++;
     s_sta_reconnect_task_live = true;
-    if (xTaskCreate(sta_delayed_connect_task, "sta_reco", 3072, NULL, 4, NULL) != pdPASS) {
+    BaseType_t ok = xTaskCreateWithCaps(sta_delayed_connect_task, "sta_reco", 6144, NULL, 4, NULL,
+                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (ok != pdPASS) {
+        ok = xTaskCreate(sta_delayed_connect_task, "sta_reco", 6144, NULL, 4, NULL);
+    }
+    if (ok != pdPASS) {
         s_sta_reconnect_task_live = false;
         ESP_LOGW(TAG, "xTaskCreate sta_reco failed");
     }
@@ -911,6 +919,10 @@ static bool portal_http_probe(void)
     return ok;
 }
 
+static esp_err_t stop_httpd(void);
+static esp_err_t start_httpd(void);
+static esp_err_t restart_httpd(void);
+
 static esp_err_t stop_httpd(void)
 {
     if (!s_server) {
@@ -921,7 +933,22 @@ static esp_err_t stop_httpd(void)
     return e;
 }
 
-static esp_err_t restart_httpd(void);
+void wifi_portal_httpd_stop(void)
+{
+    ESP_LOGI(TAG, "OTA: dung httpd SoftAP");
+    s_httpd_ota_hold = true;
+    (void)stop_httpd();
+}
+
+esp_err_t wifi_portal_httpd_start(void)
+{
+    s_httpd_ota_hold = false;
+    if (s_server) {
+        return ESP_OK;
+    }
+    ESP_LOGI(TAG, "OTA: bat lai httpd SoftAP");
+    return start_httpd();
+}
 
 static void portal_health_task(void *arg)
 {
@@ -930,6 +957,11 @@ static void portal_health_task(void *arg)
 
     int fail_streak = 0;
     for (;;) {
+        if (s_httpd_ota_hold) {
+            fail_streak = 0;
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
         if (portal_http_probe()) {
             if (fail_streak > 0) {
                 ESP_LOGI(TAG, "Portal health OK (truoc do fail %d lan)", fail_streak);
@@ -965,7 +997,12 @@ static void portal_health_start(void)
     if (s_portal_health_started) {
         return;
     }
-    if (xTaskCreate(portal_health_task, "portal_hlth", 3072, NULL, 2, NULL) != pdPASS) {
+    BaseType_t ok = xTaskCreateWithCaps(portal_health_task, "portal_hlth", 6144, NULL, 2, NULL,
+                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (ok != pdPASS) {
+        ok = xTaskCreate(portal_health_task, "portal_hlth", 6144, NULL, 2, NULL);
+    }
+    if (ok != pdPASS) {
         ESP_LOGW(TAG, "Khong tao duoc portal health task");
         return;
     }
@@ -977,11 +1014,16 @@ static esp_err_t start_httpd(void)
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     /* Gioi han URI/header: ESP-IDF 5.3 chi co CONFIG_HTTPD_MAX_* trong sdkconfig (khong co field trong httpd_config_t). */
     /* /scans dung nhieu buffer tren stack; mac dinh 4096 de tran stack overflow -> reset. */
-    cfg.stack_size = 8192;
+    cfg.stack_size = 16384;
+    /* Stack httpd tren PSRAM — du cho /scans + HTML lon. */
+    cfg.task_caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
     cfg.lru_purge_enable = true;
     cfg.max_uri_handlers = 32;
     cfg.max_open_sockets = PORTAL_HTTP_MAX_SOCKETS;
     cfg.keep_alive_enable = false;
+    /* SoftAP + HTML lon: mac dinh 5s de send EAGAIN (errno 11). */
+    cfg.send_wait_timeout = 30;
+    cfg.recv_wait_timeout = 15;
 
     esp_err_t err = httpd_start(&s_server, &cfg);
     if (err != ESP_OK) {
@@ -1244,7 +1286,12 @@ static void schedule_sntp_retry(void)
         return;
     }
     s_sntp_retry_task_live = true;
-    if (xTaskCreate(sntp_retry_task, "sntp_retry", 3072, NULL, 3, NULL) != pdPASS) {
+    BaseType_t ok = xTaskCreateWithCaps(sntp_retry_task, "sntp_retry", 6144, NULL, 3, NULL,
+                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (ok != pdPASS) {
+        ok = xTaskCreate(sntp_retry_task, "sntp_retry", 6144, NULL, 3, NULL);
+    }
+    if (ok != pdPASS) {
         s_sntp_retry_task_live = false;
         ESP_LOGW(TAG, "Khong tao duoc task sntp_retry");
     }

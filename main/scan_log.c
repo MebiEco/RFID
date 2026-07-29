@@ -12,6 +12,7 @@
 #include "lcd_ui.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "nvs.h"
@@ -602,7 +603,7 @@ typedef struct {
 } scan_log_json_query_t;
 
 /** Gioi han khi sap xep theo index/ma NV (can buffer RAM). */
-#define SCAN_LOG_SORT_BUF_MAX 400
+#define SCAN_LOG_SORT_BUF_MAX 1000
 
 typedef struct {
     char ts[80];
@@ -1164,7 +1165,11 @@ esp_err_t scan_log_send_json(httpd_req_t *req)
     bool sort_truncated = false;
 
     if (field_sort) {
-        stored = (scan_log_stored_row_t *)calloc(SCAN_LOG_SORT_BUF_MAX, sizeof(scan_log_stored_row_t));
+        stored = (scan_log_stored_row_t *)heap_caps_calloc(
+            SCAN_LOG_SORT_BUF_MAX, sizeof(scan_log_stored_row_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!stored) {
+            stored = (scan_log_stored_row_t *)calloc(SCAN_LOG_SORT_BUF_MAX, sizeof(scan_log_stored_row_t));
+        }
         if (!stored) {
             fclose(fp);
             sd_card_unlock();

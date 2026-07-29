@@ -1,0 +1,380 @@
+<!DOCTYPE html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+<title>Máy chấm công</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:system-ui,sans-serif;background:#0b1220;color:#e5e7eb;min-height:100vh;line-height:1.45;font-size:14px}
+.wrap{display:flex;min-height:100vh}
+.side{width:200px;background:#111827;border-right:1px solid #1f2937;padding:16px 0;flex-shrink:0;display:flex;flex-direction:column}
+.side h2{font-size:13px;text-align:center;margin:0 10px 14px;color:#a5b4fc;letter-spacing:.5px}
+.nav{display:flex;flex-direction:column;gap:2px;padding:0 8px}
+.nav a{display:block;padding:10px 12px;color:#9ca3af;text-decoration:none;border-radius:6px;cursor:pointer}
+.nav a:hover{color:#fff;background:#1f2937}
+.nav a.on{color:#fff;background:#3730a3}
+.main{flex:1;padding:20px;overflow:auto}
+.card{background:#1e293b;border:1px solid #334155;border-radius:10px;padding:18px;max-width:820px;margin:0 auto}
+h1{font-size:18px;margin-bottom:14px;padding-bottom:8px;border-bottom:1px solid #334155}
+label{display:block;margin:12px 0 4px;font-size:12px;color:#cbd5e1}
+input:not([type=radio]):not([type=checkbox]),select{width:100%;padding:9px 11px;background:#0f172a;border:1px solid #374151;border-radius:6px;font-size:14px;color:#fff}
+.btn,.btn-sm{display:inline-block;padding:9px 14px;border:0;border-radius:6px;background:#4f46e5;color:#fff;font-weight:600;font-size:13px;cursor:pointer;margin:8px 6px 0 0}
+.btn.red,.btn-sm.red{background:#dc2626}
+.btn.green,.btn-sm.green{background:#059669}
+.btn:disabled{opacity:.5}
+.btn-sm{padding:5px 10px;font-size:12px}
+.msg{margin-top:8px;min-height:18px}
+.msg.success{color:#34d399}.msg.error{color:#f87171}
+.tbl{width:100%;border-collapse:collapse;font-size:13px;margin-top:12px}
+.tbl th{background:#0f172a;color:#9ca3af;font-size:11px;padding:8px 10px;text-align:left}
+.tbl td{padding:8px 10px;border-bottom:1px solid #1f2937}
+.ov{position:fixed;inset:0;background:rgba(0,0,0,.55);display:none;align-items:center;justify-content:center;z-index:99}
+.ov.show{display:flex}
+.pinbox{background:#1e293b;border:1px solid #334155;padding:20px;border-radius:10px;width:90%;max-width:360px}
+.hint{font-size:12px;color:#9ca3af;margin-top:10px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;margin-bottom:14px}
+.sc{background:#151f32;border:1px solid #1f2937;border-radius:8px;padding:12px}
+.sc h3{font-size:11px;color:#9ca3af;text-transform:uppercase;margin-bottom:4px}
+.sc .v{font-weight:600;margin-bottom:4px}
+.att-sum{display:flex;flex-wrap:wrap;gap:6px;margin:6px 0 4px}
+.att-chip{display:inline-flex;align-items:center;gap:6px;padding:5px 10px;background:#0f172a;border:1px solid #1f2937;border-radius:6px;font-size:12px;white-space:nowrap}
+.att-chip .k{color:#9ca3af;text-transform:uppercase;font-size:10px;letter-spacing:.3px}
+.att-chip .n{font-weight:700;font-size:15px;font-variant-numeric:tabular-nums}
+.badge,.sb{display:inline-block;padding:2px 7px;border-radius:999px;font-size:11px;font-weight:600}
+.sb.ok,.badge.save{background:#064e3b;color:#34d399}
+.sb.warn{background:#78350f;color:#fbbf24}
+.sb.bad,.badge.del{background:#7f1d1d;color:#f87171}
+.badge.swipe{background:#1e3a8a;color:#93c5fd}
+#wlist{list-style:none;margin-top:10px}
+#wlist li{background:#151f32;border:1px solid #1f2937;padding:8px 12px;border-radius:6px;margin-bottom:6px;display:flex;justify-content:space-between;align-items:center}
+.spin{width:16px;height:16px;border:2px solid #334155;border-top-color:#fff;border-radius:50%;display:inline-block;animation:sp .7s linear infinite;vertical-align:middle}
+@keyframes sp{to{transform:rotate(360deg)}}
+.lcd-opt{display:flex;gap:10px;margin:10px 0;padding:12px;border:1px solid #334155;border-radius:8px;cursor:pointer}
+.lcd-opt.sel{border-color:#6366f1;background:#1e1b4b}
+.term-box{background:#0c0c0c;font-family:Consolas,"Cascadia Mono",ui-monospace,monospace;font-size:12px;line-height:1.35;padding:12px;border-radius:8px;border:1px solid #334155;height:450px;overflow:auto;white-space:pre-wrap;color:#cccccc;margin:12px 0}
+/* Khop IDF Monitor (Windows Terminal Campbell): I xanh la, W vang, E do */
+.te{color:#e74856}.tw{color:#f9f1a5}.ti{color:#16c60c}.td{color:#3b78ff}.tv{color:#767676}
+.te .lv,.tw .lv,.ti .lv,.td .lv,.tv .lv{font-weight:700}
+.bar-row{margin:10px 0 14px}.bar-meta{display:flex;justify-content:space-between;font-size:12px;color:#9ca3af;margin-bottom:4px}
+.bar-meta b{color:#e5e7eb;font-weight:600}.bar{height:10px;background:#0f172a;border:1px solid #334155;border-radius:999px;overflow:hidden}
+.bar>i{display:block;height:100%;border-radius:999px;background:#34d399}
+.bar>i.warn{background:#fbbf24}.bar>i.bad{background:#f87171}
+.att-block{margin-top:16px;padding:14px;background:#151f32;border:1px solid #1f2937;border-radius:8px}
+.att-block h3{position:sticky;top:0;z-index:2;font-size:14px;margin:0;padding:8px 0 6px;background:#151f32}
+.att-block .sub{font-size:12px;color:#9ca3af;margin-bottom:10px}
+.att-head{position:sticky;top:0;z-index:3;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;padding:4px 0 8px;margin:0 0 4px;background:#151f32;border-bottom:1px solid #1f2937}
+.att-lists{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin-top:12px}
+.att-list{background:#0f172a;border:1px solid #1f2937;border-radius:6px;padding:0;max-height:160px;overflow:auto;font-size:12px}
+.att-list h4{position:sticky;top:0;z-index:1;font-size:11px;color:#9ca3af;text-transform:uppercase;margin:0;padding:8px 8px 6px;background:#0f172a;border-bottom:1px solid #1f2937}
+.att-list ul{margin:0;padding:0 8px 8px}
+.att-list li{display:flex;align-items:baseline;gap:6px;padding:4px 0;border-bottom:1px solid #1f2937;list-style:none}
+.att-list .nm{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.att-list .t{color:#38bdf8;flex-shrink:0;font-variant-numeric:tabular-nums}
+.m-hdr{display:none;background:#111827;border-bottom:1px solid #1f2937;height:52px;align-items:center;padding:0 12px;position:sticky;top:0;z-index:90}
+.m-hdr h2{font-size:14px;color:#a5b4fc;margin:0 auto}
+.m-hdr button{background:0;border:0;color:#9ca3af;font-size:22px;cursor:pointer;padding:6px}
+.m-ov{display:none;position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:89}
+@media(max-width:768px){
+.m-hdr{display:flex}
+.side{position:fixed;top:52px;left:0;bottom:0;transform:translateX(-100%);z-index:91;width:220px}
+.side.show{transform:translateX(0)}
+.m-ov.show{display:block}
+.main{padding:12px}
+}
+</style></head><body>
+<div class=m-hdr id=mHdr style=display:none><button id=mBtn type=button>☰</button><h2>MÁY CHẤM CÔNG</h2></div>
+<div class=m-ov id=mOv></div>
+<div class=wrap id=appLayout style=display:none>
+<aside class=side id=sideMenu><h2>MÁY CHẤM CÔNG</h2><nav class=nav>
+<a data-sec=home class=on>Tổng quan</a>
+<a data-sec=wifi>WiFi</a>
+<a data-sec=azure>Azure</a>
+<a data-sec=log>Nhật ký</a>
+<a data-sec=cards>DS thẻ</a>
+<a data-sec=register>Đăng ký thẻ</a>
+<a data-sec=pin>Đổi PIN</a>
+<a data-sec=lcd>Màn hình</a>
+<a data-sec=terminal>Log Terminal</a>
+<a data-sec=hardware>Giám sát</a>
+<a id=logoutBtn style=color:#f87171;margin-top:auto>Đăng xuất</a>
+</nav></aside>
+<main class=main><div class=card id=panel><h1 id=title>Trang chủ</h1><div id=body><p id=st>Đang tải...</p></div></div></main>
+</div>
+<div id=loginPage style="display:flex;align-items:center;justify-content:center;min-height:100vh;padding:16px">
+<div class=card style="width:100%;max-width:360px">
+<h2 style="text-align:center;margin-bottom:16px;color:#a5b4fc">ADMIN LOGIN</h2>
+<label>Tài khoản</label><input id=luser autocomplete=username>
+<label>Mật khẩu</label><input type=password id=lpass autocomplete=current-password>
+<p class=msg id=lmsg></p>
+<button class=btn id=lbtn style=width:100%>Đăng nhập</button>
+</div></div>
+<div class=ov id=pinOv><div class=pinbox>
+<h3 id=pinTitle style=margin-bottom:10px>Nhập PIN</h3>
+<input type=password id=pinIn maxlength=15 autocomplete=off>
+<div style="margin-top:12px;display:flex;gap:8px"><button class=btn id=pinOk style=flex:1;margin:0>Xác nhận</button>
+<button class=btn id=pinCancel style="flex:1;margin:0;background:#475569">Hủy</button></div>
+<p class=hint>Sai PIN quá 5 lần sẽ bị khóa.</p>
+</div></div>
+<div class=ov id=regOv><div class=pinbox style=max-width:400px>
+<h3 id=regTitle style=margin-bottom:10px>Đăng ký nhân viên</h3>
+<label>Tên nhân viên</label><input id=regName autocomplete=off>
+<label>Mã nhân viên</label><input id=regId autocomplete=off>
+<div style="margin-top:14px;display:flex;gap:8px"><button class=btn id=regOk style=flex:1;margin:0>Lưu</button>
+<button class=btn id=regCancel style="flex:1;margin:0;background:#475569">Hủy</button></div>
+</div></div>
+<script>
+const T={home:'Tổng quan',wifi:'Cấu hình WiFi',azure:'Cấu hình Azure IoT',log:'Nhật ký hoạt động',cards:'Danh sách thẻ',register:'Đăng ký thẻ mới',pin:'Đổi mã PIN',lcd:'Cấu hình màn hình',terminal:'Log Terminal',hardware:'Giám sát phần cứng'};
+let cur='home',tokens=JSON.parse(sessionStorage.getItem('portal_tokens')||'{}'),pendSec=null,pollTimer=null;
+const tabCache={};const TAB_TTL={status:5000,attend:15000,azure:30000,screen:60000};
+function tcGet(k){const e=tabCache[k];if(!e)return null;const ttl=TAB_TTL[k]||0;if(ttl&&Date.now()-e.t>ttl){delete tabCache[k];return null;}return e.d;}
+function tcSet(k,d){tabCache[k]={t:Date.now(),d};}
+function tcClr(k){if(k)delete tabCache[k];else for(const x in tabCache)delete tabCache[x];}
+let logFilter={range:'today',from:'',to:'',code:'all',sort:'desc'};
+let cardFilter={id:''};
+function cardsQueryUrl(unreg,page){page=page||1;const p=new URLSearchParams();p.set('page',page);if(unreg)p.set('unreg','1');else if(cardFilter.id)p.set('id',cardFilter.id);return '/api/cards?'+p;}
+function logSel(v,c){return v===c?' selected':'';}
+function logQueryUrl(page){page=page||1;const p=new URLSearchParams();p.set('page',page);if(logFilter.range==='all')p.set('all','1');else if(logFilter.range==='7')p.set('days','7');else if(logFilter.range==='30')p.set('days','30');else if(logFilter.range==='custom'){if(logFilter.from)p.set('from',logFilter.from);if(logFilter.to)p.set('to',logFilter.to);}if(logFilter.code&&logFilter.code!=='all')p.set('code',logFilter.code);p.set('sort',logFilter.sort||'desc');return '/api/log?'+p;}
+function $(id){return document.getElementById(id)}
+function hdr(sec){const h={'Content-Type':'application/x-www-form-urlencoded'};const t=sec?tokens[sec]:tokens.admin;if(t)h['X-Portal-Token']=t;return h;}
+function api(sec,url,opt){return fetch(url,Object.assign({headers:hdr(sec)},opt||{}));}
+function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+function colorLog(t){
+t=esc(String(t||'')).replace(/\u001b\[[0-9;]*m/g,'').replace(/\r/g,'');
+return t.split('\n').map(line=>{
+const m=line.match(/^([EWIDV])(\s*)(\()(.*)$/);
+if(!m)return line;
+const cls={E:'te',W:'tw',I:'ti',D:'td',V:'tv'}[m[1]];
+return '<span class='+cls+'><span class=lv>'+m[1]+'</span>'+m[2]+m[3]+m[4]+'</span>';
+}).join('\n');
+}
+function showPin(sec,cb){pendSec=sec;const ov=$('pinOv');$('pinTitle').innerText='PIN - '+T[sec];$('pinIn').value='';ov.classList.add('show');$('pinIn').focus();
+const ok=()=>{const p=$('pinIn').value;fetch('/api/unlock',{method:'POST',headers:hdr(''),body:'section='+encodeURIComponent(sec)+'&pin='+encodeURIComponent(p)}).then(r=>r.json()).then(d=>{if(d.ok){tokens[sec]=d.token;sessionStorage.setItem('portal_tokens',JSON.stringify(tokens));ov.classList.remove('show');cb();}else alert(d.error||'PIN sai');});};
+$('pinOk').onclick=ok;$('pinIn').onkeydown=e=>{if(e.key==='Enter')ok();};$('pinCancel').onclick=()=>ov.classList.remove('show');}
+function need(sec,fn){if(tokens[sec]){fn();return;}showPin(sec,fn);}
+function attListHtml(title,rows,timeKey){
+let h='<div class=att-list><h4>'+esc(title)+'</h4><ul>';
+if(!rows||!rows.length)h+='<li style=color:#64748b>Không có</li>';
+else rows.forEach(r=>{const tm=timeKey&&r[timeKey]?r[timeKey]:'';
+h+='<li><span class=nm>'+esc(r.name||r.id||'-')+(r.id?' <code style=color:#64748b>'+esc(r.id)+'</code>':'')+'</span>'+(tm?'<span class=t>'+esc(tm)+'</span>':'')+'</li>';});
+return h+'</ul></div>';
+}
+function attChip(label,num,badgeHtml){
+return '<span class=att-chip><span class=k>'+esc(label)+'</span><span class=n>'+num+'</span>'+(badgeHtml||'')+'</span>';
+}
+function renderAttBlock(a){
+if(!a||!a.ok)return '<div class=att-block><p class="msg error">'+(a&&a.error?esc(a.error):'Không tải được chấm công')+'</p><button class=btn id=attRefresh>Thử lại</button></div>';
+const td=a.today||{};
+const ar=td.arrive||a.arrive||{};
+const lv=td.leave||a.leave||{};
+const y=a.yesterday||{};
+const n=+a.registered||0;
+const tPresent=(+ar.late||0)+(+ar.ontime||0);
+const tAbsent=+ar.absent||0;
+const yAbsent=+y.absent||0;
+const yPresent=Math.max(0,n-yAbsent);
+const tdDate=td.date||ar.date||'';
+return '<div class=att-block><div class=att-head>'
++'<div><h3 style="position:static;padding:0;background:0;border:0">Chấm công</h3><div class=sub style=margin:0>Giờ công '+(esc(a.work_hours||'08:30-18:00'))+'</div></div>'
++'<button class="btn-sm" id=attRefresh style=margin:0>Làm mới</button></div>'
++'<h3 style="margin-top:10px">Hôm nay <span style=color:#64748b;font-weight:400>('+esc(tdDate)+')</span></h3>'
++'<div class=att-sum>'
++attChip('Sĩ số',n,'')
++attChip('Có mặt',tPresent,'<span class="sb ok">/'+n+'</span>')
++attChip('Vắng',tAbsent,'<span class="sb bad">/'+n+'</span>')
++'</div>'
++'<h3 style="margin-top:10px">Đi làm</h3>'
++'<div class=att-sum>'
++attChip('Không đi làm',tAbsent,'<span class="sb bad">0 quẹt</span>')
++attChip('Đi muộn',ar.late||0,'<span class="sb warn">>08:30</span>')
++attChip('Đúng giờ',ar.ontime||0,'<span class="sb ok">≤08:30</span>')
++'</div><div class=att-lists>'
++attListHtml('Không đi làm',ar.absent_list,null)
++attListHtml('Đi muộn',ar.late_list,'in')
++attListHtml('Đúng giờ',ar.ontime_list,'in')
++'</div>'
++'<h3 style="margin-top:12px">Đi về</h3>'
++'<div class=att-sum>'
++attChip('Không đi làm',lv.absent||0,'')
++attChip('Quên quẹt',lv.forgot||0,'')
++attChip('Về sớm',lv.early||0,'<span class="sb warn"><18:00</span>')
++attChip('Về đúng giờ',lv.on_time_out||0,'<span class="sb ok">≥18:00</span>')
++'</div><div class=att-lists>'
++attListHtml('Không đi làm',lv.absent_list,null)
++attListHtml('Quên quẹt',lv.forgot_list,'in')
++attListHtml('Về sớm',lv.early_list,'out')
++attListHtml('Về đúng giờ',lv.on_time_out_list,'out')
++'</div>'
++'<h3 style="margin-top:16px">Hôm qua · Tổng quát <span style=color:#64748b;font-weight:400>('+esc(y.date||'')+')</span></h3>'
++'<div class=att-sum>'
++attChip('Sĩ số',n,'')
++attChip('Có mặt',yPresent,'<span class="sb ok">/'+n+'</span>')
++attChip('Vắng',yAbsent,'<span class="sb bad">/'+n+'</span>')
++attChip('Đi muộn',y.late||0,'')
++attChip('Về sớm',y.early||0,'')
++'</div><div class=att-lists>'
++attListHtml('Không đi làm',y.absent_list,null)
++attListHtml('Đi muộn',y.late_list,'in')
++attListHtml('Về sớm',y.early_list,'out')
++'</div></div>';
+}
+function bindAttRefresh(){const b=$('attRefresh');if(!b)return;b.onclick=()=>{tcClr('status');tcClr('attend');renderHome(true);};}
+function renderHomeData(d,att){
+const L={idle:['Ngoại tuyến','warn'],connecting:['Đang kết nối','warn'],connected:['Đã kết nối','ok'],fail:['Lỗi kết nối','bad']};
+const w=L[d.wifi_status]||[d.wifi_status,'warn'];
+$('body').innerHTML='<div class=grid>'
++'<div class=sc><h3>WiFi</h3><div class=v>Đã lưu: '+d.wifi_saved+' AP</div><span class="sb '+w[1]+'">'+w[0]+'</span></div>'
++'<div class=sc><h3>Azure IoT</h3><div class=v>'+(d.azure_connected?'Đang hoạt động':'Mất kết nối')+'</div><span class="sb '+(d.azure_connected?'ok':'bad')+'">'+(d.azure_connected?'Đã kết nối':'Chưa kết nối')+'</span></div>'
++'<div class=sc><h3>Thẻ SD</h3><div class=v>'+(d.sd?'Đã gắn SD':'Chưa gắn SD')+'</div><span class="sb '+(d.sd?'ok':'bad')+'">'+(d.sd?'OK':'Trống')+'</span></div>'
++'<div class=sc><h3>Giờ hệ thống</h3><div class=v>'+(d.time_ok?(d.time||'Đã đồng bộ'):'Chờ WiFi + NTP')+'</div><span class="sb '+(d.time_ok?'ok':'bad')+'">'+(d.time_ok?'Đồng bộ':'Chưa có giờ')+'</span></div>'
++'</div><p class=hint style=margin:8px 0 0>FW '+(esc(d.fw_ver||'?'))+' · '+(esc(d.fw_date||'?'))+' · '+(esc(d.fw_part||'?'))+'</p>'
++renderAttBlock(att);
+bindAttRefresh();
+}
+function renderHome(force){
+if(!force){const c=tcGet('status');const a=tcGet('attend');if(c&&a){renderHomeData(c,a);return;}}
+$('body').innerHTML='<p class=msg>Đang tải tổng quan...</p>';
+const ctrl=new AbortController();const tid=setTimeout(()=>ctrl.abort(),20000);
+Promise.all([
+fetch('/api/status',{headers:hdr(''),signal:ctrl.signal}).then(r=>{if(r.status===401||r.status===403)throw Object.assign(new Error('auth'),{auth:true});if(!r.ok)throw new Error('HTTP '+r.status);return r.json();}),
+fetch('/api/attendance_overview',{headers:hdr(''),signal:ctrl.signal}).then(r=>{if(r.status===401||r.status===403)throw Object.assign(new Error('auth'),{auth:true});return r.json().catch(()=>({ok:false,error:'Lỗi JSON'}));})
+]).then(([d,att])=>{clearTimeout(tid);tcSet('status',d);tcSet('attend',att);renderHomeData(d,att);})
+.catch(e=>{clearTimeout(tid);if(e&&e.auth){tokens={};sessionStorage.removeItem('portal_tokens');tcClr();checkLogin();return;}
+if(!tokens.admin)return;$('body').innerHTML='<p class="msg error">'+(e.name==='AbortError'?'Máy chủ không phản hồi.':'Lỗi: '+(e.message||'kết nối'))+'</p><button class=btn onclick="renderHome(true)">Thử lại</button>';});
+}
+function renderWifi(){
+$('body').innerHTML='<div style=max-width:500px><label>SSID</label><div style=display:flex;gap:8px><input id=wssid list=wl style=flex:1><button class=btn type=button id=wscan style=margin:0>Quét</button></div><datalist id=wl></datalist>'
++'<label>Mật khẩu</label><input type=password id=wpass maxlength=63><p class=msg id=wmsg></p>'
++'<button class="btn green" id=wsave>Lưu & kết nối</button><button class="btn red" id=wclr>Xóa tất cả</button></div>'
++'<h3 style="margin-top:18px;font-size:14px">WiFi đã lưu</h3><ul id=wlist></ul>';
+function wscanFill(d){const l=$('wl');if(!l)return;l.innerHTML='';(Array.isArray(d)?d:[]).forEach(i=>{const o=document.createElement('option');o.value=i.ssid;l.appendChild(o);});}
+function wscanRun(fresh){const btn=$('wscan');btn.disabled=true;btn.innerHTML='<span class=spin></span>';
+const poll=()=>{api('wifi','/scan'+(fresh?'?fresh=1':'')).then(r=>r.json()).then(d=>{if(d&&d.scanning){setTimeout(poll,400);return;}wscanFill(d);btn.disabled=false;btn.innerText='Quét';}).catch(()=>{btn.disabled=false;btn.innerText='Quét';});};poll();};
+$('wscan').onclick=()=>wscanRun(true);
+function wlist(){api('wifi','/saved_wifis').then(r=>r.json()).then(a=>{const u=$('wlist');u.innerHTML='';a.forEach(s=>{const li=document.createElement('li');li.innerHTML=esc(s)+' <button class="btn-sm red" data-s="'+esc(s)+'">Xóa</button>';
+li.querySelector('button').onclick=()=>{if(!confirm('Xóa '+s+'?'))return;api('wifi','/del_wifi',{method:'POST',body:'ssid='+encodeURIComponent(s)}).then(r=>{if(!r.ok){alert('Không xóa được');return;}wlist();});};u.appendChild(li);});});}
+wlist();wscanRun(false);
+$('wsave').onclick=()=>{const b=new URLSearchParams();b.set('ssid',$('wssid').value);b.set('pass',$('wpass').value);
+api('wifi','/save_wifi',{method:'POST',body:b}).then(r=>{const ok=r.ok;$('wmsg').innerText=ok?'Đã lưu, đang kết nối...':'Lỗi lưu';$('wmsg').className='msg '+(ok?'success':'error');if(ok)tcClr('status');wlist();});};
+$('wclr').onclick=()=>{if(!confirm('Xóa toàn bộ WiFi?'))return;api('wifi','/clear',{method:'POST'}).then(r=>{if(!r.ok){alert('Lỗi');return;}wlist();});};}
+function renderAzureData(c){
+$('body').innerHTML='<div style="background:#151f32;border:1px solid #1f2937;border-radius:8px;padding:12px;margin-bottom:14px;font-size:13px">'
++'<div>MQTT: <b style=color:'+(c.connected?'#34d399':'#f87171')+'>'+(c.connected?'Đã kết nối':'Chưa kết nối')+'</b></div>'
++'<div style=margin-top:4px>Host: <b>'+esc(c.host||'(trống)')+'</b></div>'
++'<div style=margin-top:4px>Device: <b>'+esc(c.devid||'(trống)')+'</b></div>'
++'<div style=margin-top:4px>SAS: <code style=color:#38bdf8>'+esc(c.sas_mask||'(trống)')+'</code></div></div>'
++'<div style=max-width:500px><p class=hint>Nhập đủ 3 trường mỗi lần lưu.</p>'
++'<label>HostName</label><input id=ah maxlength=63><label>Device ID</label><input id=ad maxlength=31>'
++'<label>SAS Key</label><input type=password id=as maxlength=127><p class=msg id=amsg></p>'
++'<button class="btn green" id=asv>Lưu</button><button class="btn red" id=acl>Xóa</button></div>';
+$('asv').onclick=()=>{const hVal=$('ah').value.trim(),dVal=$('ad').value.trim(),sVal=$('as').value.trim();
+if(!hVal||!dVal){alert('Thiếu Host/Device');return;}if(!sVal){alert('Thiếu SAS Key');return;}
+const b=new URLSearchParams();b.set('azure_host',hVal);b.set('azure_devid',dVal);b.set('azure_sas_key',sVal);
+api('azure','/save_azure',{method:'POST',body:b}).then(r=>{if(r.ok){tcClr('azure');tcClr('status');$('amsg').innerText='Đã lưu';$('amsg').className='msg success';setTimeout(renderAzure,1500);}else r.text().then(msg=>{$('amsg').innerText=msg||'Lỗi';$('amsg').className='msg error';});});};
+$('acl').onclick=()=>{if(confirm('Xóa Azure?'))api('azure','/clear_azure',{method:'POST'}).then(()=>{tcClr('azure');tcClr('status');renderAzure();});};}
+function renderAzure(){const c=tcGet('azure');if(c){renderAzureData(c);return;}$('body').innerHTML='<p class=msg>Đang tải...</p>';api('azure','/api/azure').then(r=>r.json()).catch(()=>({})).then(c=>{tcSet('azure',c);renderAzureData(c);});}
+function renderLog(page){page=page||1;$('body').innerHTML='<p class=msg>Đang tải nhật ký...</p>';
+api('log',logQueryUrl(page)).then(r=>r.json()).catch(()=>({})).then(d=>{
+let h='';if(d.time_ok===false)h+='<p class="msg error">Giờ chưa đồng bộ NTP — lọc ngày có thể sai.</p>';
+h+='<div style="margin-bottom:12px;padding:10px;border:1px solid #334155;border-radius:8px;display:flex;flex-wrap:wrap;gap:10px;align-items:flex-end">';
+h+='<div><label>Thời gian</label><select id=logRange style=min-width:120px><option value=today'+logSel('today',logFilter.range)+'>Hôm nay</option><option value=7'+logSel('7',logFilter.range)+'>7 ngày</option><option value=30'+logSel('30',logFilter.range)+'>30 ngày</option><option value=all'+logSel('all',logFilter.range)+'>Tất cả</option><option value=custom'+logSel('custom',logFilter.range)+'>Tùy chọn</option></select></div>';
+h+='<div id=logCustomDates style=display:'+(logFilter.range==='custom'?'flex':'none')+';gap:8px><div><label>Từ</label><input type=date id=logFrom value="'+(logFilter.from||'')+'"></div><div><label>Đến</label><input type=date id=logTo value="'+(logFilter.to||'')+'"></div></div>';
+h+='<div><label>Loại</label><select id=logCode><option value=all'+logSel('all',logFilter.code)+'>Tất cả</option><option value=602'+logSel('602',logFilter.code)+'>Quẹt thẻ</option><option value=601'+logSel('601',logFilter.code)+'>Thẻ lạ</option><option value=603'+logSel('603',logFilter.code)+'>Lưu thẻ</option><option value=604'+logSel('604',logFilter.code)+'>Xóa thẻ</option></select></div>';
+h+='<div><label>Sắp xếp</label><select id=logSort><option value=desc'+logSel('desc',logFilter.sort)+'>Mới nhất</option><option value=asc'+logSel('asc',logFilter.sort)+'>Cũ nhất</option><option value=index_desc'+logSel('index_desc',logFilter.sort)+'>Index ↓</option><option value=index_asc'+logSel('index_asc',logFilter.sort)+'>Index ↑</option><option value=id_asc'+logSel('id_asc',logFilter.sort)+'>Mã A-Z</option><option value=id_desc'+logSel('id_desc',logFilter.sort)+'>Mã Z-A</option></select></div>';
+h+='<button class=btn id=logApply style=margin:0>Áp dụng</button><button class=btn id=lr style="margin:0;background:#475569">Tải lại</button></div>';
+h+='<div style="margin-bottom:12px;padding:10px;border:1px solid #334155;border-radius:8px"><b>Đẩy lại Azure</b><div style=display:flex;gap:8px;flex-wrap:wrap;margin-top:8px>'
++'<input id=syncStart type=number placeholder="Từ Index" style=width:120px><input id=syncEnd type=number placeholder="Đến Index" style=width:120px>'
++'<button class="btn green" id=syncBtn style=margin:0>Đẩy lại</button><span id=syncMsg class=msg style=margin:0></span></div></div>';
+h+='<table class=tbl><thead><tr><th>Thao tác</th><th>Index</th><th>Thời gian</th><th>Tên</th><th>Mã NV</th></tr></thead><tbody id=logRows></tbody></table>';
+if(d.total>d.limit){const totP=Math.ceil(d.total/d.limit);h+='<div style="margin-top:12px;display:flex;gap:8px;justify-content:center;align-items:center">';if(page>1)h+='<button class=btn onclick="renderLog('+(page-1)+')">&lt;</button>';h+='<span class=hint>Trang '+page+'/'+totP+' ('+d.total+')</span>';if(page<totP)h+='<button class=btn onclick="renderLog('+(page+1)+')">&gt;</button>';h+='</div>';}
+if(d.sort_truncated)h+='<p class="msg error">Chỉ sắp xếp 400 dòng đầu — thu hẹp bộ lọc.</p>';
+$('body').innerHTML=h;renderLogRows(d.rows||[],d.sort||logFilter.sort);
+$('logRange').onchange=()=>{const cd=$('logCustomDates');if(cd)cd.style.display=$('logRange').value==='custom'?'flex':'none';};
+const apply=()=>{logFilter.range=$('logRange').value;logFilter.from=$('logFrom')?$('logFrom').value:'';logFilter.to=$('logTo')?$('logTo').value:'';logFilter.code=$('logCode').value;logFilter.sort=$('logSort').value;renderLog(1);};
+$('logApply').onclick=apply;$('lr').onclick=()=>renderLog(page);
+const sb=$('syncBtn');if(sb)sb.onclick=()=>{const st=$('syncStart').value,en=$('syncEnd').value;if(!st||!en||parseInt(st)>parseInt(en)){alert('Index không hợp lệ');return;}sb.disabled=true;$('syncMsg').innerText='Đang đẩy...';
+api('log','/api/log_sync',{method:'POST',body:'start='+encodeURIComponent(st)+'&end='+encodeURIComponent(en)}).then(r=>r.json()).then(x=>{sb.disabled=false;$('syncMsg').innerText=x.ok?('Đã đẩy '+x.resent): (x.error||'Lỗi');$('syncMsg').className='msg '+(x.ok?'success':'error');}).catch(()=>{sb.disabled=false;$('syncMsg').innerText='Lỗi mạng';$('syncMsg').className='msg error';});};});}
+function renderLogRows(rows,sort){let html='';if(!rows.length)html='<tr><td colspan=5 style=text-align:center;color:#9ca3af;padding:20px>Không có dữ liệu</td></tr>';
+else{if(sort==='desc')rows=rows.slice().reverse();rows.forEach(r=>{const b=r.admin?(r.action==='DEL'?'<span class="badge del">Xóa</span>':(r.action==='SAVE'?'<span class="badge save">Lưu</span>':'<span class="badge del">Admin</span>')):(r.code===601?'<span class="badge" style=background:#b45309;color:#fff>Thẻ lạ</span>':'<span class="badge swipe">Quẹt</span>');
+const idx=(r.index!==undefined&&r.index!==-1)?r.index:'-';html+='<tr><td>'+b+'</td><td><code style=color:#38bdf8>'+idx+'</code></td><td>'+esc(r.ts)+'</td><td>'+esc(r.name||(r.uid?('UID '+r.uid):'')||'Chưa ĐK')+'</td><td>'+esc(r.id||'')+'</td></tr>';});}
+$('logRows').innerHTML=html;}
+function cardDelDone(sec,unreg,d){if(d.ok){renderCards(unreg);if(cur==='log')renderLog();}else alert(d.error||'Xóa thất bại');}
+function cardDelReq(sec,unreg,u){api(sec,'/api/cards/del',{method:'POST',body:'uid='+encodeURIComponent(u)}).then(r=>r.json()).then(d=>cardDelDone(sec,unreg,d)).catch(()=>alert('Lỗi xóa'));}
+function renderCards(unreg,page){page=page||1;const sec=unreg?'register':'cards';$('body').innerHTML='<p class=msg>Đang tải...</p>';
+api(sec,cardsQueryUrl(unreg,page)).then(r=>r.json()).catch(()=>({})).then(d=>{
+let h='';if(!unreg){h+='<div style="margin-bottom:12px;display:flex;flex-wrap:wrap;gap:8px;align-items:flex-end"><div style=flex:1;min-width:180px><label>Lọc mã NV</label><input id=cardIdFilter value="'+(cardFilter.id||'')+'"></div><button class=btn id=cardFilterBtn style=margin:0>Áp dụng</button><button class=btn id=cardFilterClr style="margin:0;background:#475569">Xóa lọc</button></div>';}
+h+='<table class=tbl><thead><tr><th>UID</th>';if(!unreg)h+='<th>Tên</th><th>Mã NV</th>';else h+='<th>Thời gian</th>';h+='<th style=text-align:right>Thao tác</th></tr></thead><tbody>';
+const list=d.cards||[];if(!list.length)h+='<tr><td colspan='+(unreg?3:4)+' style=text-align:center;color:#9ca3af;padding:20px>'+(unreg?'Không có thẻ chờ ĐK':(cardFilter.id?'Không thấy':'Trống'))+'</td></tr>';
+else list.forEach(c=>{h+='<tr><td><code style=color:#38bdf8>'+esc(c.uid)+'</code></td>';if(!unreg)h+='<td>'+esc(c.name||'-')+'</td><td>'+esc(c.id||'-')+'</td>';else h+='<td>'+esc(c.date||'-')+'</td>';
+h+='<td style=text-align:right>';if(!unreg)h+='<button class="btn-sm green" data-u="'+esc(c.uid)+'" data-n="'+esc(c.name||'')+'" data-i="'+esc(c.id||'')+'">Sửa</button> <button class="btn-sm red" data-u="'+esc(c.uid)+'">Xóa</button>';
+else h+='<button class="btn-sm green" data-u="'+esc(c.uid)+'" data-n="'+esc(c.name||'')+'" data-i="'+esc(c.id||'')+'">Đăng ký</button> <button class="btn-sm red" data-del-unreg="'+esc(c.uid)+'">Xóa</button>';h+='</td></tr>';});
+h+='</tbody></table>';
+if(d.total>d.limit){const totP=Math.ceil(d.total/d.limit);h+='<div style="margin-top:12px;display:flex;gap:8px;justify-content:center;align-items:center">';if(page>1)h+='<button class=btn onclick="renderCards('+(unreg?'true':'false')+','+(page-1)+')">&lt;</button>';h+='<span class=hint>'+page+'/'+totP+' ('+d.total+')</span>';if(page<totP)h+='<button class=btn onclick="renderCards('+(unreg?'true':'false')+','+(page+1)+')">&gt;</button>';h+='</div>';}
+$('body').innerHTML=h;
+if(!unreg){const fb=$('cardFilterBtn');if(fb)fb.onclick=()=>{cardFilter.id=($('cardIdFilter')?$('cardIdFilter').value:'').trim();renderCards(false,1);};const fc=$('cardFilterClr');if(fc)fc.onclick=()=>{cardFilter.id='';renderCards(false,1);};const fi=$('cardIdFilter');if(fi)fi.onkeydown=e=>{if(e.key==='Enter'){cardFilter.id=fi.value.trim();renderCards(false,1);}};}
+document.querySelectorAll('button[data-u]').forEach(b=>{b.onclick=()=>{const u=b.getAttribute('data-u');if(b.classList.contains('red')){if(!confirm('Xóa thẻ '+u+'?'))return;cardDelReq(sec,unreg,u);}else{const nv=b.getAttribute('data-n')||'',iv=b.getAttribute('data-i')||'';$('regName').value=nv;$('regId').value=iv;$('regTitle').innerText=(nv?'Sửa':'Đăng ký')+' NV';const ov=$('regOv');ov.classList.add('show');$('regName').focus();
+$('regOk').onclick=()=>{const n=$('regName').value.trim(),i=$('regId').value.trim();if(!n||!i){alert('Nhập đủ tên và mã');return;}const p=new URLSearchParams();p.set('uid',u);p.set('name',n);p.set('id',i);
+api(sec,'/api/cards',{method:'POST',body:p}).then(r=>r.json()).then(d=>{if(d.ok){ov.classList.remove('show');renderCards(unreg);}else alert(d.error||'Lỗi');});};$('regCancel').onclick=()=>ov.classList.remove('show');}};});
+document.querySelectorAll('button[data-del-unreg]').forEach(b=>{b.onclick=()=>{const u=b.getAttribute('data-del-unreg');if(!confirm('Xóa thẻ lạ '+u+'?'))return;cardDelReq(sec,unreg,u);};});});}
+function renderPin(){$('body').innerHTML='<div style=max-width:400px><label>PIN hiện tại</label><input type=password id=op maxlength=15><label>PIN mới</label><input type=password id=np maxlength=15><p class=msg id=pmsg></p><button class=btn id=psv>Lưu PIN</button></div>';
+$('psv').onclick=()=>{const b=new URLSearchParams();b.set('old_pin',$('op').value);b.set('new_pin',$('np').value);api('pin','/api/pin_change',{method:'POST',body:b}).then(r=>r.json()).then(d=>{$('pmsg').innerText=d.ok?'Đổi PIN OK':(d.error||'Lỗi');$('pmsg').className='msg '+(d.ok?'success':'error');if(d.ok){$('op').value='';$('np').value='';}});};}
+function renderLcdData(d){const curNm=(d.options||[]).find(o=>o.id===d.current);const curName=curNm?curNm.name:(d.current_name||('ID '+d.current));const bv=d.brand||'MEBIECO';
+let h='<p class=hint>Chọn profile màn 2.8" rồi Lưu — thiết bị reboot.</p><div style=max-width:520px>';
+(d.options||[]).forEach(o=>{const ck=o.id===d.current?' checked':'';const sel=o.id===d.current?' sel':'';h+='<label class="lcd-opt'+sel+'"><input type=radio name=lcdprof value="'+o.id+'" data-pname="'+esc(o.name)+'"'+ck+'><span><b>'+esc(o.name)+'</b>'+(o.id===d.current?' <span class="sb ok">Hiện tại</span>':'')+'<div class=lcd-swap style=display:none;margin-top:6px;font-size:12px></div></span></label>';});
+h+='<p class=msg id=lcdmsg></p><button class="btn green" id=lcdsave>Lưu & reboot</button></div><hr style="border-color:#334155;margin:20px 0">';
+h+='<div style=max-width:520px><h4 style=margin-bottom:8px>Chữ thương hiệu (≤15)</h4><input id=brandInp maxlength=15 value="'+esc(bv)+'" style=max-width:280px><p class=msg id=brandmsg></p><button class=btn id=brandsave>Lưu brand</button></div>';
+const vol=(d.vol!=null)?d.vol:100;
+h+='<hr style="border-color:#334155;margin:20px 0"><div style=max-width:520px><h4 style=margin-bottom:8px>Âm lượng</h4><div style=display:flex;gap:12px;align-items:center><input type=range id=volSlider min=0 max=100 value="'+vol+'" style=flex:1;padding:0><span id=volVal>'+vol+'%</span></div><p class=msg id=volmsg></p></div>';
+$('body').innerHTML=h;
+function lcdSwapHint(){const sel=document.querySelector('input[name=lcdprof]:checked');document.querySelectorAll('.lcd-opt').forEach(l=>l.classList.remove('sel'));document.querySelectorAll('.lcd-swap').forEach(el=>{el.style.display='none';el.innerHTML='';});if(!sel)return;const row=sel.closest('.lcd-opt');if(row)row.classList.add('sel');const hint=row&&row.querySelector('.lcd-swap');if(!hint)return;const newName=sel.getAttribute('data-pname')||'';if(String(sel.value)===String(d.current))hint.innerHTML='<span style=color:#34d399>Đang dùng</span>';else hint.innerHTML=esc(curName)+' → <b style=color:#34d399>'+esc(newName)+'</b>';hint.style.display='block';}
+document.querySelectorAll('input[name=lcdprof]').forEach(r=>{r.onchange=lcdSwapHint;});lcdSwapHint();
+$('lcdsave').onclick=()=>{const sel=document.querySelector('input[name=lcdprof]:checked');if(!sel){alert('Chọn màn');return;}const newNm=sel.getAttribute('data-pname')||sel.value;if(!confirm(String(sel.value)===String(d.current)?('Giữ '+curName+' và reboot?'):('Đổi '+curName+' → '+newNm+'?')))return;$('lcdsave').disabled=true;$('lcdmsg').innerText='Đang lưu...';
+api('','/api/lcd_panel',{method:'POST',body:'panel='+encodeURIComponent(sel.value)}).then(r=>r.json()).then(x=>{if(x.ok&&x.reboot){$('lcdmsg').innerText=x.msg||'Rebooting...';$('lcdmsg').className='msg success';setTimeout(()=>location.reload(),8000);return;}$('lcdsave').disabled=false;$('lcdmsg').innerText=x.ok?(x.msg||'OK'):(x.error||'Lỗi');$('lcdmsg').className='msg '+(x.ok?'success':'error');}).catch(()=>{$('lcdsave').disabled=false;$('lcdmsg').innerText='Lỗi kết nối';$('lcdmsg').className='msg error';});};
+$('brandsave').onclick=()=>{need('lcd',()=>{const b=new URLSearchParams();b.set('brand',$('brandInp').value);$('brandsave').disabled=true;
+api('lcd','/api/brand',{method:'POST',body:b}).then(r=>r.json()).then(x=>{$('brandsave').disabled=false;$('brandmsg').innerText=x.ok?'Đã lưu':(x.error||'Lỗi');$('brandmsg').className='msg '+(x.ok?'success':'error');if(x.ok)tcClr('screen');}).catch(()=>{$('brandsave').disabled=false;$('brandmsg').innerText='Lỗi';$('brandmsg').className='msg error';});});};
+const vs=$('volSlider');if(vs){vs.oninput=()=>{$('volVal').innerText=vs.value+'%';};vs.onchange=()=>{need('lcd',()=>{api('lcd','/api/vol',{method:'POST',body:'vol='+encodeURIComponent(vs.value)}).then(r=>r.json()).then(rx=>{if(rx.ok){$('volmsg').innerText='Đã lưu '+vs.value+'%';$('volmsg').className='msg success';tcClr('screen');}else{$('volmsg').innerText=rx.error||'Lỗi';$('volmsg').className='msg error';};}).catch(e=>{$('volmsg').innerText=e.message;$('volmsg').className='msg error';});});};}}
+function renderLcd(){const c=tcGet('screen');if(c){renderLcdData(c);return;}$('body').innerHTML='<p class=msg>Đang tải...</p>';api('','/api/screen').then(r=>r.json()).catch(()=>({})).then(d=>{if(!d||!d.ok){$('body').innerHTML='<p class="msg error">Không tải được</p>';return;}tcSet('screen',d);renderLcdData(d);});}
+function renderTerminal(){$('body').innerHTML='<div class=term-box id=termLogBox>Đang tải...</div><button class=btn id=termRefreshBtn>Làm mới</button><button class="btn red" id=termClearBtn>Xóa log</button><label style="display:inline-flex;align-items:center;gap:6px;margin-left:12px;cursor:pointer"><input type=checkbox id=termAutoRefreshChk checked style=width:auto> Auto 3s</label>';
+const fetchLogs=()=>{api('','/api/terminal_log').then(r=>{if(r.status===401||r.status===403){tokens={};sessionStorage.removeItem('portal_tokens');tcClr();checkLogin();return '';}return r.text();}).then(txt=>{const box=$('termLogBox');if(box){box.innerHTML=colorLog(txt||'Chưa có log.');box.scrollTop=box.scrollHeight;}}).catch(e=>{const box=$('termLogBox');if(box)box.innerText='Lỗi: '+e.message;});};
+fetchLogs();$('termRefreshBtn').onclick=fetchLogs;$('termClearBtn').onclick=()=>{if(confirm('Xóa buffer log?'))api('','/api/terminal_log/clear',{method:'POST'}).then(()=>fetchLogs());};
+const chk=$('termAutoRefreshChk');pollTimer=setInterval(()=>{if(chk&&chk.checked)fetchLogs();},3000);}
+function renderHardware(){$('body').innerHTML='<p class=msg>Đang tải...</p>';
+const fetchHw=()=>{api('','/api/hardware').then(r=>{if(r.status===401||r.status===403){tokens={};sessionStorage.removeItem('portal_tokens');tcClr();checkLogin();return null;}return r.json();}).then(d=>{if(!d||!d.ok){$('body').innerHTML='<p class="msg error">Lỗi tải HW</p>';return;}
+const fb=b=>{b=+b||0;if(b<=0)return'0 B';const k=1024,s=['B','KB','MB','GB'],i=Math.min(s.length-1,Math.floor(Math.log(b)/Math.log(k)));return(+((b/Math.pow(k,i)).toFixed(2)))+' '+s[i];};
+const fu=sec=>{const d=Math.floor(sec/86400),h=Math.floor((sec%86400)/3600),m=Math.floor((sec%3600)/60),s=sec%60;return(d?d+'d ':'')+h+'h '+m+'m '+s+'s';};
+const bar=(label,used,total)=>{total=+total||0;used=Math.max(0,+used||0);const pct=total>0?Math.min(100,Math.round(used*100/total)):0;const cls=pct>=85?'bad':(pct>=70?'warn':'');
+return '<div class=bar-row><div class=bar-meta><span>'+label+'</span><span><b>'+fb(used)+'</b> / '+fb(total)+' ('+pct+'% dùng)</span></div><div class=bar><i class="'+cls+'" style=width:'+pct+'%></i></div></div>';};
+const intUsed=(d.internal_total||0)-(d.internal_free||0);
+const spUsed=(d.spiram_total||0)-(d.spiram_free||0);
+const heapUsed=(d.heap_total||0)-(d.free_heap||0);
+const partUsedHint=d.partition_size||0;
+$('body').innerHTML='<h3 style=font-size:14px;margin-bottom:8px>Tổng thể bộ nhớ</h3>'
++bar('Heap tổng',heapUsed,d.heap_total)
++bar('Internal RAM',intUsed,d.internal_total)
++(d.spiram_total>0?bar('PSRAM',spUsed,d.spiram_total):'<p class=hint>PSRAM: không có / không dùng</p>')
++'<p class=hint style=margin-bottom:12px>Còn trống: Internal '+fb(d.internal_free)+' (min '+fb(d.internal_min)+')'
++(d.spiram_total>0?' · PSRAM '+fb(d.spiram_free)+' (min '+fb(d.spiram_min)+')':'')
++' · DMA block lớn nhất '+fb(d.dma_largest||0)+'</p>'
++'<table class=tbl style=margin-bottom:16px><tr><th>Thông số</th><th>Giá trị</th></tr>'
++'<tr><td>Chip</td><td>'+esc(d.chip_model)+' rev '+d.revision+'</td></tr><tr><td>Cores</td><td>'+d.cores+'</td></tr><tr><td>IDF</td><td>'+esc(d.idf_ver)+'</td></tr>'
++'<tr><td>Uptime</td><td>'+fu(d.uptime_sec)+'</td></tr><tr><td>Reset</td><td><span class="sb warn">'+esc(d.reset_reason)+'</span></td></tr></table>'
++'<h3 style=font-size:14px;margin-bottom:8px>Flash & phân vùng app</h3>'
++'<table class=tbl><tr><th>Flash</th><th>Chi tiết</th></tr><tr><td>Size</td><td>'+fb(d.flash_size)+'</td></tr>'
++'<tr><td>Partition</td><td><span class="sb ok">'+esc(d.partition_label)+'</span> · '+fb(partUsedHint)+'</td></tr>'
++'<tr><td>Address</td><td>0x'+d.partition_address.toString(16).toUpperCase()+'</td></tr></table>'
++'<button class=btn id=hwRefreshBtn>Làm mới</button>';
+$('hwRefreshBtn').onclick=fetchHw;}).catch(e=>{$('body').innerHTML='<p class="msg error">'+esc(e.message)+'</p><button class=btn onclick="renderHardware()">Thử lại</button>';});};
+fetchHw();pollTimer=setInterval(fetchHw,5000);}
+function go(sec){if(pollTimer){clearInterval(pollTimer);pollTimer=null;}cur=sec;$('title').innerText=T[sec]||sec;document.querySelectorAll('.nav a').forEach(a=>a.classList.toggle('on',a.dataset.sec===sec));$('sideMenu').classList.remove('show');$('mOv').classList.remove('show');
+if(sec==='home'){renderHome();return;}if(sec==='lcd'){renderLcd();return;}if(sec==='terminal'){renderTerminal();return;}if(sec==='hardware'){renderHardware();return;}
+need(sec,()=>{if(sec==='wifi')renderWifi();else if(sec==='azure')renderAzure();else if(sec==='log')renderLog();else if(sec==='cards')renderCards(false);else if(sec==='register')renderCards(true);else if(sec==='pin')renderPin();});}
+function checkLogin(){const li=!!tokens.admin;$('appLayout').style.display=li?'flex':'none';$('loginPage').style.display=li?'none':'flex';$('mHdr').style.display=li?'':'none';if(!li){$('mOv').classList.remove('show');$('sideMenu').classList.remove('show');}if(li)go(cur);}
+$('mBtn').onclick=()=>{$('sideMenu').classList.toggle('show');$('mOv').classList.toggle('show');};
+$('mOv').onclick=()=>{$('sideMenu').classList.remove('show');$('mOv').classList.remove('show');};
+document.querySelectorAll('.nav a').forEach(a=>a.onclick=e=>{e.preventDefault();go(a.dataset.sec);});
+$('logoutBtn').onclick=e=>{e.preventDefault();if(confirm('Đăng xuất?')){tokens={};sessionStorage.removeItem('portal_tokens');tcClr();checkLogin();}};
+$('lbtn').onclick=()=>{const u=$('luser').value,p=$('lpass').value,btn=$('lbtn');btn.disabled=true;btn.innerHTML='<span class=spin></span>';
+fetch('/api/admin_login',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'user='+encodeURIComponent(u)+'&pass='+encodeURIComponent(p)})
+.then(r=>r.text().then(t=>{let d;try{d=JSON.parse(t);}catch(e){throw new Error(t||('HTTP '+r.status));}return d;}))
+.then(d=>{btn.disabled=false;btn.innerText='Đăng nhập';if(d.ok){tokens.admin=d.token;sessionStorage.setItem('portal_tokens',JSON.stringify(tokens));$('lmsg').innerText='';$('lmsg').className='msg';checkLogin();}else{$('lmsg').innerText=d.error||'Lỗi';$('lmsg').className='msg error';}})
+.catch(e=>{btn.disabled=false;btn.innerText='Đăng nhập';$('lmsg').innerText=e.message||'Không kết nối';$('lmsg').className='msg error';});};
+function doLogin(){if(!$('lbtn').disabled)$('lbtn').click();}
+$('lpass').onkeydown=e=>{if(e.key==='Enter')doLogin();};$('luser').onkeydown=e=>{if(e.key==='Enter')doLogin();};
+checkLogin();
+</script></body></html>

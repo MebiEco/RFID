@@ -23,7 +23,7 @@ esp_err_t card_profile_delete(const char *uid_hex_nocolon);
 /** Xoa tat ca the (profiles + anh) */
 void card_profile_delete_all(void);
 
-#define CARD_PROFILE_LIST_MAX 20
+#define CARD_PROFILE_LIST_MAX 50
 /** So dong hien thi tren mot trang man hinh danh sach the (LCD). */
 #define CARD_PROFILE_PAGE_ROWS 4
 typedef struct {

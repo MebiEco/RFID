@@ -16,6 +16,12 @@
 #include "esp_task_wdt.h"
 
 static const char *TAG = "app_rfid";
+static volatile bool s_rfid_paused;
+
+void app_rfid_set_paused(bool paused)
+{
+    s_rfid_paused = paused;
+}
 
 /** UID hex liền (vd. 09F8D21E) — giống uid_to_hex_nocolon ở chế độ đầy đủ. */
 static void uid_to_hex_nocolon(const mfrc522_uid_t *uid, char *out, size_t out_len)
@@ -52,6 +58,12 @@ static void rfid_task(void *arg)
     for (;;) {
         if (wdt_ok) {
             esp_task_wdt_reset();
+        }
+        while (s_rfid_paused) {
+            if (wdt_ok) {
+                esp_task_wdt_reset();
+            }
+            vTaskDelay(pdMS_TO_TICKS(200));
         }
         if (!da_doc_duoc_the && !da_canh_bao_anten && esp_timer_get_time() > 10000000ULL) {
             da_canh_bao_anten = true;
@@ -136,6 +148,7 @@ void app_rfid_start(void)
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/idf_additions.h"
 #if BOARD_ENABLE_WIFI
 #include "esp_wifi.h"
 #endif
@@ -158,6 +171,15 @@ void app_rfid_start(void)
 #include "wifi_portal.h"
 
 static const char *TAG = "app_rfid";
+static volatile bool s_rfid_paused;
+
+void app_rfid_set_paused(bool paused)
+{
+    s_rfid_paused = paused;
+    if (paused) {
+        ESP_LOGI(TAG, "OTA: tam dung quet RFID");
+    }
+}
 
 typedef enum {
     RFID_TIME_GATE_OK = 0,
@@ -454,6 +476,12 @@ static void rfid_task(void *arg)
         if (wdt_ok) {
             esp_task_wdt_reset();
         }
+        while (s_rfid_paused) {
+            if (wdt_ok) {
+                esp_task_wdt_reset();
+            }
+            vTaskDelay(pdMS_TO_TICKS(200));
+        }
         uint64_t now_us = esp_timer_get_time();
 
         // if ((now_us - s_last_stack_log_us) >= 15000000ULL) {
@@ -726,10 +754,14 @@ static void rfid_task(void *arg)
 
 void app_rfid_start(void)
 {
-    /* Tăng stack lên 16KB để hệ thống đẩy sang PSRAM, giải phóng RAM nội bộ. */
-    BaseType_t res = xTaskCreate(rfid_task, "rfid", 16384, NULL, 10, NULL);
+    /* Stack 24KB tren SPIRAM — PNG/UI/swipe path. */
+    BaseType_t res = xTaskCreateWithCaps(rfid_task, "rfid", 24576, NULL, 10, NULL,
+                                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (res != pdPASS) {
-        ESP_LOGE(TAG, "L\u1ed7i t\u1ea1o task rfid_task");
+        res = xTaskCreate(rfid_task, "rfid", 24576, NULL, 10, NULL);
+    }
+    if (res != pdPASS) {
+        ESP_LOGE(TAG, "Loi tao task rfid_task");
     }
 }
 

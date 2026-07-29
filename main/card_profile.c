@@ -4,12 +4,14 @@
 #include <dirent.h>
 #include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <sys/stat.h>
 
 #include "board_pins.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "scan_log.h"
 #include "sd_card.h"
 #include "esp_timer.h"
@@ -317,6 +319,13 @@ static bool wall_time_valid(time_t utc)
 
 static void card_profile_cleanup_unregistered(void)
 {
+    static int64_t s_last_cleanup_sec = 0;
+    int64_t now_sec = esp_timer_get_time() / 1000000;
+    if (s_last_cleanup_sec > 0 && (now_sec - s_last_cleanup_sec < 600)) {
+        return;
+    }
+    s_last_cleanup_sec = now_sec;
+
     if (!sd_card_is_mounted()) {
         return;
     }
@@ -664,7 +673,11 @@ static int scan_profile_txt(int mode, int skip_first, CardProfileEntry_t *entrie
         return 0;
     }
 
-    sorted_entry_t *temp = malloc(file_count * sizeof(sorted_entry_t));
+    sorted_entry_t *temp = heap_caps_malloc(file_count * sizeof(sorted_entry_t),
+                                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!temp) {
+        temp = malloc(file_count * sizeof(sorted_entry_t));
+    }
     if (!temp) {
         ESP_LOGE(TAG, "Out of memory allocating %d sorted entries", file_count);
         closedir(dir);

@@ -40,3 +40,8 @@ time_t wifi_portal_get_utc_sec(void);
 void wifi_portal_get_brand_text(char *out, size_t sz);
 esp_err_t wifi_portal_set_brand_text(const char *txt);
 
+/** OTA: tat web server SoftAP de giai phong socket/RAM (giu WiFi STA). */
+void wifi_portal_httpd_stop(void);
+/** OTA fail: bat lai web server. */
+esp_err_t wifi_portal_httpd_start(void);
+

@@ -1,4 +1,6 @@
 #include "app_azure.h"
+#include "command_status.h"
+
 
 #include <stdio.h>
 #include <stdint.h>
@@ -8,6 +10,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/idf_additions.h"
 #include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_wifi.h"
@@ -104,6 +107,7 @@ static esp_mqtt_client_handle_t s_mqtt_client    = NULL;
 static bool        s_azure_connected  = false;
 static volatile bool s_flush_requested = false; /* flag: azure_task se flush queue khi co mang */
 static volatile bool s_azure_config_reload = false;
+static volatile bool s_azure_ota_suspend = false; /* OTA: khong reconnect MQTT */
 
 /** Tham so doi chieu 605 (backend LastIdx / Missing). */
 typedef struct {
@@ -353,7 +357,7 @@ static void azure_send_sync_dm_response(esp_mqtt_client_handle_t client, const c
                  "\"PendingFlushed\":%d,\"Message\":\"Flush trigger accepted\"}}",
                  (long long)time(NULL), pend_flushed);
     }
-    azure_dm_response(client, rid, 200, res_payload);
+    azure_dm_response(client, rid, COMMAND_STATUS_OK, res_payload);
 }
 
 static int64_t azure_now_ms(void)
@@ -793,29 +797,116 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                             method_name[len] = '\0';
                         }
                     }
-                    
+
                     bool is_flush_req = (strcmp(method_name, "FlushQueue") == 0);
                     bool is_ota_req = (strcmp(method_name, "TriggerOTA") == 0);
-                    int method_code = 0;
-                    
+                    bool is_dev_cmd = (strcmp(method_name, "DeviceCommand") == 0);
+                    bool is_audio_cmd = (strcmp(method_name, "PlayAlarm") == 0 ||
+                                         strcmp(method_name, "TriggerSiren") == 0 ||
+                                         strcmp(method_name, "PlayAudio") == 0);
+
+                    // 1. Sai tên method (404 - không support)
+                    if (!is_flush_req && !is_ota_req && !is_dev_cmd && !is_audio_cmd) {
+                        if (rid[0] != '\0') {
+                            char res_payload[192];
+                            snprintf(res_payload, sizeof(res_payload),
+                                     "{\"status\":404,\"payload\":{\"Message\":\"Method name not supported: %s\"}}",
+                                     method_name);
+                            azure_dm_response(event->client, rid, COMMAND_STATUS_NOT_FOUND, res_payload);
+                        }
+                        free(topic_str);
+                        break;
+                    }
+
+                    // 2. Parse JSON & Kiem tra JSON loi (400 - Invalid JSON)
                     cJSON *root = NULL;
+                    bool invalid_json = false;
                     if (event->data_len > 0) {
                         char *json_str = malloc(event->data_len + 1);
                         if (json_str) {
                             memcpy(json_str, event->data, event->data_len);
                             json_str[event->data_len] = '\0';
-                            root = cJSON_Parse(json_str);
+                            
+                            char *trim_ptr = json_str;
+                            while (*trim_ptr && isspace((unsigned char)*trim_ptr)) trim_ptr++;
+                            if (strlen(trim_ptr) > 0) {
+                                root = cJSON_Parse(json_str);
+                                if (!root) {
+                                    invalid_json = true;
+                                }
+                            }
                             free(json_str);
+                        } else {
+                            invalid_json = true;
                         }
                     }
-                    
-                    if (root) {
+
+                    if (invalid_json) {
+                        if (rid[0] != '\0') {
+                            char res_payload[128];
+                            snprintf(res_payload, sizeof(res_payload),
+                                     "{\"status\":400,\"payload\":{\"Message\":\"Invalid JSON\"}}");
+                            azure_dm_response(event->client, rid, COMMAND_STATUS_BAD_REQUEST, res_payload);
+                        }
+                        free(topic_str);
+                        break;
+                    }
+
+                    int method_code = 0;
+
+                    // 3. Kiem tra Thieu Code / Data cho DeviceCommand (400)
+                    if (is_dev_cmd) {
+                        if (!root) {
+                            if (rid[0] != '\0') {
+                                char res_payload[128];
+                                snprintf(res_payload, sizeof(res_payload),
+                                         "{\"status\":400,\"payload\":{\"Message\":\"Missing Code or Data\"}}");
+                                azure_dm_response(event->client, rid, COMMAND_STATUS_BAD_REQUEST, res_payload);
+                            }
+                            free(topic_str);
+                            break;
+                        }
                         cJSON *code = cJSON_GetObjectItem(root, "Code");
-                        if (code && cJSON_IsNumber(code)) {
-                            method_code = code->valueint;
+                        cJSON *data = cJSON_GetObjectItem(root, "Data");
+                        if (!code || !cJSON_IsNumber(code) || !data || !cJSON_IsObject(data)) {
+                            if (rid[0] != '\0') {
+                                char res_payload[128];
+                                snprintf(res_payload, sizeof(res_payload),
+                                         "{\"status\":400,\"payload\":{\"Message\":\"Missing Code or Data\"}}");
+                                azure_dm_response(event->client, rid, COMMAND_STATUS_BAD_REQUEST, res_payload);
+                            }
+                            cJSON_Delete(root);
+                            free(topic_str);
+                            break;
+                        }
+                        method_code = code->valueint;
+
+                        // 4. Kiem tra Code la (400 - Unknown Code: ...)
+                        bool known_code = (method_code == 600 || method_code == 603 || method_code == 604 ||
+                                           method_code == 605 || method_code == 606 || method_code == 611 ||
+                                           method_code == 612 || method_code == 607 || method_code == 608 ||
+                                           method_code == 610);
+                        if (!known_code) {
+                            if (rid[0] != '\0') {
+                                char res_payload[192];
+                                snprintf(res_payload, sizeof(res_payload),
+                                         "{\"status\":400,\"payload\":{\"Message\":\"Unknown Code: %d\"}}",
+                                         method_code);
+                                azure_dm_response(event->client, rid, COMMAND_STATUS_BAD_REQUEST, res_payload);
+                            }
+                            cJSON_Delete(root);
+                            free(topic_str);
+                            break;
+                        }
+                    } else {
+                        if (root) {
+                            cJSON *code = cJSON_GetObjectItem(root, "Code");
+                            if (code && cJSON_IsNumber(code)) {
+                                method_code = code->valueint;
+                            }
                         }
                     }
-                    
+
                     if (method_code == 605) {
                         is_flush_req = true;
                     } else if (method_code == 606) {
@@ -849,7 +940,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                                          "{\"status\":200,\"payload\":{\"Code\":605,\"TimeStamp\":%lld,"
                                          "\"Message\":\"Flush trigger accepted\"}}",
                                          (long long)time(NULL));
-                                azure_dm_response(event->client, rid, 200, res_payload);
+                                azure_dm_response(event->client, rid, COMMAND_STATUS_OK, res_payload);
                             }
                         }
                     } else if (is_ota_req) {
@@ -870,7 +961,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                                 snprintf(res_payload, sizeof(res_payload),
                                          "{\"status\":200,\"payload\":{\"Code\":606,\"TimeStamp\":%lld,\"Message\":\"OTA trigger accepted, starting download\"}}",
                                          (long long)time(NULL));
-                                azure_dm_response(event->client, rid, 200, res_payload);
+                                azure_dm_response(event->client, rid, COMMAND_STATUS_OK, res_payload);
                             }
                             app_ota_start(ota_url);
                         } else {
@@ -879,7 +970,57 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                                 char res_payload[192];
                                 snprintf(res_payload, sizeof(res_payload),
                                          "{\"status\":400,\"payload\":{\"Message\":\"Missing Url parameter\"}}");
-                                azure_dm_response(event->client, rid, 400, res_payload);
+                                azure_dm_response(event->client, rid, COMMAND_STATUS_BAD_REQUEST, res_payload);
+                            }
+                        }
+                    } else if (is_audio_cmd || method_code == 607 || method_code == 608 || method_code == 610) {
+                        // 5. Queue full (429 - Alarm/Siren queue full)
+                        if (app_audio_is_queue_full()) {
+                            if (rid[0] != '\0') {
+                                char res_payload[192];
+                                snprintf(res_payload, sizeof(res_payload),
+                                         "{\"status\":429,\"payload\":{\"Message\":\"Alarm/Siren queue full\"}}");
+                                azure_dm_response(event->client, rid, COMMAND_STATUS_TOO_MANY_REQUEST, res_payload);
+                            }
+                        } else {
+                            char play_path[128];
+                            snprintf(play_path, sizeof(play_path), "%s", BOARD_SD_AUDIO_4_WAV); // default
+                            if (root) {
+                                cJSON *data = cJSON_GetObjectItem(root, "Data");
+                                if (data && cJSON_IsObject(data)) {
+                                    cJSON *path_j = cJSON_GetObjectItem(data, "Path");
+                                    if (path_j && cJSON_IsString(path_j)) {
+                                        strncpy(play_path, path_j->valuestring, sizeof(play_path) - 1);
+                                    } else {
+                                        cJSON *url_j = cJSON_GetObjectItem(data, "Url");
+                                        if (url_j && cJSON_IsString(url_j)) {
+                                            strncpy(play_path, url_j->valuestring, sizeof(play_path) - 1);
+                                        }
+                                    }
+                                }
+                            }
+                            esp_err_t err = app_audio_queue_wav(play_path);
+                            if (err == ESP_ERR_NO_MEM) {
+                                if (rid[0] != '\0') {
+                                    char res_payload[192];
+                                    snprintf(res_payload, sizeof(res_payload),
+                                             "{\"status\":429,\"payload\":{\"Message\":\"Alarm/Siren queue full\"}}");
+                                    azure_dm_response(event->client, rid, COMMAND_STATUS_TOO_MANY_REQUEST, res_payload);
+                                }
+                            } else if (err != ESP_OK) {
+                                if (rid[0] != '\0') {
+                                    char res_payload[192];
+                                    snprintf(res_payload, sizeof(res_payload),
+                                             "{\"status\":500,\"payload\":{\"Message\":\"Play audio failed\"}}");
+                                    azure_dm_response(event->client, rid, COMMAND_STATUS_DEVICE_ERROR, res_payload);
+                                }
+                            } else {
+                                if (rid[0] != '\0') {
+                                    char res_payload[192];
+                                    snprintf(res_payload, sizeof(res_payload),
+                                             "{\"status\":200,\"payload\":{\"Message\":\"Alarm/Siren play queued\"}}");
+                                    azure_dm_response(event->client, rid, COMMAND_STATUS_OK, res_payload);
+                                }
                             }
                         }
                     } else if (root && (method_code == 603 || method_code == 604)) {
@@ -908,7 +1049,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                                                      "{\"status\":200,\"payload\":{\"Code\":603,\"TimeStamp\":%lld,"
                                                      "\"Message\":\"Updated UID %s\"}}",
                                                      (long long)time(NULL), uid_str);
-                                            azure_dm_response(event->client, rid, 200, res_payload);
+                                            azure_dm_response(event->client, rid, COMMAND_STATUS_OK, res_payload);
                                         }
                                     } else {
                                         ESP_LOGE(TAG, "603: Luu profile loi UID=%s", uid_str);
@@ -916,7 +1057,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                                             char res_payload[256];
                                             snprintf(res_payload, sizeof(res_payload),
                                                      "{\"status\":500,\"payload\":{\"Message\":\"Save failed\"}}");
-                                            azure_dm_response(event->client, rid, 500, res_payload);
+                                            azure_dm_response(event->client, rid, COMMAND_STATUS_DEVICE_ERROR, res_payload);
                                         }
                                     }
                                 } else {
@@ -941,7 +1082,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                                                  "{\"status\":200,\"payload\":{\"Code\":604,\"TimeStamp\":%lld,"
                                                  "\"Message\":\"Deleted or absent UID %s\"}}",
                                                  (long long)time(NULL), uid_str);
-                                        azure_dm_response(event->client, rid, 200, res_payload);
+                                        azure_dm_response(event->client, rid, COMMAND_STATUS_OK, res_payload);
                                     }
                                 }
                             }
@@ -1001,7 +1142,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                         if (rid[0] != '\0') {
                             char res_payload[256];
                             snprintf(res_payload, sizeof(res_payload), "{\"status\":200,\"payload\":{\"Code\":600,\"Reset\":\"%s\",\"Message\":\"Reset initiated. Rebooting...\"}}", reset_type);
-                            azure_dm_response(event->client, rid, 200, res_payload);
+                            azure_dm_response(event->client, rid, COMMAND_STATUS_OK, res_payload);
                         }
                         vTaskDelay(pdMS_TO_TICKS(1000));
                         esp_restart();
@@ -1014,7 +1155,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                         if (rid[0] != '\0') {
                             char res_payload[128];
                             snprintf(res_payload, sizeof(res_payload), "{\"status\":200,\"payload\":{\"Message\":\"Switched to screen type %d. Rebooting...\"}}", v);
-                            azure_dm_response(event->client, rid, 200, res_payload);
+                            azure_dm_response(event->client, rid, COMMAND_STATUS_OK, res_payload);
                         }
                         vTaskDelay(pdMS_TO_TICKS(1000));
                         esp_restart();
@@ -1054,7 +1195,7 @@ static void azure_task(void *arg)
         if (!azure_load_cred(&cred)) {
             ESP_LOGW(TAG, "Chua thiet lap Azure thong qua WiFi Portal. Tam dung MQTT.");
             s_azure_task_handle = NULL;
-            vTaskDelete(NULL);
+            vTaskDeleteWithCaps(NULL);
             return;
         }
 
@@ -1062,6 +1203,13 @@ static void azure_task(void *arg)
         azure_wait_network_ready();
 
         while (!s_azure_config_reload) {
+            while (s_azure_ota_suspend && !s_azure_config_reload) {
+                azure_mqtt_disconnect();
+                vTaskDelay(pdMS_TO_TICKS(500));
+            }
+            if (s_azure_config_reload) {
+                break;
+            }
             while ((wifi_portal_get_conn_status() != WIFI_STATUS_CONNECTED ||
                     !wifi_portal_time_is_valid()) &&
                    !s_azure_config_reload) {
@@ -1119,7 +1267,8 @@ static void azure_task(void *arg)
                 },
                 .task = {
                     .priority = 6,
-                    .stack_size = 10240,
+                    /* MQTT task van Internal — giu vua phai; azure_task (SPIRAM) lo phan nang. */
+                    .stack_size = 12288,
                 },
             };
 
@@ -1133,11 +1282,11 @@ static void azure_task(void *arg)
             esp_mqtt_client_register_event(s_mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
             esp_mqtt_client_start(s_mqtt_client);
 
-            for (int i = 0; i < 720 * 12 && !s_azure_config_reload; i++) {
-                for (int t = 0; t < 10 && !s_azure_config_reload; t++) {
+            for (int i = 0; i < 720 * 12 && !s_azure_config_reload && !s_azure_ota_suspend; i++) {
+                for (int t = 0; t < 10 && !s_azure_config_reload && !s_azure_ota_suspend; t++) {
                     vTaskDelay(pdMS_TO_TICKS(500));
                 }
-                if (s_azure_config_reload) {
+                if (s_azure_config_reload || s_azure_ota_suspend) {
                     break;
                 }
                 if (s_flush_requested && s_azure_connected && s_mqtt_client) {
@@ -1217,6 +1366,19 @@ void app_azure_notify_config_changed(void)
     }
 }
 
+void app_azure_suspend_for_ota(void)
+{
+    ESP_LOGI(TAG, "OTA: ngat MQTT de giai phong TLS/RAM");
+    s_azure_ota_suspend = true;
+    azure_mqtt_disconnect();
+}
+
+void app_azure_resume_after_ota(void)
+{
+    ESP_LOGI(TAG, "OTA fail: cho phep MQTT ket noi lai");
+    s_azure_ota_suspend = false;
+}
+
 void app_azure_start(void)
 {
     if (!s_ntp_done_sem) {
@@ -1225,8 +1387,14 @@ void app_azure_start(void)
     if (s_azure_task_handle != NULL) {
         return;
     }
-    BaseType_t res = xTaskCreatePinnedToCore(azure_task, "azure_task", 20480, NULL, 5,
-                                             &s_azure_task_handle, 0);
+    BaseType_t res = xTaskCreatePinnedToCoreWithCaps(azure_task, "azure_task", 32768, NULL, 5,
+                                                     &s_azure_task_handle, 0,
+                                                     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (res != pdPASS) {
+        res = xTaskCreatePinnedToCoreWithCaps(azure_task, "azure_task", 32768, NULL, 5,
+                                              &s_azure_task_handle, 0,
+                                              MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
     if (res != pdPASS) {
         ESP_LOGE(TAG, "Không tạo được azure_task");
         s_azure_task_handle = NULL;

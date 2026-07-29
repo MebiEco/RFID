@@ -157,7 +157,8 @@
  * 10 MHz dễ CRC/MISO=FF trên dây dài hoặc khi WiFi phát cao — 4 MHz thường ổn hơn.
  */
 #ifndef BOARD_SD_SPI_MAX_FREQ_KHZ
-#define BOARD_SD_SPI_MAX_FREQ_KHZ 2000
+/* 10 MHz: preload WAV nhanh; truoc day 2 MHz de doc SD cham → I2S underrun. */
+#define BOARD_SD_SPI_MAX_FREQ_KHZ 10000
 #endif
 /** Chờ sau khi CS cao + bus init trước mount (ms); WiFi/MQTT bật → nguồn dao động: tăng nếu vẫn CRC. */
 #ifndef BOARD_SD_PRE_MOUNT_DELAY_MS
@@ -215,8 +216,8 @@
 #error "BOARD_LCD_PANEL_ID: chi ho tro 1 (GMT028) hoac 2 (legacy 2.8)"
 #endif
 #define BOARD_LCD_SPI_MODE 0
-/** 24 dòng/chunk: ít lần ghi SPI hơn → ít răng cưa khi flush LVGL trên 240px. */
-#define BOARD_LCD_SPI_CHUNK_LINES 24
+/** 40 dong/chunk: flush man muot hon (buffer DMA ~25KB/buf — Internal). */
+#define BOARD_LCD_SPI_CHUNK_LINES 40
 #define BOARD_LCD_POST_DISPON_DELAY_MS 80
 
 /**
@@ -393,7 +394,7 @@
 #endif
 /** Khi bật audio: ưu tiên thấp hơn màn/ảnh/RFID (FreeRTOS, số càng lớn càng ưu). Mặc định 3. */
 #ifndef BOARD_AUDIO_TASK_PRIO
-#define BOARD_AUDIO_TASK_PRIO 7
+#define BOARD_AUDIO_TASK_PRIO 12
 #endif
 /**
  * Số ms nghỉ trước khi xếp hàng 2/3.wav sau khi vẽ ảnh (decode + SPI) — 0 = không trễ.

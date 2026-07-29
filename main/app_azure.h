@@ -49,6 +49,11 @@ void app_azure_send_card_event(const char *uid, const char *name, const char *id
  */
 int app_azure_is_connected(void);
 
+/** OTA: ngat MQTT TLS de giai phong RAM (giu WiFi STA). */
+void app_azure_suspend_for_ota(void);
+/** OTA fail: cho phep azure_task ket noi lai. */
+void app_azure_resume_after_ota(void);
+
 /**
  * @brief Gửi lại dữ liệu (từ file CSV cục bộ) lên Azure trong một khoảng Index
  */

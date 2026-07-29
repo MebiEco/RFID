@@ -18,6 +18,7 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/idf_additions.h"
 
 #if BOARD_ENABLE_WIFI
 #include "esp_wifi.h"
@@ -426,7 +427,7 @@ void lv_port_show_change_password(const char *old_pin, const char *new_pin, int 
 
 /* ------------- WiFi ------------- */
 /** Không gọi esp_wifi_scan_start trực tiếp trong LVGL/event: scan đồng bộ chặn lvgl_task → TWDT reset. */
-#define WIFI_SCAN_WORKER_STACK_BYTES 16384
+#define WIFI_SCAN_WORKER_STACK_BYTES 20480
 
 static volatile bool s_wifi_scan_busy;
 /** Worker set, lvgl_task xử lý — tránh lv_async_call / lv_mem từ thread khác (heap LVGL không mutex). */
@@ -549,8 +550,11 @@ void lv_port_wifi_request_scan(void)
         return;
     }
     s_wifi_scan_busy = true;
-    BaseType_t ok =
-        xTaskCreate(wifi_scan_worker_task, "wifi_scan", WIFI_SCAN_WORKER_STACK_BYTES, NULL, 5, NULL);
+    BaseType_t ok = xTaskCreateWithCaps(wifi_scan_worker_task, "wifi_scan", WIFI_SCAN_WORKER_STACK_BYTES,
+                                        NULL, 5, NULL, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (ok != pdPASS) {
+        ok = xTaskCreate(wifi_scan_worker_task, "wifi_scan", WIFI_SCAN_WORKER_STACK_BYTES, NULL, 5, NULL);
+    }
     if (ok != pdPASS) {
         s_wifi_scan_busy = false;
         ESP_LOGW(TAG, "xTaskCreate(wifi_scan) failed");
