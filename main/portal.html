@@ -223,7 +223,8 @@ $('body').innerHTML='<div class=grid>'
 +'<div class=sc><h3>Azure IoT</h3><div class=v>'+(d.azure_connected?'Đang hoạt động':'Mất kết nối')+'</div><span class="sb '+(d.azure_connected?'ok':'bad')+'">'+(d.azure_connected?'Đã kết nối':'Chưa kết nối')+'</span></div>'
 +'<div class=sc><h3>Thẻ SD</h3><div class=v>'+(d.sd?'Đã gắn SD':'Chưa gắn SD')+'</div><span class="sb '+(d.sd?'ok':'bad')+'">'+(d.sd?'OK':'Trống')+'</span></div>'
 +'<div class=sc><h3>Giờ hệ thống</h3><div class=v>'+(d.time_ok?(d.time||'Đã đồng bộ'):'Chờ WiFi + NTP')+'</div><span class="sb '+(d.time_ok?'ok':'bad')+'">'+(d.time_ok?'Đồng bộ':'Chưa có giờ')+'</span></div>'
-+'</div><p class=hint style=margin:8px 0 0>FW '+(esc(d.fw_ver||'?'))+' · '+(esc(d.fw_date||'?'))+' · '+(esc(d.fw_part||'?'))+'</p>'
++'<div class=sc><h3>Phiên bản FW</h3><div class=v>'+(esc(d.fw_ver||'?'))+'</div><span class="sb ok">'+(esc(d.fw_date||'?'))+'</span></div>'
++'</div>'
 +renderAttBlock(att);
 bindAttRefresh();
 }

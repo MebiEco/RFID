@@ -26,7 +26,7 @@ static const char *TAG = "app_ota";
 
 static volatile bool s_ota_busy;
 
-static void ota_mark_skip_welcome_on_reboot(void)
+static void ota_mark_skip_welcome_on_reboot(void) //
 {
     nvs_handle_t h;
     if (nvs_open(OTA_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {

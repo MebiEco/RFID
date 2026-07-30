@@ -31,6 +31,7 @@
 #include "app_ota.h"
 #include "wifi_portal.h"
 #include "scan_log.h"
+#include "esp_app_desc.h"
 
 /** CA gốc Azure IoT Hub (Baltimore + DigiCert G2 + MS RSA 2017) — nhúng từ azure_iot_ca.pem. */
 extern const uint8_t azure_iot_ca_pem_start[] asm("_binary_azure_iot_ca_pem_start");
@@ -40,6 +41,15 @@ extern const uint8_t azure_iot_ca_pem_end[] asm("_binary_azure_iot_ca_pem_end");
 extern void lcd_ui_invalidate_card_cache(void);
 
 static const char *TAG = "azure_iot";
+
+static const char *azure_get_fw_version(void)
+{
+    const esp_app_desc_t *app = esp_app_get_description();
+    if (app && app->version[0]) {
+        return app->version;
+    }
+    return "0.0.0";
+}
 
 /** 2020-01-01 UTC — duoi nguong nay = chua NTP / epoch sai, khong gui backend. */
 #define AZURE_TS_MIN_UTC 1577836800LL
@@ -181,14 +191,15 @@ static int azure_publish_event_entry(esp_mqtt_client_handle_t client, const char
         ESP_LOGW(TAG, "Replay bo qua index=%ld — chua co timestamp hop le", (long)ent->index);
         return 0;
     }
-    char topic[128];
-    snprintf(topic, sizeof(topic), "devices/%s/messages/events/", dev_id);
+    char topic[192];
+    snprintf(topic, sizeof(topic), "devices/%s/messages/events/$.ct=application%%2Fjson&$.ce=utf-8", dev_id);
 
-    static char payload[384];
+    static char payload[448];
     snprintf(payload, sizeof(payload),
              "{\"Code\":%d,\"Index\":%ld,\"TimeStamp\":%lld,\"Data\":{\"DeviceName\":\"RFID_Scanner\","
-             "\"UID\":\"%s\",\"Name\":\"%s\",\"ID\":\"%s\"}}",
-             ent->event_code, (long)ent->index, (long long)ts, ent->uid, ent->name, ent->id);
+             "\"UID\":\"%s\",\"Name\":\"%s\",\"ID\":\"%s\",\"Version\":\"%s\"}}",
+             ent->event_code, (long)ent->index, (long long)ts, ent->uid, ent->name, ent->id,
+             azure_get_fw_version());
 
     int pub_ret = esp_mqtt_client_publish(client, topic, payload, 0, 1, 0);
     if (pub_ret < 0) {
@@ -588,8 +599,8 @@ static int flush_pending_queue(esp_mqtt_client_handle_t client, const char *dev_
         return 0;
     }
 
-    char topic[128];
-    snprintf(topic, sizeof(topic), "devices/%s/messages/events/", dev_id);
+    char topic[192];
+    snprintf(topic, sizeof(topic), "devices/%s/messages/events/$.ct=application%%2Fjson&$.ce=utf-8", dev_id);
 
     int total_flushed = 0;
     bool had_error = false;
@@ -630,12 +641,12 @@ static int flush_pending_queue(esp_mqtt_client_handle_t client, const char *dev_
         rec.timestamp_utc = (int64_t)ts;
 
         /* Dùng static để giảm áp lực lên stack của task */
-        static char payload[384];
+        static char payload[448];
         snprintf(payload, sizeof(payload),
                  "{\"Code\":%d,\"Index\":%ld,\"TimeStamp\":%lld,\"Data\":{\"DeviceName\":\"RFID_Scanner\","
-                 "\"UID\":\"%s\",\"Name\":\"%s\",\"ID\":\"%s\"}}",
+                 "\"UID\":\"%s\",\"Name\":\"%s\",\"ID\":\"%s\",\"Version\":\"%s\"}}",
                  (int)rec.event_code, (long)rec.index, (long long)rec.timestamp_utc,
-                 rec.uid, rec.name, rec.id);
+                 rec.uid, rec.name, rec.id, azure_get_fw_version());
 
         int pub_ret = esp_mqtt_client_publish(client, topic, payload, 0, 1, 0);
         if (pub_ret < 0) {
@@ -801,12 +812,9 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                     bool is_flush_req = (strcmp(method_name, "FlushQueue") == 0);
                     bool is_ota_req = (strcmp(method_name, "TriggerOTA") == 0);
                     bool is_dev_cmd = (strcmp(method_name, "DeviceCommand") == 0);
-                    bool is_audio_cmd = (strcmp(method_name, "PlayAlarm") == 0 ||
-                                         strcmp(method_name, "TriggerSiren") == 0 ||
-                                         strcmp(method_name, "PlayAudio") == 0);
 
                     // 1. Sai tên method (404 - không support)
-                    if (!is_flush_req && !is_ota_req && !is_dev_cmd && !is_audio_cmd) {
+                    if (!is_flush_req && !is_ota_req && !is_dev_cmd) {
                         if (rid[0] != '\0') {
                             char res_payload[192];
                             snprintf(res_payload, sizeof(res_payload),
@@ -884,8 +892,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                         // 4. Kiem tra Code la (400 - Unknown Code: ...)
                         bool known_code = (method_code == 600 || method_code == 603 || method_code == 604 ||
                                            method_code == 605 || method_code == 606 || method_code == 611 ||
-                                           method_code == 612 || method_code == 607 || method_code == 608 ||
-                                           method_code == 610);
+                                           method_code == 612);
                         if (!known_code) {
                             if (rid[0] != '\0') {
                                 char res_payload[192];
@@ -971,56 +978,6 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                                 snprintf(res_payload, sizeof(res_payload),
                                          "{\"status\":400,\"payload\":{\"Message\":\"Missing Url parameter\"}}");
                                 azure_dm_response(event->client, rid, COMMAND_STATUS_BAD_REQUEST, res_payload);
-                            }
-                        }
-                    } else if (is_audio_cmd || method_code == 607 || method_code == 608 || method_code == 610) {
-                        // 5. Queue full (429 - Alarm/Siren queue full)
-                        if (app_audio_is_queue_full()) {
-                            if (rid[0] != '\0') {
-                                char res_payload[192];
-                                snprintf(res_payload, sizeof(res_payload),
-                                         "{\"status\":429,\"payload\":{\"Message\":\"Alarm/Siren queue full\"}}");
-                                azure_dm_response(event->client, rid, COMMAND_STATUS_TOO_MANY_REQUEST, res_payload);
-                            }
-                        } else {
-                            char play_path[128];
-                            snprintf(play_path, sizeof(play_path), "%s", BOARD_SD_AUDIO_4_WAV); // default
-                            if (root) {
-                                cJSON *data = cJSON_GetObjectItem(root, "Data");
-                                if (data && cJSON_IsObject(data)) {
-                                    cJSON *path_j = cJSON_GetObjectItem(data, "Path");
-                                    if (path_j && cJSON_IsString(path_j)) {
-                                        strncpy(play_path, path_j->valuestring, sizeof(play_path) - 1);
-                                    } else {
-                                        cJSON *url_j = cJSON_GetObjectItem(data, "Url");
-                                        if (url_j && cJSON_IsString(url_j)) {
-                                            strncpy(play_path, url_j->valuestring, sizeof(play_path) - 1);
-                                        }
-                                    }
-                                }
-                            }
-                            esp_err_t err = app_audio_queue_wav(play_path);
-                            if (err == ESP_ERR_NO_MEM) {
-                                if (rid[0] != '\0') {
-                                    char res_payload[192];
-                                    snprintf(res_payload, sizeof(res_payload),
-                                             "{\"status\":429,\"payload\":{\"Message\":\"Alarm/Siren queue full\"}}");
-                                    azure_dm_response(event->client, rid, COMMAND_STATUS_TOO_MANY_REQUEST, res_payload);
-                                }
-                            } else if (err != ESP_OK) {
-                                if (rid[0] != '\0') {
-                                    char res_payload[192];
-                                    snprintf(res_payload, sizeof(res_payload),
-                                             "{\"status\":500,\"payload\":{\"Message\":\"Play audio failed\"}}");
-                                    azure_dm_response(event->client, rid, COMMAND_STATUS_DEVICE_ERROR, res_payload);
-                                }
-                            } else {
-                                if (rid[0] != '\0') {
-                                    char res_payload[192];
-                                    snprintf(res_payload, sizeof(res_payload),
-                                             "{\"status\":200,\"payload\":{\"Message\":\"Alarm/Siren play queued\"}}");
-                                    azure_dm_response(event->client, rid, COMMAND_STATUS_OK, res_payload);
-                                }
                             }
                         }
                     } else if (root && (method_code == 603 || method_code == 604)) {
@@ -1435,13 +1392,14 @@ void app_azure_send_telemetry(const char *uid, const char *name, const char *id,
         return;
     }
 
-    char topic[128];
-    snprintf(topic, sizeof(topic), "devices/%s/messages/events/", cred.azure_dev);
+    char topic[192];
+    snprintf(topic, sizeof(topic), "devices/%s/messages/events/$.ct=application%%2Fjson&$.ce=utf-8", cred.azure_dev);
 
-    char payload[320];
+    char payload[384];
     snprintf(payload, sizeof(payload),
-             "{\"Code\":%d,\"Index\":%ld,\"TimeStamp\":%lld,\"Data\":{\"DeviceName\":\"RFID_Scanner\",\"UID\":\"%s\",\"Name\":\"%s\",\"ID\":\"%s\"}}",
-             code_val, (long)msg_idx, (long long)now, uid, name ? name : "", id ? id : "");
+             "{\"Code\":%d,\"Index\":%ld,\"TimeStamp\":%lld,\"Data\":{\"DeviceName\":\"RFID_Scanner\",\"UID\":\"%s\",\"Name\":\"%s\",\"ID\":\"%s\",\"Version\":\"%s\"}}",
+             code_val, (long)msg_idx, (long long)now, uid, name ? name : "", id ? id : "",
+             azure_get_fw_version());
 
     int pub_id = esp_mqtt_client_publish(s_mqtt_client, topic, payload, 0, 1, 0);
     ESP_LOGI(TAG, "Da day telemetry len Azure (msg_id=%d, index=%ld): %s", pub_id, (long)msg_idx, payload);
@@ -1481,13 +1439,14 @@ void app_azure_send_card_event(const char *uid, const char *name, const char *id
         return;
     }
 
-    char topic[128];
-    snprintf(topic, sizeof(topic), "devices/%s/messages/events/", cred.azure_dev);
+    char topic[192];
+    snprintf(topic, sizeof(topic), "devices/%s/messages/events/$.ct=application%%2Fjson&$.ce=utf-8", cred.azure_dev);
 
-    char payload[320];
+    char payload[384];
     snprintf(payload, sizeof(payload),
-             "{\"Code\":%d,\"Index\":%ld,\"TimeStamp\":%lld,\"Data\":{\"DeviceName\":\"RFID_Scanner\",\"UID\":\"%s\",\"Name\":\"%s\",\"ID\":\"%s\"}}",
-             event_code, (long)msg_idx, (long long)now, uid, name ? name : "", id ? id : "");
+             "{\"Code\":%d,\"Index\":%ld,\"TimeStamp\":%lld,\"Data\":{\"DeviceName\":\"RFID_Scanner\",\"UID\":\"%s\",\"Name\":\"%s\",\"ID\":\"%s\",\"Version\":\"%s\"}}",
+             event_code, (long)msg_idx, (long long)now, uid, name ? name : "", id ? id : "",
+             azure_get_fw_version());
 
     int pub_id = esp_mqtt_client_publish(s_mqtt_client, topic, payload, 0, 1, 0);
     ESP_LOGI(TAG, "Da day event %d len Azure (msg_id=%d, index=%ld): %s", event_code, pub_id, (long)msg_idx, payload);

@@ -1,0 +1,711 @@
+================================================================================
+  AZURE IOT HUB — DIRECT METHODS & TELEMETRY (thiet bi RFID)
+  Dong bo theo firmware: main/app_azure.c, main/command_status.h, main/scan_log.h
+================================================================================
+
+--------------------------------------------------------------------------------
+A. KET NOI / TOPIC
+--------------------------------------------------------------------------------
+* Thiet bi dang ky MQTT Azure IoT Hub, lang nghe Direct Method:
+    $iothub/methods/POST/#
+
+* Topic nhan lenh (Hub -> Device), vi du:
+    $iothub/methods/POST/{MethodName}/?$rid={requestId}
+
+* Phan hoi Direct Method (Device -> Hub):
+    $iothub/methods/res/{httpStatus}/?$rid={requestId}
+  Body JSON luon co dang:
+    { "status": <httpStatus>, "payload": { ... } }
+  (httpStatus trong topic va trong body.status phai khop nhau.)
+
+* Telemetry / event (Device -> Hub), QoS 1:
+    devices/{deviceId}/messages/events/$.ct=application%2Fjson&$.ce=utf-8
+
+* Dieu kien de MQTT chay:
+  - WiFi STA connected
+  - NTP/SNTP da co thoi gian hop le (can de tao SAS token)
+  - Da cau hinh Azure tren WiFi Portal (HostName, DeviceId, SAS key)
+
+* Khi OTA dang chay: MQTT bi suspend (ngat TLS) de giai RAM; sau OTA fail moi reconnect.
+
+
+--------------------------------------------------------------------------------
+B. METHOD NAME (--method-name) — CHI 3 TEN HOP LE
+--------------------------------------------------------------------------------
+Khi goi Direct Method (Azure Portal / az CLI / backend), truong method-name
+BAT BUOC la dung 1 trong 3 chuoi sau (phan biet hoa thuong):
+
+  method-name = "FlushQueue"      // Code 605 — flush / dong bo log
+  method-name = "TriggerOTA"      // Code 606 — OTA firmware
+  method-name = "DeviceCommand"   // Code 600,603,604,605,606,611,612
+
+Ten khac (sai chinh ta, thua ky tu...) -> HTTP 404:
+  { "Message": "Method name not supported: <name>" }
+
+Bang map nhanh Code -> method-name khuyen nghi:
+
+  Code 605  ->  method-name: FlushQueue     (hoac DeviceCommand)
+  Code 606  ->  method-name: TriggerOTA     (hoac DeviceCommand)
+  Code 600  ->  method-name: DeviceCommand
+  Code 603  ->  method-name: DeviceCommand
+  Code 604  ->  method-name: DeviceCommand
+  Code 611  ->  method-name: DeviceCommand
+  Code 612  ->  method-name: DeviceCommand
+
+Cu phap az CLI:
+  az iot hub invoke-device-method \
+    --hub-name <HUB> \
+    --device-id <DEVICE> \
+    --method-name <FlushQueue|TriggerOTA|DeviceCommand> \
+    --method-payload "<JSON>"
+
+Luu y:
+  - FlushQueue / TriggerOTA: co the goi truc tiep bang ten method (khong bat buoc
+    qua DeviceCommand). Van nen gui JSON co "Code" + "Data".
+  - DeviceCommand: BAT BUOC co "Code" (number) va "Data" (object). Thieu -> 400.
+  - Payload toi da xu ly ~ < 1024 byte tren mot MQTT DATA event.
+
+
+--------------------------------------------------------------------------------
+C. MA TRANG THAI HTTP (command_status.h)
+--------------------------------------------------------------------------------
+  200  OK                 — lenh chap nhan / thanh cong
+  400  Bad Request        — JSON loi, thieu Code/Data, Unknown Code, thieu Url...
+  404  Not Found          — Method name khong duoc ho tro
+  429  Too Many Request   — (dinh nghia san; hien tai firmware chua dung)
+  500  Device Error       — loi thiet bi (vd: luu profile SD that bai)
+
+
+--------------------------------------------------------------------------------
+D. BANG MA SU KIEN (Code) — TONG QUAN
+--------------------------------------------------------------------------------
+  Cloud -> Device (Direct Method / DeviceCommand):
+    600  Reset thiet bi / xoa cau hinh (roi reboot)
+    603  Luu / dang ky / cap nhat profile the
+    604  Xoa profile the
+    605  Flush / dong bo log offline (cung FlushQueue)
+    606  Trigger OTA      (cung TriggerOTA)
+    611  Doi man hinh CU  (ILI9341 Legacy, panel id = 2) + reboot
+    612  Doi man hinh MOI (GMT028, panel id = 1) + reboot
+
+  Device -> Cloud (telemetry / event publish):
+    601  Quet the CHUA dang ky (unknown)
+    602  Quet the DA dang ky (registered)
+    603  Su kien sau khi luu/cap nhat the (admin SAVE)
+    604  Su kien sau khi xoa the (admin DEL)
+
+  Code DeviceCommand khong nam trong {600,603,604,605,606,611,612}
+  -> 400  { "Message": "Unknown Code: <n>" }
+
+
+--------------------------------------------------------------------------------
+E. BO DEM INDEX (NVS namespace "wifi_portal")
+--------------------------------------------------------------------------------
+Moi loai su kien co index rieng, tang dan, bat dau tu 1:
+
+  idx_swipe   — quet the da dang ky          (Code 602)
+  idx_unkn    — quet the la / chua dang ky   (Code 601)
+  idx_admin   — luu/xoa the                  (Code 603 / 604)
+
+Backend dung LastIdxSwipe / LastIdxUnkn / LastIdxAdmin de biet da nhan den
+index nao; thiet bi se gui lai cac ban ghi index > LastIdx* (va/hoac trong Missing[]).
+
+
+--------------------------------------------------------------------------------
+F. DINH DANG TELEMETRY DEVICE -> CLOUD
+--------------------------------------------------------------------------------
+Moi ban ghi publish len Hub (online) hoac replay tu log/SD:
+
+{
+  "Code": 602,
+  "Index": 150,
+  "TimeStamp": 1720000000,
+  "Data": {
+    "DeviceName": "RFID_Scanner",
+    "UID": "A1B2C3D4",
+    "Name": "Nguyen Van A",
+    "ID": "NV001",
+    "Version": "<fw_version>"
+  }
+}
+
+* TimeStamp: Unix UTC (giay). Neu chua NTP, ban ghi bi xep hang SD (/sdcard/az_pend.bin)
+  va gui lai khi co thoi gian + MQTT.
+* Offline: telemetry/event duoc ghi vao hang doi SD, tu flush khi MQTT connected.
+* QoS: 1 (can PUBACK).
+
+
+================================================================================
+1. FlushQueue  /  DeviceCommand Code 605
+   Dong bo log offline + replay ban ghi con thieu tu rfid_log.csv
+================================================================================
+Method Name:
+  - "FlushQueue"  (khuyen nghi)
+  - hoac "DeviceCommand" voi "Code": 605
+
+Muc dich:
+  1) Day hang doi pending tren SD (az_pend.bin) len Hub (neu co).
+  2) Doc rfid_log.csv, gui lai cac ban ghi backend con thieu.
+
+--------------------------------------------------------------------------------
+  605 GUI LAI TU DAU TOI DAU? (quan trong)
+--------------------------------------------------------------------------------
+Co 2 cach chi dinh khoang index can gui lai:
+
+  ***** CACH 1 — Tu dong theo LastIdx* (hay dung nhat) *****
+  Backend khai bao "toi da nhan den index nao". Thiet bi tu gui lai PHAN CON THIEU:
+
+      Gui lai:  (LastIdx + 1)  ......  IdxHienTaiTrenThietBi
+
+  Vi du thuc te:
+    Backend:  LastIdxSwipe = 150
+    Thiet bi: IdxSwipe     = 160   (NVS, peek trong response)
+    => Thiet bi replay Code 602 voi Index: 151, 152, ..., 160
+       (tu 151 TOI 160 — moi ban ghi index > 150)
+
+  Tuong tu 3 kenh index doc lap:
+    LastIdxSwipe  -> replay Code 602  tu (LastIdxSwipe+1)  toi IdxSwipe
+    LastIdxUnkn   -> replay Code 601  tu (LastIdxUnkn+1)   toi IdxUnkn
+    LastIdxAdmin  -> replay Code 603/604 tu (LastIdxAdmin+1) toi IdxAdmin
+
+  Neu LastIdx* >= Idx* tren thiet bi -> khong co gi de gui o kenh do.
+  Neu khong gui mot LastIdx* -> kenh do KHONG duoc quet gap (chi Missing/Start-End
+  moi anh huong).
+
+  ***** CACH 2 — Chi dinh ro TU ... TOI ... (StartIdx / EndIdx) *****
+  Backend bat thiet bi gui dung khoang [StartIdx .. EndIdx] (hai dau inclusive):
+
+      Gui lai:  StartIdx  ......  EndIdx   (cung CodeRange)
+
+  Vi du:
+{
+  "Code": 605,
+  "Data": {
+    "StartIdx": 100,
+    "EndIdx": 120,
+    "CodeRange": 602
+  }
+}
+  => Replay Code 602, Index tu 100 TOI 120 (gom ca 100 va 120).
+
+  Dieu kien hop le:
+  - StartIdx, EndIdx la number
+  - StartIdx > 0
+  - EndIdx >= StartIdx
+  - CodeRange: 601 | 602 | 603 | 604 (mac dinh 602 neu thieu)
+  - Do dai dai (EndIdx - StartIdx + 1) + Missing[] tong <= 64
+    (SCAN_LOG_SYNC_MISSING_MAX). Neu dai dai hon 64, chi lay 64 phan tu dau.
+
+  ***** CACH 3 — Missing[] tung index le (lo) *****
+  Dung khi biet chinh xac index nao bi mat, khong can ca dai lien tuc:
+    "Missing": [ {"Code":602,"Index":140}, {"Code":601,"Index":8} ]
+  Co the KET HOP voi LastIdx* va/hoac StartIdx-EndIdx trong cung 1 payload.
+  StartIdx-EndIdx noi bo se duoc expand thanh cac o Missing[] truoc khi quet CSV.
+
+--------------------------------------------------------------------------------
+  LENH VI DU 605 (moi vi du ghi RO method-name + JSON + az CLI)
+--------------------------------------------------------------------------------
+
+# ---------- 1) Chi flush hang doi offline ----------
+method-name: FlushQueue
+
+JSON:
+{
+  "Code": 605,
+  "Data": {}
+}
+
+az iot hub invoke-device-method --hub-name <HUB> --device-id <DEVICE> --method-name FlushQueue --method-payload "{\"Code\":605,\"Data\":{}}"
+
+
+# ---------- 2) Theo LastIdx* — gui lai tu (LastIdx+1) toi Idx thiet bi ----------
+method-name: FlushQueue
+
+JSON:
+{
+  "Code": 605,
+  "Data": {
+    "LastIdxSwipe": 150,
+    "LastIdxUnkn": 12,
+    "LastIdxAdmin": 5
+  }
+}
+
+az iot hub invoke-device-method --hub-name <HUB> --device-id <DEVICE> --method-name FlushQueue --method-payload "{\"Code\":605,\"Data\":{\"LastIdxSwipe\":150,\"LastIdxUnkn\":12,\"LastIdxAdmin\":5}}"
+
+
+# ---------- 3) TU ... TOI ... — Code 602, index 100 den 120 ----------
+method-name: FlushQueue
+
+JSON:
+{
+  "Code": 605,
+  "Data": {
+    "StartIdx": 100,
+    "EndIdx": 120,
+    "CodeRange": 602
+  }
+}
+
+az iot hub invoke-device-method --hub-name <HUB> --device-id <DEVICE> --method-name FlushQueue --method-payload "{\"Code\":605,\"Data\":{\"StartIdx\":100,\"EndIdx\":120,\"CodeRange\":602}}"
+
+
+# ---------- 4) TU ... TOI ... — Code 601 (the la), index 1 den 20 ----------
+method-name: FlushQueue
+
+JSON:
+{
+  "Code": 605,
+  "Data": {
+    "StartIdx": 1,
+    "EndIdx": 20,
+    "CodeRange": 601
+  }
+}
+
+az iot hub invoke-device-method --hub-name <HUB> --device-id <DEVICE> --method-name FlushQueue --method-payload "{\"Code\":605,\"Data\":{\"StartIdx\":1,\"EndIdx\":20,\"CodeRange\":601}}"
+
+
+# ---------- 5) Missing[] — tung index le bi mat ----------
+method-name: FlushQueue
+
+JSON:
+{
+  "Code": 605,
+  "Data": {
+    "Missing": [
+      { "Code": 602, "Index": 140 },
+      { "Code": 602, "Index": 145 },
+      { "Code": 601, "Index": 8 }
+    ]
+  }
+}
+
+az iot hub invoke-device-method --hub-name <HUB> --device-id <DEVICE> --method-name FlushQueue --method-payload "{\"Code\":605,\"Data\":{\"Missing\":[{\"Code\":602,\"Index\":140},{\"Code\":602,\"Index\":145},{\"Code\":601,\"Index\":8}]}}"
+
+
+# ---------- 6) Ket hop LastIdx + Start-End + Missing ----------
+method-name: FlushQueue
+
+JSON:
+{
+  "Code": 605,
+  "Data": {
+    "LastIdxSwipe": 150,
+    "StartIdx": 100,
+    "EndIdx": 105,
+    "CodeRange": 602,
+    "Missing": [
+      { "Code": 601, "Index": 8 }
+    ]
+  }
+}
+
+az iot hub invoke-device-method --hub-name <HUB> --device-id <DEVICE> --method-name FlushQueue --method-payload "{\"Code\":605,\"Data\":{\"LastIdxSwipe\":150,\"StartIdx\":100,\"EndIdx\":105,\"CodeRange\":602,\"Missing\":[{\"Code\":601,\"Index\":8}]}}"
+
+
+# ---------- 7) Cung JSON nhung dung DeviceCommand ----------
+method-name: DeviceCommand
+
+JSON:
+{
+  "Code": 605,
+  "Data": {
+    "StartIdx": 100,
+    "EndIdx": 120,
+    "CodeRange": 602
+  }
+}
+
+az iot hub invoke-device-method --hub-name <HUB> --device-id <DEVICE> --method-name DeviceCommand --method-payload "{\"Code\":605,\"Data\":{\"StartIdx\":100,\"EndIdx\":120,\"CodeRange\":602}}"
+
+--------------------------------------------------------------------------------
+Cach goi:
+  A) Chi trigger flush hang doi (khong doi chieu index):
+     - FlushQueue voi body rong / Data rong
+     - Phan hoi NGAY (khong defer):
+       {
+         "status": 200,
+         "payload": {
+           "Code": 605,
+           "TimeStamp": 1720000000,
+           "Message": "Flush trigger accepted"
+         }
+       }
+     - Thiet bi van se flush pending trong background (azure task).
+
+  B) Dong bo theo LastIdx + Missing (defer — TRA LOI SAU KHI SYNC XONG):
+{
+  "Code": 605,
+  "Data": {
+    "LastIdxSwipe": 150,
+    "LastIdxUnkn": 12,
+    "LastIdxAdmin": 5,
+    "Missing": [
+      { "Code": 602, "Index": 140 },
+      { "Code": 602, "Index": 145 },
+      { "Code": 601, "Index": 8 }
+    ]
+  }
+}
+
+  Tham so Data (tat ca optional, nhung it nhat 1 dieu kien de bat sync):
+  - LastIdxSwipe (number): backend da co toi index 602 nay.
+      => thiet bi gui lai tu (LastIdxSwipe+1) toi IdxSwipe.
+  - LastIdxUnkn  (number): tuong tu cho 601 — tu (LastIdxUnkn+1) toi IdxUnkn.
+  - LastIdxAdmin (number): tuong tu cho 603/604 — tu (LastIdxAdmin+1) toi IdxAdmin.
+  - Missing[]: danh sach {Code, Index} can gui lai dung tung ban ghi.
+    Gioi han: toi da 64 phan tu (SCAN_LOG_SYNC_MISSING_MAX).
+
+  C) Quet theo dai TU StartIdx TOI EndIdx (inclusive):
+{
+  "Code": 605,
+  "Data": {
+    "StartIdx": 100,
+    "EndIdx": 120,
+    "CodeRange": 602
+  }
+}
+  - Nghia: "gui lai cho toi tu index 100 toi index 120" (CodeRange).
+  - Co the ket hop them LastIdx* / Missing trong cung Data.
+
+Dieu kien defer_response:
+  Neu co bat ky LastIdx* / Missing / StartIdx-EndIdx hop le -> thiet bi KHONG tra
+  Direct Method ngay. Sau khi flush pending + replay log xong moi tra:
+
+{
+  "status": 200,
+  "payload": {
+    "Code": 605,
+    "TimeStamp": 1720000000,
+    "IdxSwipe": 160,
+    "IdxUnkn": 15,
+    "IdxAdmin": 7,
+    "LastIdxSwipe": 150,
+    "LastIdxUnkn": 12,
+    "LastIdxAdmin": 5,
+    "PendingFlushed": 3,
+    "ResentFromLog": 12,
+    "Message": "Sync done"
+  }
+}
+
+  Y nghia:
+  - IdxSwipe / IdxUnkn / IdxAdmin: index hien tai tren thiet bi (peek NVS, chua tang).
+  - LastIdx*: echo lai gia tri backend gui xuong (-1 neu backend khong gui truong do).
+  - PendingFlushed: so ban ghi day tu hang doi SD.
+  - ResentFromLog: so ban ghi gui lai tu CSV.
+
+
+================================================================================
+2. TriggerOTA  /  DeviceCommand Code 606
+   Cap nhat firmware tu URL HTTP(S)
+================================================================================
+Method Name:
+  - "TriggerOTA"  (khuyen nghi)
+  - hoac "DeviceCommand" voi "Code": 606
+
+Muc dich:
+  Bat dau HTTPS/HTTP OTA download firmware.bin tu Url, ghi partition OTA, reboot
+  neu thanh cong.
+
+Payload bat buoc:
+{
+  "Code": 606,
+  "Data": {
+    "Url": "http://192.168.1.100:8000/RFID.bin"
+  }
+}
+
+  - Url: string, bat buoc, khong rong. Thieu -> 400 Missing Url parameter.
+  - URL phai reachable tu mang thiet bi (STA). Nen dung HTTP LAN / HTTPS public
+    (tuy cau hinh TLS OTA trong firmware).
+
+Phan hoi thanh cong (chap nhan, bat dau download — chua bao OTA xong):
+{
+  "status": 200,
+  "payload": {
+    "Code": 606,
+    "TimeStamp": 1720000000,
+    "Message": "OTA trigger accepted, starting download"
+  }
+}
+
+Phan hoi loi:
+{
+  "status": 400,
+  "payload": {
+    "Message": "Missing Url parameter"
+  }
+}
+
+Hanh vi he thong khi OTA:
+  - Suspend Azure MQTT + tam dung task nang (LVGL/RFID/audio tuy build).
+  - Task WDT duoc go khoi LVGL truoc khi suspend (tranh panic mid-OTA).
+  - Neu OTA thanh cong: reboot sang partition moi; co the skip welcome audio.
+  - Neu OTA that bai: resume MQTT, thiet bi van chay firmware cu.
+  - "Accepted" != "Installed". Kiem tra sau reboot: Compile time / fw_ver tren portal.
+
+
+================================================================================
+3. DeviceCommand — Code 600
+   Reset / xoa cau hinh, sau do reboot (~1s)
+================================================================================
+Method Name: DeviceCommand
+
+Payload:
+{
+  "Code": 600,
+  "Data": {
+    "Reset": "wifi"
+  }
+}
+
+Tham so Data.Reset (string). Mac dinh neu thieu: "all".
+
+  "wifi"
+    Xoa SSID + Password WiFi trong NVS (giu Azure cred neu co).
+    Sau reboot thiet bi se can cau hinh WiFi lai (portal SoftAP).
+
+  "azure"
+    Xoa HostName, DeviceId, SAS key Azure trong NVS (giu WiFi).
+    Sau reboot MQTT Azure khong ket noi cho den khi cau hinh lai.
+
+  "sd"
+    - Xoa file log quet the (BOARD_SD_RFID_LOG_PATH)
+    - Xoa hang doi pending Azure (az_pend.bin / az_pend.tmp)
+    - Xoa toan bo card profile tren SD
+    - Reset bo dem idx_swipe, idx_unkn, idx_admin ve trang thai ban dau
+
+  "all" (hoac moi gia tri khac ngoai wifi/azure/sd)
+    nvs_flash_erase() — xoa toan bo NVS, ve trang thai factory (WiFi + Azure + khac).
+
+Phan hoi (truoc khi reboot):
+{
+  "status": 200,
+  "payload": {
+    "Code": 600,
+    "Reset": "wifi",
+    "Message": "Reset initiated. Rebooting..."
+  }
+}
+
+* Delay 1000 ms roi esp_restart().
+
+
+================================================================================
+4. DeviceCommand — Code 603
+   Luu / dang ky / cap nhat profile the tren SD
+================================================================================
+Method Name: DeviceCommand
+
+Payload:
+{
+  "Code": 603,
+  "Data": {
+    "UID": "A1B2C3D4",
+    "Name": "Nguyen Van A",
+    "ID": "NV001"
+  }
+}
+
+Tham so:
+  - UID  (string, bat buoc, khong rong): ma the.
+  - Name (string, optional): ten hien thi; thieu -> "".
+  - ID   (string, optional): ma nhan vien / ma noi bo; thieu -> "".
+
+Hanh vi thanh cong:
+  - Ghi profile SD (card_profile_save)
+  - Tang idx_admin, publish event Code 603 len Hub
+  - Ghi admin log CSV (SAVE)
+  - Invalidate cache UI the
+
+Phan hoi OK:
+{
+  "status": 200,
+  "payload": {
+    "Code": 603,
+    "TimeStamp": 1720000000,
+    "Message": "Updated UID A1B2C3D4"
+  }
+}
+
+Phan hoi loi ghi SD:
+{
+  "status": 500,
+  "payload": {
+    "Message": "Save failed"
+  }
+}
+
+* Neu thieu UID hop le: firmware khong gui response (nen luon gui UID).
+
+
+================================================================================
+5. DeviceCommand — Code 604
+   Xoa profile the khoi SD
+================================================================================
+Method Name: DeviceCommand
+
+Payload:
+{
+  "Code": 604,
+  "Data": {
+    "UID": "A1B2C3D4"
+  }
+}
+
+Tham so:
+  - UID (string, bat buoc).
+
+Hanh vi:
+  - Lookup ten/ID neu con profile (de gui event)
+  - Xoa file profile (OK ca khi file da khong ton tai)
+  - Tang idx_admin, publish event Code 604
+  - Ghi admin log CSV (DEL)
+  - Invalidate cache UI
+
+Phan hoi (luon 200 neu co UID):
+{
+  "status": 200,
+  "payload": {
+    "Code": 604,
+    "TimeStamp": 1720000000,
+    "Message": "Deleted or absent UID A1B2C3D4"
+  }
+}
+
+
+================================================================================
+6. DeviceCommand — Code 611 / 612
+   Doi loai man hinh LCD, luu NVS, reboot (~1s)
+================================================================================
+Method Name: DeviceCommand
+
+  Code 611 — man hinh CU  (ILI9341 Legacy), panel id = 2
+  Code 612 — man hinh MOI (GMT028),         panel id = 1
+
+Payload:
+{
+  "Code": 611,
+  "Data": {}
+}
+
+(Data bat buoc la object; co the rong.)
+
+Phan hoi:
+{
+  "status": 200,
+  "payload": {
+    "Message": "Switched to screen type 2. Rebooting..."
+  }
+}
+(voi 612 thi "screen type 1")
+
+* Delay 1000 ms roi esp_restart().
+
+
+================================================================================
+7. LOI CHUNG (moi method)
+================================================================================
+Method name khong ho tro:
+{
+  "status": 404,
+  "payload": { "Message": "Method name not supported: <name>" }
+}
+
+JSON parse fail:
+{
+  "status": 400,
+  "payload": { "Message": "Invalid JSON" }
+}
+
+DeviceCommand thieu Code (number) hoac Data (object):
+{
+  "status": 400,
+  "payload": { "Message": "Missing Code or Data" }
+}
+
+DeviceCommand Code la:
+{
+  "status": 400,
+  "payload": { "Message": "Unknown Code: 999" }
+}
+
+
+================================================================================
+8. VI DU CAC LENH KHAC (method-name + JSON + az CLI)
+================================================================================
+
+# ----- OTA (606) -----
+method-name: TriggerOTA
+
+JSON:
+{
+  "Code": 606,
+  "Data": {
+    "Url": "http://192.168.1.100:8000/RFID.bin"
+  }
+}
+az iot hub invoke-device-method --hub-name <HUB> --device-id <DEVICE> --method-name TriggerOTA --method-payload "{\"Code\":606,\"Data\":{\"Url\":\"http://192.168.1.100:8000/RFID.bin\"}}"
+
+# ----- Luu the (603) -----
+method-name: DeviceCommand
+
+JSON:
+{
+  "Code": 603,
+  "Data": {
+    "UID": "A1B2C3D4",
+    "Name": "Nguyen Van A",
+    "ID": "NV001"
+  }
+}
+az iot hub invoke-device-method --hub-name <HUB> --device-id <DEVICE> --method-name DeviceCommand --method-payload "{\"Code\":603,\"Data\":{\"UID\":\"A1B2C3D4\",\"Name\":\"Nguyen Van A\",\"ID\":\"NV001\"}}"
+
+# ----- Xoa the (604) -----
+method-name: DeviceCommand
+
+JSON:
+{
+  "Code": 604,
+  "Data": {
+    "UID": "A1B2C3D4"
+  }
+}
+az iot hub invoke-device-method --hub-name <HUB> --device-id <DEVICE> --method-name DeviceCommand --method-payload "{\"Code\":604,\"Data\":{\"UID\":\"A1B2C3D4\"}}"
+
+# ----- Reset WiFi (600) -----
+method-name: DeviceCommand
+
+JSON:
+{
+  "Code": 600,
+  "Data": {
+    "Reset": "wifi"
+  }
+}
+az iot hub invoke-device-method --hub-name <HUB> --device-id <DEVICE> --method-name DeviceCommand --method-payload "{\"Code\":600,\"Data\":{\"Reset\":\"wifi\"}}"
+
+# ----- Doi man hinh moi (612) -----
+method-name: DeviceCommand
+
+JSON:
+{
+  "Code": 612,
+  "Data": {}
+}
+az iot hub invoke-device-method --hub-name <HUB> --device-id <DEVICE> --method-name DeviceCommand --method-payload "{\"Code\":612,\"Data\":{}}"
+
+
+================================================================================
+9. CHECKLIST NHANH CHO BACKEND
+================================================================================
+[ ] Chi dung 3 method name: FlushQueue | TriggerOTA | DeviceCommand
+[ ] DeviceCommand luon co "Code" + "Data" (object)
+[ ] Telemetry 601/602/603/604: theo Index rieng tung loai
+[ ] Sync 605: gui LastIdx* thuc te backend dang giu; Missing[] <= 64
+[ ] OTA 606: Url reachable; doi reboot + kiem tra version (khong chi tin "accepted")
+[ ] 600 / 611 / 612: thiet bi se reboot — timeout Direct Method can du dai
+[ ] Offline: thiet bi tu queue SD; backend co the dinh ky FlushQueue/605
+================================================================================
