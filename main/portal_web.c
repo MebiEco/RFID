@@ -18,12 +18,14 @@
 #include "card_profile.h"
 #include "lcd_ui.h"
 #include "app_azure.h"
+#include "app_ota.h"
 #include "scan_log.h"
 #include "sd_card.h"
 #include "wifi_portal.h"
 #include "lcd_panel_config.h"
 
 #include "esp_system.h"
+#include "esp_netif.h"
 #include "app_audio.h"
 #include "lv_port.h"
 #include "esp_heap_caps.h"
@@ -962,8 +964,9 @@ static esp_err_t api_status_get_handler(httpd_req_t *req)
         httpd_resp_set_type(req, "application/json");
         return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"Yeu cau dang nhap\"}");
     }
-    char resp[480];
+    char resp[560];
     char time_str[32] = "";
+    char sta_ip[20] = "";
     int cnt = wifi_list_get_count();
     wifi_conn_status_t st = wifi_portal_get_conn_status();
     const char *stt = "idle";
@@ -973,6 +976,15 @@ static esp_err_t api_status_get_handler(httpd_req_t *req)
         stt = "connected";
     } else if (st == WIFI_STATUS_FAIL) {
         stt = "fail";
+    }
+    if (st == WIFI_STATUS_CONNECTED) {
+        esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+        if (netif) {
+            esp_netif_ip_info_t ipi;
+            if (esp_netif_get_ip_info(netif, &ipi) == ESP_OK && ipi.ip.addr != 0) {
+                snprintf(sta_ip, sizeof(sta_ip), IPSTR, IP2STR(&ipi.ip));
+            }
+        }
     }
     const bool time_ok = wifi_portal_time_is_valid();
     if (time_ok) {
@@ -994,13 +1006,17 @@ static esp_err_t api_status_get_handler(httpd_req_t *req)
     const lcd_panel_profile_t *lcd_p = lcd_panel_get_active();
     const esp_app_desc_t *app = esp_app_get_description();
     const esp_partition_t *run = esp_ota_get_running_partition();
+    const bool ota_busy = app_ota_is_busy();
+    const int ota_pct = app_ota_get_progress_pct();
     snprintf(resp, sizeof(resp),
-             "{\"ok\":true,\"wifi_saved\":%d,\"wifi_status\":\"%s\",\"sd\":%s,\"time_ok\":%s,\"time\":\"%s\","
+             "{\"ok\":true,\"wifi_saved\":%d,\"wifi_status\":\"%s\",\"sta_ip\":\"%s\",\"sd\":%s,\"time_ok\":%s,\"time\":\"%s\","
              "\"lcd_panel\":%u,\"lcd_panel_name\":\"%s\",\"azure_connected\":%s,"
+             "\"ota_busy\":%s,\"ota_pct\":%d,"
              "\"fw_ver\":\"%s\",\"fw_date\":\"%s %s\",\"fw_part\":\"%s\"}",
-             cnt, stt, sd_card_is_mounted() ? "true" : "false", time_ok ? "true" : "false", time_str,
+             cnt, stt, sta_ip, sd_card_is_mounted() ? "true" : "false", time_ok ? "true" : "false", time_str,
              (unsigned)lcd_panel_get_id(), lcd_p ? lcd_p->name : "",
              az_conn ? "true" : "false",
+             ota_busy ? "true" : "false", ota_pct,
              app && app->version[0] ? app->version : "?",
              app ? app->date : "?", app ? app->time : "?",
              run ? run->label : "?");

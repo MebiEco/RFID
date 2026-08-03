@@ -26,10 +26,10 @@ wifi_conn_status_t wifi_portal_get_conn_status(void);
 void wifi_portal_get_azure(char *host, size_t host_sz, char *devid, size_t dev_sz, char *sas_mask,
                            size_t sas_sz);
 
-/** true sau khi SNTP cap nhat time() hop le (nam >= 2020, gio VN). */
+/** true khi da co gio hop le tu DS3231 (boot) hoac SNTP (nam >= 2020). */
 bool wifi_portal_time_is_valid(void);
 
-/** Giay UTC (time_t); 0 neu chua dong bo NTP hop le — dung cho TimeStamp gui backend. */
+/** Giay UTC (time_t); 0 neu chua co nguon gio tin cay (RTC/NTP). */
 time_t wifi_portal_get_utc_sec(void);
 
 /**

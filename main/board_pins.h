@@ -373,6 +373,28 @@
 #ifndef BOARD_I2S_DOUT_GPIO
 #define BOARD_I2S_DOUT_GPIO GPIO_NUM_18
 #endif
+
+/**
+ * DS3231 RTC (I2C) — giữ giờ khi mất WiFi/NTP. Không trùng LCD/SD/RFID/I2S.
+ * SDA=14, SCL=15 (an toàn trên ESP32-S3; tránh 19/20 USB, 26–37 flash/PSRAM, 0/45/46 strap).
+ * 0 = tắt (không init I2C); module không gắn vẫn an toàn nếu bật (init fail → fallback NTP/NVS).
+ */
+#ifndef BOARD_ENABLE_DS3231
+#define BOARD_ENABLE_DS3231 1
+#endif
+#ifndef BOARD_DS3231_I2C_PORT
+#define BOARD_DS3231_I2C_PORT 0
+#endif
+#ifndef BOARD_DS3231_SDA_GPIO
+#define BOARD_DS3231_SDA_GPIO GPIO_NUM_14
+#endif
+#ifndef BOARD_DS3231_SCL_GPIO
+#define BOARD_DS3231_SCL_GPIO GPIO_NUM_15
+#endif
+#ifndef BOARD_DS3231_ADDR
+#define BOARD_DS3231_ADDR 0x68
+#endif
+
 /**
  * 0 = tắt I2S/loa (không task WAV). 1 = bật.
  * Tắt thì ảnh từ SD lên màn thường mượt hơn: bớt tranh CPU/DMA + đọc thẻ (decode JPEG/PNG tốn PSRAM/CPU).

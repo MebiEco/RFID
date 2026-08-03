@@ -14,7 +14,6 @@
 #include "app_audio.h"
 #include "app_azure.h"
 #include "app_rfid.h"
-#include "wifi_portal.h"
 #include "lv_port.h"
 
 static const char *TAG = "app_ota";
@@ -25,8 +24,19 @@ static const char *TAG = "app_ota";
 #define OTA_TASK_STACK    20480
 
 static volatile bool s_ota_busy;
+static volatile int s_ota_pct = -1;
 
-static void ota_mark_skip_welcome_on_reboot(void) //
+bool app_ota_is_busy(void)
+{
+    return s_ota_busy;
+}
+
+int app_ota_get_progress_pct(void)
+{
+    return s_ota_busy ? s_ota_pct : -1;
+}
+
+static void ota_mark_skip_welcome_on_reboot(void)
 {
     nvs_handle_t h;
     if (nvs_open(OTA_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
@@ -62,20 +72,19 @@ static void ota_log_heap(const char *when)
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 }
 
-/** Ngung dich vu nang — giai phong TLS/socket/DMA cho HTTPS OTA (giu WiFi STA). */
+/** Giam dich vu nang — Azure/LVGL/RFID/audio; GIU web de theo doi. */
 static void ota_release_resources(void)
 {
-    ESP_LOGI(TAG, "OTA: ngung dich vu de lay RAM/socket...");
+    ESP_LOGI(TAG, "OTA: giam dich vu (giu httpd)...");
     app_audio_stop_and_clear();
     app_audio_pause();
     /* Cho MQTT PUBACK Direct Method xong roi moi ngat. */
     vTaskDelay(pdMS_TO_TICKS(1000));
     app_azure_suspend_for_ota();
-    wifi_portal_httpd_stop();
     app_rfid_set_paused(true);
     lv_port_suspend_for_ota();
     vTaskDelay(pdMS_TO_TICKS(500));
-    ota_log_heap("sau ngung dich vu");
+    ota_log_heap("sau giam dich vu");
 }
 
 static void ota_restore_resources(void)
@@ -83,8 +92,8 @@ static void ota_restore_resources(void)
     ESP_LOGW(TAG, "OTA fail: khoi phuc dich vu");
     lv_port_resume_after_ota();
     app_rfid_set_paused(false);
-    (void)wifi_portal_httpd_start();
     app_azure_resume_after_ota();
+    s_ota_pct = -1;
     s_ota_busy = false;
 }
 
@@ -93,6 +102,7 @@ static void ota_task(void *pvParameter)
     char *url = (char *)pvParameter;
     const esp_partition_t *run = esp_ota_get_running_partition();
     ESP_LOGI(TAG, "Bat dau OTA tu URL: %s (running=%s)", url, run && run->label ? run->label : "?");
+    s_ota_pct = 0;
 
     ota_release_resources();
 
@@ -133,10 +143,13 @@ static void ota_task(void *pvParameter)
         int read = esp_https_ota_get_image_len_read(handle);
         if (total > 0) {
             int pct = (int)((read * 100LL) / total);
+            s_ota_pct = pct;
             if (pct != last_pct && (pct % 10) == 0) {
                 last_pct = pct;
                 ESP_LOGI(TAG, "OTA tien do: %d%% (%d/%d)", pct, read, total);
             }
+        } else if (read > 0) {
+            s_ota_pct = -1;
         }
         vTaskDelay(pdMS_TO_TICKS(1));
     }

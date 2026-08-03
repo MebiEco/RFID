@@ -198,18 +198,18 @@ static bool rfid_sta_has_wifi(void)
 }
 #endif
 
-/** Quet the / check-in chi khi da co gio thuc (SNTP). */
+/** Quet the khi da co gio tin cay (DS3231 hoac NTP). Co RTC thi khong bat buoc WiFi. */
 static rfid_time_gate_t rfid_time_gate_check(void)
 {
+    if (wifi_portal_time_is_valid()) {
+        return RFID_TIME_GATE_OK;
+    }
 #if BOARD_ENABLE_WIFI
     if (!rfid_sta_has_wifi()) {
         return RFID_TIME_GATE_NEED_WIFI;
     }
 #endif
-    if (!wifi_portal_time_is_valid()) {
-        return RFID_TIME_GATE_WAIT_NTP;
-    }
-    return RFID_TIME_GATE_OK;
+    return RFID_TIME_GATE_WAIT_NTP;
 }
 
 #define RFID_UI_MAX_CHARS_PER_LINE ((BOARD_LCD_H_RES) / 8)
@@ -643,7 +643,7 @@ static void rfid_task(void *arg)
             const rfid_time_gate_t time_gate = rfid_time_gate_check();
             if (time_gate != RFID_TIME_GATE_OK) {
                 const char *err_msg = (time_gate == RFID_TIME_GATE_WAIT_NTP) ? "Đang lấy thời gian"
-                                                                               : "Vui lòng kết nối mạng";
+                                                                               : "Cần giờ RTC hoặc WiFi";
                 snprintf(line1, sizeof(line1), "%s", err_msg);
                 snprintf(line_ma, sizeof(line_ma), "Ma: -");
                 dtline[0] = '\0';

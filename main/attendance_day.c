@@ -17,8 +17,10 @@
 
 static const char *TAG = "attend_day";
 
-#define ATT_WORK_START_MIN (8 * 60 + 30)
-#define ATT_WORK_END_MIN   (18 * 60)
+#define ATT_WORK_START_MIN (8 * 60 + 30)  /* 08:30 — muộn nếu LẦN ĐẦU vào sau mốc này */
+#define ATT_WORK_END_MIN   (18 * 60)      /* 18:00 — về đúng giờ nếu LẦN RA >= mốc này */
+/** Hai lần quẹt cách nhau dưới ngưỡng này coi như cùng lần / nhầm — chưa tính là ra. */
+#define ATT_CHECKOUT_GAP_MIN 20
 #define ATT_MAX_EMP        128
 #define ATT_LIST_CAP       64
 
@@ -33,6 +35,33 @@ typedef struct {
     int t_first_min;
     int t_last_min;
 } att_emp_t;
+
+/**
+ * Có lần ra thật: last sau first ít nhất ATT_CHECKOUT_GAP_MIN phút.
+ * Lần đầu = vào; quẹt liên tiếp gần nhau (~20 phút) không tính về sớm.
+ */
+static bool att_has_checkout(const att_emp_t *e, int today)
+{
+    if (!e) {
+        return false;
+    }
+    int first;
+    int last;
+    int swipes;
+    if (today) {
+        first = e->t_first_min;
+        last = e->t_last_min;
+        swipes = e->t_swipes;
+    } else {
+        first = e->y_first_min;
+        last = e->y_last_min;
+        swipes = e->y_swipes;
+    }
+    if (swipes < 2 || first < 0 || last < 0 || last <= first) {
+        return false;
+    }
+    return (last - first) >= ATT_CHECKOUT_GAP_MIN;
+}
 
 static void att_feed_wdt(void)
 {
@@ -316,14 +345,14 @@ esp_err_t attendance_day_send_overview_json(httpd_req_t *req)
         } else {
             t_ontime++;
         }
-        /* today leave */
+        /* today leave — lần đầu chỉ tính vào; về sớm/đúng giờ cần lần ra riêng (sau lần đầu) */
         if (e->t_swipes == 0) {
             t_leave_abs++;
-        } else if (e->t_swipes == 1) {
+        } else if (!att_has_checkout(e, 1)) {
             t_forgot++;
-        } else if (e->t_last_min >= 0 && e->t_last_min < ATT_WORK_END_MIN) {
+        } else if (e->t_last_min < ATT_WORK_END_MIN) {
             t_early++;
-        } else {
+        } else if (e->t_last_min >= ATT_WORK_END_MIN) {
             t_out_ok++;
         }
         /* yesterday summary (có thể trùng: muộn + về sớm) */
@@ -333,7 +362,7 @@ esp_err_t attendance_day_send_overview_json(httpd_req_t *req)
         if (e->y_swipes >= 1 && e->y_first_min > ATT_WORK_START_MIN) {
             y_late++;
         }
-        if (e->y_swipes >= 2 && e->y_last_min >= 0 && e->y_last_min < ATT_WORK_END_MIN) {
+        if (att_has_checkout(e, 0) && e->y_last_min < ATT_WORK_END_MIN) {
             y_early++;
         }
     }
@@ -442,7 +471,7 @@ esp_err_t attendance_day_send_overview_json(httpd_req_t *req)
     listed = 0;
     for (int i = 0; i < nemp && listed < ATT_LIST_CAP; i++) {
         att_emp_t *e = &emps[i];
-        if (e->t_swipes != 1) {
+        if (e->t_swipes == 0 || att_has_checkout(e, 1)) {
             continue;
         }
         char hm[8];
@@ -464,7 +493,7 @@ esp_err_t attendance_day_send_overview_json(httpd_req_t *req)
     listed = 0;
     for (int i = 0; i < nemp && listed < ATT_LIST_CAP; i++) {
         att_emp_t *e = &emps[i];
-        if (e->t_swipes < 2 || e->t_last_min < 0 || e->t_last_min >= ATT_WORK_END_MIN) {
+        if (!att_has_checkout(e, 1) || e->t_last_min >= ATT_WORK_END_MIN) {
             continue;
         }
         char hm[8];
@@ -486,7 +515,7 @@ esp_err_t attendance_day_send_overview_json(httpd_req_t *req)
     listed = 0;
     for (int i = 0; i < nemp && listed < ATT_LIST_CAP; i++) {
         att_emp_t *e = &emps[i];
-        if (e->t_swipes < 2 || e->t_last_min < ATT_WORK_END_MIN) {
+        if (!att_has_checkout(e, 1) || e->t_last_min < ATT_WORK_END_MIN) {
             continue;
         }
         char hm[8];
@@ -554,7 +583,7 @@ esp_err_t attendance_day_send_overview_json(httpd_req_t *req)
     listed = 0;
     for (int i = 0; i < nemp && listed < ATT_LIST_CAP; i++) {
         att_emp_t *e = &emps[i];
-        if (e->y_swipes < 2 || e->y_last_min < 0 || e->y_last_min >= ATT_WORK_END_MIN) {
+        if (!att_has_checkout(e, 0) || e->y_last_min >= ATT_WORK_END_MIN) {
             continue;
         }
         char hm[8];

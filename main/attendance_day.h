@@ -3,6 +3,8 @@
  * - Hôm nay: Đi làm + Đi về (cùng 1 ngày, đủ chi tiết)
  * - Hôm qua: tổng quát không đi / đi muộn / về sớm
  * Giờ công cố định 08:30 – 18:00 (giờ địa phương board).
+ * Lần quẹt đầu = vào. Hai lần cách nhau < 20 phút không tính là ra.
+ * Về sớm: có lần ra thật và giờ ra < 18:00.
  */
 #pragma once
 

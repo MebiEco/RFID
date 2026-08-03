@@ -23,6 +23,8 @@
 #include "lwip/inet.h"
 #include "lwip/sockets.h"
 
+#include "board_pins.h"
+#include "ds3231.h"
 #include "scan_log.h"
 #include "app_azure.h"
 #include "app_rfid.h"
@@ -32,7 +34,6 @@ static const char *TAG = "wifi_portal";
 
 #define NVS_NS "wifi_portal"
 #define NVS_KEY "cred"
-#define NVS_KEY_WALL_UTC "wall_utc"
 #define CRED_MAGIC 0x57494649u
 
 typedef struct __attribute__((packed)) {
@@ -166,7 +167,7 @@ void wifi_list_get_item(int idx, char *ssid, char *pass) {
 }
 
 /** SoftAP WPA2 — mật khẩu AP_PASS; vào http://192.168.4.1 sau khi nối */
-#define AP_SSID "Defaufl-AP"
+#define AP_SSID "Defuafl-AP"
 #define AP_PASS "12345678"
 #define AP_CHANNEL 1
 #define AP_MAX_CONN 4
@@ -1074,59 +1075,55 @@ static bool wall_time_valid(time_t utc)
     return t.tm_year >= (2020 - 1900);
 }
 
-/* Sau mat dien: gio khoi phuc tu NVS >= 2020 nhung KHONG phai gio NTP that.
- * Dung de chan cham cong "sai gio" cho den khi SNTP that su cap nhat. */
-static bool    s_wall_from_nvs = false;
-static int64_t s_wall_nvs_epoch = 0;      /* UTC khoi phuc tu NVS */
-static int64_t s_wall_nvs_uptime_us = 0;  /* esp_timer luc khoi phuc */
-/* Nguong (giay) coi la "dong ho da nhay" -> SNTP that da hieu chinh. */
-#define WALL_NTP_JUMP_MIN_SEC 5
+/* Nguon gio tin cay: DS3231 (offline) hoac SNTP. Khong dung gio NVS tam. */
 
-/** Luu UTC lan NTP cuoi — sau reset khoi phuc tam cho den khi SNTP cap nhat lai. */
-static void wall_time_nvs_save(time_t utc)
+/** Ghi nguoc system time vao DS3231 (neu co) — goi sau NTP sync. */
+static void wall_time_rtc_save(time_t utc)
 {
-    if (!wall_time_valid(utc)) {
+#if BOARD_ENABLE_DS3231
+    if (!ds3231_is_ready() || !wall_time_valid(utc)) {
         return;
     }
-    nvs_handle_t h;
-    if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) {
+    esp_err_t e = ds3231_set_utc(utc);
+    if (e != ESP_OK) {
+        ESP_LOGW(TAG, "Ghi DS3231 that bai: %s", esp_err_to_name(e));
         return;
     }
-    nvs_set_i64(h, NVS_KEY_WALL_UTC, (int64_t)utc);
-    nvs_commit(h);
-    nvs_close(h);
+    ESP_LOGI(TAG, "Da cap nhat DS3231 tu NTP (UTC=%lld)", (long long)utc);
+#else
+    (void)utc;
+#endif
 }
 
-/** Sau mat nguon: dat time() tu NVS (co the lech bang thoi gian tat may); SNTP se hieu chinh. */
-static void wall_time_nvs_restore(void)
+/**
+ * Boot: doc DS3231 -> settimeofday, danh dau synced (cho phep cham cong offline).
+ */
+static bool wall_time_rtc_restore(void)
 {
-    if (wall_time_valid(time(NULL))) {
-        return;
+#if BOARD_ENABLE_DS3231
+    if (ds3231_init() != ESP_OK) {
+        return false;
     }
-    nvs_handle_t h;
-    int64_t saved = 0;
-    if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) {
-        return;
+    time_t utc = 0;
+    if (ds3231_get_utc(&utc) != ESP_OK || !wall_time_valid(utc)) {
+        ESP_LOGW(TAG, "DS3231 chua co gio hop le — cho NTP");
+        return false;
     }
-    esp_err_t e = nvs_get_i64(h, NVS_KEY_WALL_UTC, &saved);
-    nvs_close(h);
-    if (e != ESP_OK || !wall_time_valid((time_t)saved)) {
-        return;
-    }
-    struct timeval tv = {.tv_sec = (time_t)saved, .tv_usec = 0};
+    struct timeval tv = {.tv_sec = utc, .tv_usec = 0};
     if (settimeofday(&tv, NULL) != 0) {
-        ESP_LOGW(TAG, "Khoi phuc gio NVS that bai");
-        return;
+        ESP_LOGW(TAG, "settimeofday tu DS3231 that bai");
+        return false;
     }
-    /* Danh dau: gio nay tu NVS (tam, hien thi) — chua duoc phep cham cong. */
-    s_wall_from_nvs = true;
-    s_wall_nvs_epoch = saved;
-    s_wall_nvs_uptime_us = esp_timer_get_time();
+    s_time_synced = true;
     struct tm t;
-    scan_log_wall_tm((time_t)saved, &t);
-    ESP_LOGI(TAG, "Khoi phuc gio NVS (tam, cho NTP): %04d-%02d-%02d %02d:%02d:%02d",
+    scan_log_wall_tm(utc, &t);
+    ESP_LOGI(TAG, "Gio tu DS3231 (OK offline): %04d-%02d-%02d %02d:%02d:%02d",
              (int)(t.tm_year + 1900), (int)(t.tm_mon + 1), (int)t.tm_mday, (int)t.tm_hour, (int)t.tm_min,
              (int)t.tm_sec);
+    return true;
+#else
+    return false;
+#endif
 }
 
 bool wifi_portal_time_is_valid(void)
@@ -1137,7 +1134,7 @@ bool wifi_portal_time_is_valid(void)
     return s_time_synced;
 }
 
-/** UTC cho backend — chi sau NTP that (khong dung gio NVS tam). */
+/** UTC cho backend — chi khi da sync tu DS3231 hoac NTP. */
 time_t wifi_portal_get_utc_sec(void)
 {
     if (!s_time_synced) {
@@ -1174,26 +1171,10 @@ static void sntp_adopt_wall_time_if_valid(void)
     if (!wall_time_valid(now)) {
         return;
     }
-    /* Sau mat dien, time() la gio khoi phuc tu NVS (chua chinh xac).
-     * Chi chap nhan khi phat hien SNTP that su da hieu chinh: time() nhay
-     * khoi quy dao du doan (NVS_epoch + uptime). Neu chua nhay -> cho callback NTP,
-     * KHONG cham cong bang gio NVS de tranh sai gio. */
-    if (s_wall_from_nvs) {
-        int64_t elapsed_s = (esp_timer_get_time() - s_wall_nvs_uptime_us) / 1000000;
-        int64_t predicted = s_wall_nvs_epoch + elapsed_s;
-        int64_t diff = (int64_t)now - predicted;
-        if (diff < 0) {
-            diff = -diff;
-        }
-        if (diff < WALL_NTP_JUMP_MIN_SEC) {
-            return;
-        }
-        ESP_LOGI(TAG, "SNTP hieu chinh gio NVS (nhay %lld s)", (long long)diff);
-    }
     s_time_synced = true;
     struct tm t;
     scan_log_wall_tm(now, &t);
-    wall_time_nvs_save(now);
+    wall_time_rtc_save(now);
     ESP_LOGI(TAG, "NTP ok (poll), Real time: %04d-%02d-%02d %02d:%02d:%02d",
              (int)(t.tm_year + 1900), (int)(t.tm_mon + 1), (int)t.tm_mday,
              (int)t.tm_hour, (int)t.tm_min, (int)t.tm_sec);
@@ -1309,7 +1290,7 @@ static void time_synced_cb(struct timeval *tv)
     s_time_synced = true;
     struct tm t;
     scan_log_wall_tm(now, &t);
-    wall_time_nvs_save(now);
+    wall_time_rtc_save(now);
     ESP_LOGI(TAG, "NTP ok, Real time: %04d-%02d-%02d %02d:%02d:%02d",
              (int)(t.tm_year + 1900), (int)(t.tm_mon + 1), (int)t.tm_mday,
              (int)t.tm_hour, (int)t.tm_min, (int)t.tm_sec);
@@ -1340,8 +1321,9 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
         if (s_sta_netif) {
             esp_netif_set_default_netif(s_sta_netif);
         }
+        /* Co RTC van van chay SNTP de hieu chinh + ghi nguoc DS3231. */
+        sntp_start_or_restart();
         if (!s_time_synced) {
-            sntp_start_or_restart();
             schedule_sntp_retry();
         }
     }
@@ -1357,7 +1339,8 @@ esp_err_t wifi_portal_start(void)
      */
     setenv("TZ", "UTC-7", 1);
     tzset();
-    wall_time_nvs_restore();
+    /* Chi DS3231 luc boot; khong co RTC/gio -> cho NTP. */
+    (void)wall_time_rtc_restore();
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     esp_netif_create_default_wifi_ap();
     s_sta_netif = esp_netif_create_default_wifi_sta();

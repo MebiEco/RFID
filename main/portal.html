@@ -192,8 +192,8 @@ return '<div class=att-block><div class=att-head>'
 +'<h3 style="margin-top:12px">Đi về</h3>'
 +'<div class=att-sum>'
 +attChip('Không đi làm',lv.absent||0,'')
-+attChip('Quên quẹt',lv.forgot||0,'')
-+attChip('Về sớm',lv.early||0,'<span class="sb warn"><18:00</span>')
++attChip('Quên quẹt',lv.forgot||0,'<span class="sb warn">chưa đủ ra</span>')
++attChip('Về sớm',lv.early||0,'<span class="sb warn">ra &lt;18:00 · cách ≥20p</span>')
 +attChip('Về đúng giờ',lv.on_time_out||0,'<span class="sb ok">≥18:00</span>')
 +'</div><div class=att-lists>'
 +attListHtml('Không đi làm',lv.absent_list,null)
@@ -218,15 +218,20 @@ function bindAttRefresh(){const b=$('attRefresh');if(!b)return;b.onclick=()=>{tc
 function renderHomeData(d,att){
 const L={idle:['Ngoại tuyến','warn'],connecting:['Đang kết nối','warn'],connected:['Đã kết nối','ok'],fail:['Lỗi kết nối','bad']};
 const w=L[d.wifi_status]||[d.wifi_status,'warn'];
+const otaBusy=!!d.ota_busy;
+const otaPct=(typeof d.ota_pct==='number'&&d.ota_pct>=0)?d.ota_pct:null;
 $('body').innerHTML='<div class=grid>'
 +'<div class=sc><h3>WiFi</h3><div class=v>Đã lưu: '+d.wifi_saved+' AP</div><span class="sb '+w[1]+'">'+w[0]+'</span></div>'
++'<div class=sc><h3>Địa chỉ IP</h3><div class=v>'+(esc(d.sta_ip||'—'))+'</div><span class="sb '+(d.sta_ip?'ok':'warn')+'">'+(d.sta_ip?'STA':'Chưa có')+'</span></div>'
 +'<div class=sc><h3>Azure IoT</h3><div class=v>'+(d.azure_connected?'Đang hoạt động':'Mất kết nối')+'</div><span class="sb '+(d.azure_connected?'ok':'bad')+'">'+(d.azure_connected?'Đã kết nối':'Chưa kết nối')+'</span></div>'
 +'<div class=sc><h3>Thẻ SD</h3><div class=v>'+(d.sd?'Đã gắn SD':'Chưa gắn SD')+'</div><span class="sb '+(d.sd?'ok':'bad')+'">'+(d.sd?'OK':'Trống')+'</span></div>'
 +'<div class=sc><h3>Giờ hệ thống</h3><div class=v>'+(d.time_ok?(d.time||'Đã đồng bộ'):'Chờ WiFi + NTP')+'</div><span class="sb '+(d.time_ok?'ok':'bad')+'">'+(d.time_ok?'Đồng bộ':'Chưa có giờ')+'</span></div>'
 +'<div class=sc><h3>Phiên bản FW</h3><div class=v>'+(esc(d.fw_ver||'?'))+'</div><span class="sb ok">'+(esc(d.fw_date||'?'))+'</span></div>'
++(otaBusy?('<div class=sc><h3>OTA</h3><div class=v>'+(otaPct!=null?(otaPct+'%'):'Đang tải...')+'</div><span class="sb warn">Đang cập nhật</span></div>'):'')
 +'</div>'
 +renderAttBlock(att);
 bindAttRefresh();
+if(otaBusy){clearTimeout(window._otaPoll);window._otaPoll=setTimeout(()=>{tcClr('status');renderHome(true);},2000);}
 }
 function renderHome(force){
 if(!force){const c=tcGet('status');const a=tcGet('attend');if(c&&a){renderHomeData(c,a);return;}}
