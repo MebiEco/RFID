@@ -1,0 +1,5 @@
+dependencies:
+  # ESP-IDF component manager: dùng semver ^ / ~ / số cố định — không dùng ">=a <b"
+  lvgl/lvgl: "^8.3.0"
+  espressif/esp_lcd_ili9341: "^2.0.0"
+

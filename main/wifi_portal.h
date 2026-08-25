@@ -1,0 +1,58 @@
+#pragma once
+
+#include <stdbool.h>
+#include <time.h>
+
+#include "esp_err.h"
+
+/** SoftAP + web (192.168.4.1): form lưu / xóa WiFi STA vào NVS. Gọi sau nvs_flash_init. */
+esp_err_t wifi_portal_start(void);
+
+void wifi_list_add(const char *ssid, const char *pass);
+void wifi_list_remove(const char *ssid);
+int wifi_list_get_count(void);
+typedef enum {
+    WIFI_STATUS_IDLE,
+    WIFI_STATUS_CONNECTING,
+    WIFI_STATUS_CONNECTED,
+    WIFI_STATUS_FAIL
+} wifi_conn_status_t;
+
+void wifi_list_get_item(int idx, char *ssid, char *pass);
+void wifi_portal_connect_to(const char *ssid, const char *pass);
+wifi_conn_status_t wifi_portal_get_conn_status(void);
+
+/** Azure da luu trong NVS (sas_mask chi hien 4 ky tu cuoi neu co). */
+void wifi_portal_get_azure(char *host, size_t host_sz, char *devid, size_t dev_sz, char *sas_mask,
+                           size_t sas_sz);
+
+/** Luu thong tin Azure Hub moi vao NVS (HostName, DeviceID, SAS key). Neu devid NULL/rong thi giu nguyen devid cu. */
+esp_err_t wifi_portal_set_azure(const char *host, const char *devid, const char *sas_key);
+
+/** true khi da co gio hop le tu DS3231 (boot) hoac SNTP (nam >= 2020). */
+bool wifi_portal_time_is_valid(void);
+
+/** Giay UTC (time_t); 0 neu chua co nguon gio tin cay (RTC/NTP). */
+time_t wifi_portal_get_utc_sec(void);
+
+/**
+ * @brief Đọc/ghi chữ thương hiệu hiển thị trên màn idle (NVS key "brand_txt").
+ *        Mặc định "MEBISOFT" nếu chưa có giá trị.
+ *        @p out tối đa 16 ký tự (bao gồm '\\0').
+ */
+void wifi_portal_get_brand_text(char *out, size_t sz);
+esp_err_t wifi_portal_set_brand_text(const char *txt);
+
+/**
+ * @brief Đọc/ghi giờ vào làm & giờ tan làm/đi về (NVS key "work_start", "work_end").
+ *        Mặc định "08:30" và "18:00".
+ */
+void wifi_portal_get_work_hours(char *start_out, size_t start_sz, char *end_out, size_t end_sz);
+esp_err_t wifi_portal_set_work_hours(const char *start_str, const char *end_str);
+void wifi_portal_get_work_hours_min(int *start_min, int *end_min);
+
+/** OTA: tat web server SoftAP de giai phong socket/RAM (giu WiFi STA). */
+void wifi_portal_httpd_stop(void);
+/** OTA fail: bat lai web server. */
+esp_err_t wifi_portal_httpd_start(void);
+

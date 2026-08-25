@@ -1,0 +1,81 @@
+# Bảng phân vùng tùy chỉnh
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+# Flash 16MB: factory trong partitions.csv = 3MiB (đủ đệm app LVGL); spiffs 1MiB.
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
+
+# ── Octal SPI PSRAM (SPIRAM) ───────────────────────────────────────────────
+# N16R8 có PSRAM trên chip; board USB/DevKit **không phải** module đó → vẫn báo "PSRAM not connected".
+# IGNORE_NOTFOUND: không abort — chạy RAM nội nếu init PSRAM lỗi (log cảnh báo).
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_IGNORE_NOTFOUND=y
+CONFIG_SPIRAM_SPEED_80M=y
+# USE_MALLOC: malloc lon → PSRAM; chi giu Internal cho DMA/WiFi nho.
+CONFIG_SPIRAM_USE_MALLOC=y
+# CONFIG_SPIRAM_USE_CAPS_ALLOC is not set
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+# Chi alloc <= 1KB uu tien Internal — con lai dung PSRAM.
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=1024
+# Pool Internal cho DMA / descriptor / buffer he thong.
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=32768
+# Cho phep EXT_RAM_BSS_ATTR (PCM audio, …) nam trong PSRAM.
+CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
+# Code/rodata chay tu PSRAM — bot tranh bus flash voi LCD SPI → UI muot hon.
+CONFIG_SPIRAM_FETCH_INSTRUCTIONS=y
+CONFIG_SPIRAM_RODATA=y
+
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=32
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=32
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=10
+
+# LVGL: moi alloc widget → PSRAM (lv_psram_mem.h).
+CONFIG_LV_MEM_CUSTOM=y
+CONFIG_LV_MEM_CUSTOM_INCLUDE="lv_psram_mem.h"
+CONFIG_LV_MEM_BUF_MAX_NUM=32
+CONFIG_LV_LAYER_SIMPLE_BUF_SIZE=49152
+CONFIG_LV_IMG_CACHE_DEF_SIZE=8
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=10240
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=15
+# LV_COLOR_16_SWAP: tắt — driver ili9488 đã xử lý đúng thứ tự byte qua BOARD_LCD_COLOR_PIPELINE_BGR.
+# Bật đồng thời cả hai gây "double swap" → màu bị lệch (xanh → vàng/xanh lá).
+# CONFIG_LV_COLOR_16_SWAP is not set
+
+# Azure IoT Hub vẫn có hub dùng chuỗi Baltimore/DigiCert cũ — bật thêm CA deprecated
+# trong bundle để esp_crt_bundle_attach verify được (tránh PK verify failed / -0x3000).
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEPRECATED_LIST=y
+
+# TLS Azure MQTT: sau "Certificate verified" handshake có thể fail -0x2880 (X509_ALLOC_FAILED)
+# / Dynamic Impl alloc failed do heap nội bộ thấp (~30KB free sau WiFi+UI).
+# DYNAMIC_BUFFER + EXTERNAL_MEM_ALLOC: buffer TLS lấy từ PSRAM (8MB), giữ internal cho DMA/WiFi.
+CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
+CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
+# CONFIG_MBEDTLS_INTERNAL_MEM_ALLOC is not set
+# CONFIG_MBEDTLS_SSL_KEEP_PEER_CERTIFICATE is not set
+
+# Man hinh 2.8": GMT028 (mac dinh) hoac ILI9341 legacy — doi trong menuconfig "Man hinh LCD"
+CONFIG_LCD_PANEL_GMT028_28=y
+# CONFIG_LCD_PANEL_ILI9341_LEGACY_28 is not set
+
+# Cho phép cập nhật firmware qua giao thức HTTP thường
+CONFIG_OTA_ALLOW_HTTP=y
+CONFIG_ESP_HTTPS_OTA_ALLOW_HTTP=y
+
+# I2S ISR trong IRAM — tranh cache disable khi flash/PSRAM → bot underrun loa.
+CONFIG_I2S_ISR_IRAM_SAFE=y
+# Cho phep nhieu FILE* SD song song (audio fread + UI doc anh).
+CONFIG_FATFS_FS_LOCK=4
+
+# SNTP: dong bo gio ngay khi co WiFi (khong delay ngau nhien, nhieu may chu, NTP tu DHCP)
+CONFIG_LWIP_SNTP_MAX_SERVERS=3
+CONFIG_LWIP_DHCP_GET_NTP_SRV=y
+# CONFIG_LWIP_SNTP_STARTUP_DELAY is not set
+
+# Tang stack cho sys_evt (event loop) de tranh stack overflow khi nhan IP / WiFi event
+CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096
+CONFIG_SYSTEM_EVENT_TASK_STACK_SIZE=4096
+
+# Co che chong treo / rollback OTA tu dong neu firmware moi bi reset/crash lien tuc
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+
