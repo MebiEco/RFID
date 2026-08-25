@@ -216,8 +216,12 @@
 #error "BOARD_LCD_PANEL_ID: chi ho tro 1 (GMT028) hoac 2 (legacy 2.8)"
 #endif
 #define BOARD_LCD_SPI_MODE 0
-/** 40 dong/chunk: flush man muot hon (buffer DMA ~25KB/buf — Internal). */
-#define BOARD_LCD_SPI_CHUNK_LINES 40
+/**
+ * So dong/chunk SPI LCD (= kich thuoc LVGL draw buf + max_transfer).
+ * 4 (~2.5KB): an toan DMA nhung man cham. 16 (~10KB): man muot hon, van vua Internal.
+ * Truoc day tung 32–40 khi Internal con nhieu; portal/list da chuyen PSRAM nen 16 OK.
+ */
+#define BOARD_LCD_SPI_CHUNK_LINES 16
 #define BOARD_LCD_POST_DISPON_DELAY_MS 80
 
 /**

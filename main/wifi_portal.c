@@ -7,6 +7,7 @@
 #include <sys/time.h>
 #include <time.h>
 
+#include "esp_attr.h"
 #include "esp_event.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
@@ -170,14 +171,14 @@ void wifi_list_get_item(int idx, char *ssid, char *pass) {
 #define AP_SSID "Defuafl-AP"
 #define AP_PASS "12345678"
 #define AP_CHANNEL 1
-#define AP_MAX_CONN 4
+#define AP_MAX_CONN 2 /* SoftAP it client — bot Internal khi bat APSTA */
 
 /** Tu kiem tra portal; chi restart httpd khi mat phan hoi (khong reboot ESP). */
 #define PORTAL_HEALTH_INTERVAL_SEC      3600
 #define PORTAL_HEALTH_INITIAL_DELAY_SEC  600
 #define PORTAL_HEALTH_FAIL_RESTART       1
 /* LWIP_MAX_SOCKETS=10 → httpd can dung toi da 7 (7+3 noi bo). */
-#define PORTAL_HTTP_MAX_SOCKETS           7
+#define PORTAL_HTTP_MAX_SOCKETS           2 /* 1 trang + 1 API; bot LWIP Internal */
 
 static httpd_handle_t s_server;
 static bool s_sntp_started;
@@ -798,7 +799,8 @@ typedef struct {
     wifi_ap_record_t aps[WIFI_SCAN_CACHE_MAX];
 } wifi_scan_cache_t;
 
-static wifi_scan_cache_t s_wifi_scan;
+/* ~3.5KB AP cache — PSRAM BSS, khong can DMA. */
+static EXT_RAM_BSS_ATTR wifi_scan_cache_t s_wifi_scan;
 
 static void wifi_scan_cache_fill(void)
 {
@@ -1037,7 +1039,8 @@ static esp_err_t start_httpd(void)
 {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     /* Gioi han URI/header: ESP-IDF 5.3 chi co CONFIG_HTTPD_MAX_* trong sdkconfig (khong co field trong httpd_config_t). */
-    cfg.stack_size = 10240;
+    cfg.task_priority = 3; /* Thap hon rfid(10) / mqtt(6) / azure(5) — uu tien quet+gui */
+    cfg.stack_size = 8192; /* 6KB de stack overflow khi browser load portal + API song song */
     /* Stack httpd phai nam o INTERNAL RAM (DRAM) de an toan khi ghi Flash / OTA (tranh loi s_task_stack_is_sane_when_cache_frozen). */
     cfg.task_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
     cfg.lru_purge_enable = true;
@@ -1319,6 +1322,53 @@ static void time_synced_cb(struct timeval *tv)
     app_azure_notify_sntp_synced();
 }
 
+/** SoftAP + STA (APSTA) an manh Internal. Khi STA da co IP: chi STA — portal qua LAN. */
+static void wifi_ap_config_fill(wifi_config_t *ap)
+{
+    memset(ap, 0, sizeof(*ap));
+    copy_field((char *)ap->ap.ssid, sizeof(ap->ap.ssid), AP_SSID);
+    ap->ap.ssid_len = (uint8_t)strlen(AP_SSID);
+    ap->ap.channel = AP_CHANNEL;
+    ap->ap.max_connection = AP_MAX_CONN;
+    copy_field((char *)ap->ap.password, sizeof(ap->ap.password), AP_PASS);
+    ap->ap.authmode = WIFI_AUTH_WPA2_PSK;
+}
+
+static void wifi_prefer_sta_only(void)
+{
+    wifi_mode_t mode = WIFI_MODE_NULL;
+    if (esp_wifi_get_mode(&mode) == ESP_OK && mode == WIFI_MODE_STA) {
+        return;
+    }
+    esp_err_t e = esp_wifi_set_mode(WIFI_MODE_STA);
+    if (e != ESP_OK) {
+        ESP_LOGW(TAG, "Tat SoftAP (MODE_STA) fail: %s", esp_err_to_name(e));
+        return;
+    }
+    ESP_LOGI(TAG, "STA OK — SoftAP tat (nhả Internal). Portal: IP LAN");
+}
+
+static void wifi_enable_apsta_fallback(void)
+{
+    wifi_mode_t mode = WIFI_MODE_NULL;
+    if (esp_wifi_get_mode(&mode) == ESP_OK && mode == WIFI_MODE_APSTA) {
+        return;
+    }
+    wifi_config_t ap;
+    wifi_ap_config_fill(&ap);
+    esp_err_t e = esp_wifi_set_mode(WIFI_MODE_APSTA);
+    if (e != ESP_OK) {
+        ESP_LOGW(TAG, "Bat APSTA fail: %s", esp_err_to_name(e));
+        return;
+    }
+    e = esp_wifi_set_config(WIFI_IF_AP, &ap);
+    if (e != ESP_OK) {
+        ESP_LOGW(TAG, "AP config fail: %s", esp_err_to_name(e));
+        return;
+    }
+    ESP_LOGI(TAG, "STA mat — SoftAP bat lai (%s / 192.168.4.1)", AP_SSID);
+}
+
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *ev)
 {
     (void)arg;
@@ -1329,6 +1379,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
         int reason = d ? (int)d->reason : -1;
         ESP_LOGW(TAG, "STA mat ket noi, reason=%d", reason);
         s_wifi_conn_status = WIFI_STATUS_FAIL;
+        wifi_enable_apsta_fallback();
         schedule_sta_reconnect();
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         s_sta_reconnect_count = 0;
@@ -1343,6 +1394,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
         if (s_sta_netif) {
             esp_netif_set_default_netif(s_sta_netif);
         }
+        wifi_prefer_sta_only();
         /* Co RTC van van chay SNTP de hieu chinh + ghi nguoc DS3231. */
         sntp_start_or_restart();
         if (!s_time_synced) {
@@ -1373,13 +1425,8 @@ esp_err_t wifi_portal_start(void)
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL));
 
-    wifi_config_t ap = {0};
-    copy_field((char *)ap.ap.ssid, sizeof(ap.ap.ssid), AP_SSID);
-    ap.ap.ssid_len = (uint8_t)strlen(AP_SSID);
-    ap.ap.channel = AP_CHANNEL;
-    ap.ap.max_connection = AP_MAX_CONN;
-    copy_field((char *)ap.ap.password, sizeof(ap.ap.password), AP_PASS);
-    ap.ap.authmode = WIFI_AUTH_WPA2_PSK;
+    wifi_config_t ap;
+    wifi_ap_config_fill(&ap);
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap));

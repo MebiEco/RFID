@@ -31,7 +31,6 @@
 #include "app_ota.h"
 #include "wifi_portal.h"
 #include "scan_log.h"
-#include "esp_app_desc.h"
 
 /** CA gốc Azure IoT Hub (Baltimore + DigiCert G2 + MS RSA 2017) — nhúng từ azure_iot_ca.pem. */
 extern const uint8_t azure_iot_ca_pem_start[] asm("_binary_azure_iot_ca_pem_start");
@@ -41,15 +40,6 @@ extern const uint8_t azure_iot_ca_pem_end[] asm("_binary_azure_iot_ca_pem_end");
 extern void lcd_ui_invalidate_card_cache(void);
 
 static const char *TAG = "azure_iot";
-
-static const char *azure_get_fw_version(void)
-{
-    const esp_app_desc_t *app = esp_app_get_description();
-    if (app && app->version[0]) {
-        return app->version;
-    }
-    return "0.0.0";
-}
 
 /** 2020-01-01 UTC — duoi nguong nay = chua NTP / epoch sai, khong gui backend. */
 #define AZURE_TS_MIN_UTC 1577836800LL
@@ -88,6 +78,9 @@ static void trim_inplace(char *s)
     s[n] = '\0';
 }
 
+static void azure_note_publish(int msg_id, const char *payload);
+static const char *azure_lookup_publish(int msg_id);
+
 /** Tra loi Direct Method Azure IoT Hub (HTTP status trong topic). Tra ve msg_id publish (PUBACK). */
 static int azure_dm_response(esp_mqtt_client_handle_t client, const char *rid, int status_code,
                              const char *json_payload)
@@ -97,7 +90,9 @@ static int azure_dm_response(esp_mqtt_client_handle_t client, const char *rid, i
     }
     char res_topic[160];
     snprintf(res_topic, sizeof(res_topic), "$iothub/methods/res/%d/?$rid=%s", status_code, rid);
-    return esp_mqtt_client_publish(client, res_topic, json_payload, 0, 1, 0);
+    int mid = esp_mqtt_client_publish(client, res_topic, json_payload, 0, 1, 0);
+    azure_note_publish(mid, json_payload);
+    return mid;
 }
 
 #define NVS_NS "wifi_portal"
@@ -114,7 +109,8 @@ typedef struct __attribute__((packed)) {
 } wifi_cred_t; 
 
 static esp_mqtt_client_handle_t s_mqtt_client    = NULL;
-static bool        s_azure_connected  = false;
+static volatile bool s_azure_connected  = false;
+static volatile int  s_azure_tx_busy    = 0;
 static volatile bool s_flush_requested = false; /* flag: azure_task se flush queue khi co mang */
 static volatile bool s_azure_config_reload = false;
 static volatile bool s_azure_ota_suspend = false; /* OTA: khong reconnect MQTT */
@@ -163,6 +159,37 @@ static uint32_t s_mqtt_disc_count = 0;         /* dem ngat trong cua so 2 phut *
 #define AZURE_PEND_SD_FILE  "/sdcard/az_pend.bin"
 #define AZURE_PEND_SD_TMP   "/sdcard/az_pend.tmp"
 
+/** Cache payload theo MQTT msg_id — PUBACK log lai noi dung da gui. */
+#define AZURE_PUB_TRACE_MAX 8
+#define AZURE_PUB_TRACE_PAYLOAD 384
+typedef struct {
+    int msg_id;
+    char payload[AZURE_PUB_TRACE_PAYLOAD];
+} azure_pub_trace_t;
+static azure_pub_trace_t s_pub_trace[AZURE_PUB_TRACE_MAX];
+static uint8_t s_pub_trace_i;
+
+static void azure_note_publish(int msg_id, const char *payload)
+{
+    if (msg_id < 0 || !payload || !payload[0]) {
+        return;
+    }
+    azure_pub_trace_t *t = &s_pub_trace[s_pub_trace_i % AZURE_PUB_TRACE_MAX];
+    s_pub_trace_i++;
+    t->msg_id = msg_id;
+    snprintf(t->payload, sizeof(t->payload), "%s", payload);
+}
+
+static const char *azure_lookup_publish(int msg_id)
+{
+    for (int i = 0; i < AZURE_PUB_TRACE_MAX; i++) {
+        if (s_pub_trace[i].msg_id == msg_id && s_pub_trace[i].payload[0]) {
+            return s_pub_trace[i].payload;
+        }
+    }
+    return NULL;
+}
+
 static void sd_pend_init(void);
 static int flush_pending_queue(esp_mqtt_client_handle_t client, const char *dev_id);
 static bool azure_pend_has_data(void);
@@ -202,16 +229,17 @@ static int azure_publish_event_entry(esp_mqtt_client_handle_t client, const char
     static char payload[448];
     snprintf(payload, sizeof(payload),
              "{\"Code\":%d,\"Index\":%ld,\"TimeStamp\":%lld,\"Data\":{\"DeviceName\":\"RFID_Scanner\","
-             "\"UID\":\"%s\",\"Name\":\"%s\",\"ID\":\"%s\",\"Version\":\"%s\"}}",
-             ent->event_code, (long)ent->index, (long long)ts, ent->uid, ent->name, ent->id,
-             azure_get_fw_version());
+             "\"UID\":\"%s\",\"Name\":\"%s\",\"ID\":\"%s\"}}",
+             ent->event_code, (long)ent->index, (long long)ts, ent->uid, ent->name, ent->id);
 
     int pub_ret = esp_mqtt_client_publish(client, topic, payload, 0, 1, 0);
     if (pub_ret < 0) {
         ESP_LOGW(TAG, "Replay publish loi code=%d index=%ld", ent->event_code, (long)ent->index);
         return -1;
     }
-    ESP_LOGI(TAG, "Replay tu log: code=%d index=%ld uid=%s", ent->event_code, (long)ent->index, ent->uid);
+    azure_note_publish(pub_ret, payload);
+    ESP_LOGI(TAG, "Replay tu log: code=%d index=%ld uid=%s msg_id=%d", ent->event_code, (long)ent->index, ent->uid,
+             pub_ret);
     return 0;
 }
 
@@ -674,9 +702,9 @@ static int flush_pending_queue(esp_mqtt_client_handle_t client, const char *dev_
         static char payload[448];
         snprintf(payload, sizeof(payload),
                  "{\"Code\":%d,\"Index\":%ld,\"TimeStamp\":%lld,\"Data\":{\"DeviceName\":\"RFID_Scanner\","
-                 "\"UID\":\"%s\",\"Name\":\"%s\",\"ID\":\"%s\",\"Version\":\"%s\"}}",
+                 "\"UID\":\"%s\",\"Name\":\"%s\",\"ID\":\"%s\"}}",
                  (int)rec.event_code, (long)rec.index, (long long)rec.timestamp_utc,
-                 rec.uid, rec.name, rec.id, azure_get_fw_version());
+                 rec.uid, rec.name, rec.id);
 
         int pub_ret = esp_mqtt_client_publish(client, topic, payload, 0, 1, 0);
         if (pub_ret < 0) {
@@ -690,6 +718,7 @@ static int flush_pending_queue(esp_mqtt_client_handle_t client, const char *dev_
             xSemaphoreGive(s_sd_pend_mtx);
             continue;
         }
+        azure_note_publish(pub_ret, payload);
         total_flushed++;
         /* Tăng delay lên 500ms để thẻ SD và bus SPI có thời gian nghỉ, nhường cho task RFID */
         vTaskDelay(pdMS_TO_TICKS(500));
@@ -1233,9 +1262,15 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         azure_log_mqtt_error(event, uptime);
         break;
     }
-    case MQTT_EVENT_PUBLISHED:
-        ESP_LOGI(TAG, "MQTT_EVENT_PUBLISHED, msg_id=%d - Azure da xac nhan nhan tin nhan (QoS 1 PUBACK)", event->msg_id);
+    case MQTT_EVENT_PUBLISHED: {
+        const char *body = azure_lookup_publish(event->msg_id);
+        if (body) {
+            ESP_LOGI(TAG, "MQTT_EVENT_PUBLISHED msg_id=%d PUBACK — da gui: %s", event->msg_id, body);
+        } else {
+            ESP_LOGI(TAG, "MQTT_EVENT_PUBLISHED msg_id=%d — Azure PUBACK (khong con cache payload)", event->msg_id);
+        }
         break;
+    }
     default:
         break;
     }
@@ -1325,8 +1360,8 @@ static void azure_task(void *arg)
                 },
                 .task = {
                     .priority = 6,
-                    /* MQTT task van Internal — giu vua phai; azure_task (SPIRAM) lo phan nang. */
-                    .stack_size = 12288,
+                    /* MQTT task Internal — 8KB du keepalive; azure_task (SPIRAM) lo phan nang. */
+                    .stack_size = 8192,
                 },
             };
 
@@ -1513,11 +1548,13 @@ void app_azure_send_telemetry(const char *uid, const char *name, const char *id,
 
     char payload[384];
     snprintf(payload, sizeof(payload),
-             "{\"Code\":%d,\"Index\":%ld,\"TimeStamp\":%lld,\"Data\":{\"DeviceName\":\"RFID_Scanner\",\"UID\":\"%s\",\"Name\":\"%s\",\"ID\":\"%s\",\"Version\":\"%s\"}}",
-             code_val, (long)msg_idx, (long long)now, uid, name ? name : "", id ? id : "",
-             azure_get_fw_version());
+             "{\"Code\":%d,\"Index\":%ld,\"TimeStamp\":%lld,\"Data\":{\"DeviceName\":\"RFID_Scanner\",\"UID\":\"%s\",\"Name\":\"%s\",\"ID\":\"%s\"}}",
+             code_val, (long)msg_idx, (long long)now, uid, name ? name : "", id ? id : "");
 
+    app_azure_tx_busy_begin();
     int pub_id = esp_mqtt_client_publish(s_mqtt_client, topic, payload, 0, 1, 0);
+    app_azure_tx_busy_end();
+    azure_note_publish(pub_id, payload);
     ESP_LOGI(TAG, "Da day telemetry len Azure (msg_id=%d, index=%ld): %s", pub_id, (long)msg_idx, payload);
 }
 
@@ -1560,11 +1597,13 @@ void app_azure_send_card_event(const char *uid, const char *name, const char *id
 
     char payload[384];
     snprintf(payload, sizeof(payload),
-             "{\"Code\":%d,\"Index\":%ld,\"TimeStamp\":%lld,\"Data\":{\"DeviceName\":\"RFID_Scanner\",\"UID\":\"%s\",\"Name\":\"%s\",\"ID\":\"%s\",\"Version\":\"%s\"}}",
-             event_code, (long)msg_idx, (long long)now, uid, name ? name : "", id ? id : "",
-             azure_get_fw_version());
+             "{\"Code\":%d,\"Index\":%ld,\"TimeStamp\":%lld,\"Data\":{\"DeviceName\":\"RFID_Scanner\",\"UID\":\"%s\",\"Name\":\"%s\",\"ID\":\"%s\"}}",
+             event_code, (long)msg_idx, (long long)now, uid, name ? name : "", id ? id : "");
 
+    app_azure_tx_busy_begin();
     int pub_id = esp_mqtt_client_publish(s_mqtt_client, topic, payload, 0, 1, 0);
+    app_azure_tx_busy_end();
+    azure_note_publish(pub_id, payload);
     ESP_LOGI(TAG, "Da day event %d len Azure (msg_id=%d, index=%ld): %s", event_code, pub_id, (long)msg_idx, payload);
 }
 
@@ -1584,6 +1623,7 @@ int app_azure_resend_range(int code, int32_t start_idx, int32_t end_idx)
         const char *dev_id;
     } rctx = { .client = s_mqtt_client, .dev_id = cred.azure_dev };
 
+    app_azure_tx_busy_begin();
     while (current <= end_idx) {
         scan_log_sync_filter_t filt;
         memset(&filt, 0, sizeof(filt));
@@ -1600,7 +1640,25 @@ int app_azure_resend_range(int code, int32_t start_idx, int32_t end_idx)
             total_resent += st.resent;
         }
     }
+    app_azure_tx_busy_end();
     return total_resent;
+}
+
+void app_azure_tx_busy_begin(void)
+{
+    s_azure_tx_busy++;
+}
+
+void app_azure_tx_busy_end(void)
+{
+    if (s_azure_tx_busy > 0) {
+        s_azure_tx_busy--;
+    }
+}
+
+bool app_azure_tx_busy(void)
+{
+    return s_azure_tx_busy > 0;
 }
 
 int app_azure_is_connected(void)

@@ -766,7 +766,12 @@ static void disp_flush(lv_disp_drv_t * disp_drv, const lv_area_t * area, lv_colo
 #endif
     esp_err_t dr = lcd_ui_draw_bitmap_sync(s_panel, area->x1, area->y1, area->x2 + 1, area->y2 + 1, color_p);
     if (dr != ESP_OK) {
-        ESP_LOGW(TAG, "disp_flush: %s", esp_err_to_name(dr));
+        static int s_flush_err_log;
+        if ((s_flush_err_log++ % 50) == 0) {
+            ESP_LOGW(TAG, "disp_flush: %s (free_int=%u largest_dma=%u)", esp_err_to_name(dr),
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
+        }
         vTaskDelay(pdMS_TO_TICKS(2));
     }
     if (s_lvgl_wdt_ok) {
@@ -1014,7 +1019,7 @@ void lv_port_init(esp_lcd_panel_handle_t panel)
     g_last_activity_us = esp_timer_get_time();
 
 
-    /* Buffer LVGL: 1 buffer DMA Internal (~25KB) — tiet Internal, UI van on (khong double-buffer). */
+    /* Buffer LVGL: 1 buffer DMA Internal (~10KB voi CHUNK_LINES=16). */
     uint32_t buf_size = BOARD_LCD_H_RES * (uint32_t)BOARD_LCD_SPI_CHUNK_LINES;
     const size_t buf_bytes = buf_size * sizeof(lv_color_t);
     buf1 = heap_caps_malloc(buf_bytes, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
@@ -1062,11 +1067,19 @@ void lv_port_init(esp_lcd_panel_handle_t panel)
     build_idle_screen();
     update_ui_timer_cb(NULL);
 
-    /* Stack 24KB tren SPIRAM — PSRAM con nhieu, UI/JPEG an toan. */
-    BaseType_t ok = xTaskCreatePinnedToCoreWithCaps(lvgl_task, "lvgl_task", 24576, NULL, 5, &s_lvgl_task, 1,
-                                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    /* Stack Internal bat buoc — uu tien 8KB de giu DMA headroom; 12KB chi khi 8KB fail. */
+    BaseType_t ok = xTaskCreatePinnedToCoreWithCaps(lvgl_task, "lvgl_task", 8192, NULL, 5, &s_lvgl_task, 1,
+                                                    MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (ok != pdPASS) {
-        xTaskCreatePinnedToCore(lvgl_task, "lvgl_task", 24576, NULL, 5, &s_lvgl_task, 1);
+        ESP_LOGW(TAG, "lvgl_task Internal 8KB fail — thu 12KB");
+        ok = xTaskCreatePinnedToCoreWithCaps(lvgl_task, "lvgl_task", 12288, NULL, 5, &s_lvgl_task, 1,
+                                            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
+    if (ok != pdPASS) {
+        ESP_LOGE(TAG, "lvgl_task: khong du Internal cho stack (free_int=%u largest_dma=%u) — bo UI task",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
+        s_lvgl_task = NULL;
     }
 }
 

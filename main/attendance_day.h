@@ -13,5 +13,5 @@
 #include "esp_err.h"
 #include "esp_http_server.h"
 
-/** Gửi JSON attendance overview (chunked). Caller đã auth. */
+/** Gửi JSON attendance overview (chunked HTTP; SD doc tu EOF). Caller đã auth. */
 esp_err_t attendance_day_send_overview_json(httpd_req_t *req);

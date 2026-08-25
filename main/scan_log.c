@@ -12,6 +12,7 @@
 #include "board_pins.h"
 #include "lcd_ui.h"
 #include "esp_http_server.h"
+#include "esp_attr.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
@@ -20,6 +21,8 @@
 #include "sd_card.h"
 #include "esp_task_wdt.h"
 #include "lv_port.h"
+#include "portal_web.h"
+#include "app_rfid.h"
 #include <sys/stat.h>
 
 static const char *TAG = "scan_log";
@@ -78,10 +81,10 @@ typedef struct {
 } scan_pend_blob_t;
 
 /**
- * Blob ~4.2KB — khong dat tren stack (task main chi ~3584 byte mac dinh).
- * Dung buffer tinh + mutex vi rfid_task va main deu goi enqueue/flush.
+ * Blob ~4.2KB — PSRAM BSS (khong DMA). Giai phong Internal cho LCD/SD.
+ * Mutex vi rfid_task va main deu goi enqueue/flush.
  */
-static scan_pend_blob_t s_pend_blob;
+static EXT_RAM_BSS_ATTR scan_pend_blob_t s_pend_blob;
 static SemaphoreHandle_t s_pend_mtx;
 
 static void pend_mtx_take(void)
@@ -706,8 +709,10 @@ typedef struct {
     char to_ymd[11];
 } scan_log_json_query_t;
 
-/** Gioi han khi sap xep theo index/ma NV (can buffer RAM). */
-#define SCAN_LOG_SORT_BUF_MAX 1000
+/** Gioi han khi sap xep theo index/ma NV (PSRAM). Truoc 1000 ≈ 300KB — de Internal chet. */
+#define SCAN_LOG_SORT_BUF_MAX 200
+/** Toi da dong/trang portal — bot JSON + RAM httpd. */
+#define SCAN_LOG_PAGE_LIMIT_MAX 30
 
 typedef struct {
     char ts[80];
@@ -908,7 +913,7 @@ static void scan_log_json_parse_query(httpd_req_t *req, scan_log_json_query_t *q
 {
     memset(q, 0, sizeof(*q));
     q->type_code = -1;
-    q->limit = 50;
+    q->limit = 30;
     q->page = 1;
     q->sort_mode = SCAN_LOG_SORT_TIME_DESC;
 
@@ -955,7 +960,7 @@ static void scan_log_json_parse_query(httpd_req_t *req, scan_log_json_query_t *q
     }
     if (httpd_query_key_value(query, "limit", v, sizeof(v)) == ESP_OK) {
         int n = atoi(v);
-        if (n > 0 && n <= 200) {
+        if (n > 0 && n <= SCAN_LOG_PAGE_LIMIT_MAX) {
             q->limit = n;
         }
     }
@@ -1245,9 +1250,196 @@ static void scan_log_page_range(const scan_log_json_query_t *jq, int total_match
     }
 }
 
+
+/**
+ * TIME_DESC: doc 1 cua so co dinh tu EOF (PSRAM).
+ * - Du match trong cua so → nhanh, khong quet ca file.
+ * - Thieu match ma chua cham dau file → -1 (fallback full-scan).
+ * - covered_all chi khi start == 0.
+ * page_rows: cu → moi.
+ */
+/* Cua so nho + mo rong khi thieu — tranh fread 128KB (SPI bounce lau, Internal bi WiFi/TLS can kip). */
+#define SCAN_LOG_TAIL_WIN_START (8 * 1024)
+#define SCAN_LOG_TAIL_WIN_MAX   (48 * 1024)
+#define SCAN_LOG_TAIL_MAX_NEED  300
+
+/**
+ * Doc tu EOF: cua so PSRAM nho, duyet dong moi→cu, dung ngay khi du `need` match.
+ * Tra ve so dong trang; -1 = can fallback full-scan.
+ */
+static int scan_log_fill_page_from_tail(FILE *fp, const scan_log_json_query_t *jq, bool time_ok,
+                                        const char *today_ymd, scan_log_stored_row_t *page_rows, int page_cap,
+                                        int *total_out)
+{
+    if (total_out) {
+        *total_out = 0;
+    }
+    if (!fp || !jq || !page_rows || page_cap <= 0) {
+        return 0;
+    }
+    if (fseek(fp, 0, SEEK_END) != 0) {
+        return 0;
+    }
+    long fsz = ftell(fp);
+    if (fsz <= 0) {
+        return 0;
+    }
+
+    const int need = jq->page * page_cap;
+    if (need <= 0 || need > SCAN_LOG_TAIL_MAX_NEED) {
+        return -1;
+    }
+
+    scan_log_stored_row_t *newest = (scan_log_stored_row_t *)heap_caps_calloc(
+        (size_t)need, sizeof(scan_log_stored_row_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!newest) {
+        return -1;
+    }
+
+    size_t win = (size_t)SCAN_LOG_TAIL_WIN_START;
+    if ((long)win > fsz) {
+        win = (size_t)fsz;
+    }
+    int got = 0;
+    bool covered_all = false;
+    size_t used_win = win;
+
+    while (1) {
+        lv_port_feed_wdt();
+        /* Quet the dang cho SD / dang xu ly — nhường ngay, khong mo rong cua so. */
+        if (app_rfid_swipe_busy() || sd_card_service_waiting() || app_azure_tx_busy()) {
+            free(newest);
+            ESP_LOGW(TAG, "log tail abort — uu tien quet/Azure");
+            return -2;
+        }
+        long start = fsz - (long)win;
+        if (start < 0) {
+            start = 0;
+        }
+        covered_all = (start == 0);
+        size_t n = (size_t)(fsz - start);
+        used_win = n;
+
+        char *buf = (char *)heap_caps_malloc(n + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!buf) {
+            free(newest);
+            return -1;
+        }
+        if (fseek(fp, start, SEEK_SET) != 0 || fread(buf, 1, n, fp) != n) {
+            free(buf);
+            free(newest);
+            return -1;
+        }
+        buf[n] = '\0';
+
+        char *body = buf;
+        if (start > 0) {
+            char *nl = strchr(buf, '\n');
+            if (!nl) {
+                free(buf);
+                if (covered_all) {
+                    got = 0;
+                    break;
+                }
+                goto expand_win;
+            }
+            body = nl + 1;
+        }
+
+        /* Thu thap con tro dong, duyet moi → cu, dung khi du need. */
+        int max_lines = (int)(n / 40) + 8;
+        if (max_lines < 32) {
+            max_lines = 32;
+        }
+        char **lines = (char **)heap_caps_malloc((size_t)max_lines * sizeof(char *), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!lines) {
+            free(buf);
+            free(newest);
+            return -1;
+        }
+        int nlines = 0;
+        char *line = body;
+        while (line && *line && nlines < max_lines) {
+            char *nl = strchr(line, '\n');
+            lines[nlines++] = line;
+            if (!nl) {
+                break;
+            }
+            *nl = '\0';
+            line = nl + 1;
+        }
+
+        got = 0;
+        for (int i = nlines - 1; i >= 0 && got < need; i--) {
+            scan_log_parsed_row_t row;
+            char linebuf[384];
+            snprintf(linebuf, sizeof(linebuf), "%s", lines[i]);
+            if (scan_log_parse_csv_line(linebuf, &row) &&
+                scan_log_row_matches_query(&row, jq, time_ok, today_ymd)) {
+                scan_log_store_row(&row, &newest[got++]);
+            }
+            if ((i & 31) == 0) {
+                lv_port_feed_wdt();
+            }
+        }
+        free(lines);
+        free(buf);
+
+        if (got >= need || covered_all) {
+            break;
+        }
+expand_win:
+        if (win >= (size_t)SCAN_LOG_TAIL_WIN_MAX || (long)win >= fsz) {
+            free(newest);
+            ESP_LOGI(TAG, "log tail miss need=%d got=%d win=%u — fallback full", need, got, (unsigned)used_win);
+            return -1;
+        }
+        win *= 2;
+        if (win > (size_t)SCAN_LOG_TAIL_WIN_MAX) {
+            win = (size_t)SCAN_LOG_TAIL_WIN_MAX;
+        }
+        if ((long)win > fsz) {
+            win = (size_t)fsz;
+        }
+    }
+
+    /* newest[0]=moi nhat … page: cu→moi trong trang (portal reverse khi desc). */
+    int start_i = (jq->page - 1) * page_cap;
+    int page_count = 0;
+    if (start_i < got) {
+        int end_i = got < start_i + page_cap ? got : start_i + page_cap;
+        for (int i = end_i - 1; i >= start_i; i--) {
+            page_rows[page_count++] = newest[i];
+        }
+    }
+    free(newest);
+
+    if (total_out) {
+        int base = (jq->page - 1) * page_cap + page_count;
+        if (!covered_all && got >= need) {
+            *total_out = jq->page * page_cap + 1;
+        } else {
+            *total_out = base;
+        }
+    }
+    ESP_LOGI(TAG, "log tail-win=%u need=%d got=%d page=%d/%d covered=%d",
+             (unsigned)used_win, need, got, page_count, page_cap, (int)covered_all);
+    return page_count;
+}
+
 esp_err_t scan_log_send_json(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "application/json; charset=utf-8");
+    httpd_resp_set_hdr(req, "Connection", "close");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+
+    if (portal_reject_heavy_if_busy(req)) {
+        return ESP_OK;
+    }
+
+    const uint32_t free_int0 = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    const uint32_t dma0 = heap_caps_get_largest_free_block(MALLOC_CAP_DMA);
+    ESP_LOGI(TAG, "api/log begin free_int=%u dma=%u", (unsigned)free_int0, (unsigned)dma0);
 
     if (!sd_card_is_mounted()) {
         return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"SD chua mount\",\"rows\":[]}");
@@ -1263,58 +1455,137 @@ esp_err_t scan_log_send_json(httpd_req_t *req)
     scan_log_json_query_t jq;
     scan_log_json_parse_query(req, &jq, time_ok, today_ymd);
 
-    sd_card_lock();
-    FILE *fp = fopen(BOARD_SD_RFID_LOG_PATH, "r");
-    if (!fp) {
-        sd_card_unlock();
-        return httpd_resp_sendstr(req, "{\"ok\":true,\"rows\":[]}");
+    const bool field_sort = scan_log_sort_by_field(jq.sort_mode);
+    const bool time_desc = (!field_sort && jq.sort_mode == SCAN_LOG_SORT_TIME_DESC);
+    const int page_cap = jq.limit > 0 ? jq.limit : 30;
+
+    scan_log_stored_row_t *page_rows = (scan_log_stored_row_t *)heap_caps_calloc(
+        (size_t)page_cap, sizeof(scan_log_stored_row_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!page_rows) {
+        return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"Het PSRAM dem trang log\",\"rows\":[]}");
     }
 
-    const bool field_sort = scan_log_sort_by_field(jq.sort_mode);
     scan_log_stored_row_t *stored = NULL;
     int stored_count = 0;
     int full_filtered = 0;
     bool sort_truncated = false;
+    int total_matched = 0;
+    int page_count = 0;
 
     if (field_sort) {
         stored = (scan_log_stored_row_t *)heap_caps_calloc(
             SCAN_LOG_SORT_BUF_MAX, sizeof(scan_log_stored_row_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         if (!stored) {
-            stored = (scan_log_stored_row_t *)calloc(SCAN_LOG_SORT_BUF_MAX, sizeof(scan_log_stored_row_t));
-        }
-        if (!stored) {
-            fclose(fp);
-            sd_card_unlock();
-            return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"Out of memory\",\"rows\":[]}");
+            free(page_rows);
+            return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"Het PSRAM sort log\",\"rows\":[]}");
         }
     }
 
-    int total_matched = 0;
-    char temp_line[384];
-    while (fgets(temp_line, sizeof(temp_line), fp)) {
-        lv_port_feed_wdt();
-        char buf[384];
-        snprintf(buf, sizeof(buf), "%s", temp_line);
-        scan_log_parsed_row_t row;
-        if (!scan_log_parse_csv_line(buf, &row)) {
-            continue;
+    sd_card_lock();
+    FILE *fp = fopen(BOARD_SD_RFID_LOG_PATH, "r");
+    if (!fp) {
+        sd_card_unlock();
+        free(page_rows);
+        free(stored);
+        return httpd_resp_sendstr(req, "{\"ok\":true,\"rows\":[],\"total\":0,\"page\":1,\"limit\":30}");
+    }
+
+    if (time_desc) {
+        /* Doc cua so tu EOF — dung som khi du trang (mat do cao / file lon). */
+        int n = scan_log_fill_page_from_tail(fp, &jq, time_ok, today_ymd, page_rows, page_cap, &total_matched);
+        if (n == -2) {
+            fclose(fp);
+            sd_card_unlock();
+            free(page_rows);
+            free(stored);
+            return httpd_resp_sendstr(req,
+                                      "{\"ok\":false,\"error\":\"Dang quet the / gui Azure — thu lai sau\",\"rows\":[]}");
         }
-        if (!scan_log_row_matches_query(&row, &jq, time_ok, today_ymd)) {
-            continue;
+        if (n >= 0) {
+            page_count = n;
+        } else {
+            /* Fallback: quet xuoi + ring (page*limit qua lon / het PSRAM). */
+            int ring_i = 0, ring_n = 0;
+            char temp_line[384];
+            rewind(fp);
+            while (fgets(temp_line, sizeof(temp_line), fp)) {
+                lv_port_feed_wdt();
+                char buf[384];
+                snprintf(buf, sizeof(buf), "%s", temp_line);
+                scan_log_parsed_row_t row;
+                if (!scan_log_parse_csv_line(buf, &row) ||
+                    !scan_log_row_matches_query(&row, &jq, time_ok, today_ymd)) {
+                    continue;
+                }
+                total_matched++;
+                scan_log_store_row(&row, &page_rows[ring_i]);
+                ring_i = (ring_i + 1) % page_cap;
+                if (ring_n < page_cap) {
+                    ring_n++;
+                }
+            }
+            page_count = ring_n;
+            if (ring_n == page_cap) {
+                scan_log_stored_row_t *ordered = (scan_log_stored_row_t *)heap_caps_malloc(
+                    (size_t)page_cap * sizeof(scan_log_stored_row_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+                if (ordered) {
+                    for (int i = 0; i < page_cap; i++) {
+                        ordered[i] = page_rows[(ring_i + i) % page_cap];
+                    }
+                    memcpy(page_rows, ordered, (size_t)page_cap * sizeof(scan_log_stored_row_t));
+                    free(ordered);
+                }
+            }
+            /* total_matched = dem full; trang 1 ring = page_cap dong moi nhat */
+            if (jq.page == 1) {
+                /* OK */
+            } else {
+                /* Fallback ring chi dung page 1 — trang >1 can pass 2 */
+                int start_idx = 0, end_idx = 0;
+                scan_log_page_range(&jq, total_matched, &start_idx, &end_idx);
+                page_count = 0;
+                rewind(fp);
+                int current_match = 0;
+                char temp_line2[384];
+                while (fgets(temp_line2, sizeof(temp_line2), fp) && page_count < page_cap) {
+                    lv_port_feed_wdt();
+                    char buf[384];
+                    snprintf(buf, sizeof(buf), "%s", temp_line2);
+                    scan_log_parsed_row_t row;
+                    if (!scan_log_parse_csv_line(buf, &row) ||
+                        !scan_log_row_matches_query(&row, &jq, time_ok, today_ymd)) {
+                        continue;
+                    }
+                    if (current_match < start_idx) {
+                        current_match++;
+                        continue;
+                    }
+                    if (current_match >= end_idx) {
+                        break;
+                    }
+                    scan_log_store_row(&row, &page_rows[page_count++]);
+                    current_match++;
+                }
+            }
         }
-        if (field_sort) {
+    } else if (field_sort) {
+        char temp_line[384];
+        while (fgets(temp_line, sizeof(temp_line), fp)) {
+            lv_port_feed_wdt();
+            char buf[384];
+            snprintf(buf, sizeof(buf), "%s", temp_line);
+            scan_log_parsed_row_t row;
+            if (!scan_log_parse_csv_line(buf, &row) ||
+                !scan_log_row_matches_query(&row, &jq, time_ok, today_ymd)) {
+                continue;
+            }
             full_filtered++;
             if (stored_count < SCAN_LOG_SORT_BUF_MAX) {
                 scan_log_store_row(&row, &stored[stored_count++]);
             } else {
                 sort_truncated = true;
             }
-            continue;
         }
-        total_matched++;
-    }
-
-    if (field_sort) {
         if (full_filtered > SCAN_LOG_SORT_BUF_MAX) {
             sort_truncated = true;
         }
@@ -1330,12 +1601,58 @@ esp_err_t scan_log_send_json(httpd_req_t *req)
         if (stored_count > 1) {
             qsort(stored, (size_t)stored_count, sizeof(scan_log_stored_row_t), cmp_fn);
         }
+        int start_idx = 0, end_idx = 0;
+        scan_log_page_range(&jq, total_matched, &start_idx, &end_idx);
+        for (int i = start_idx; i < end_idx && page_count < page_cap; i++) {
+            page_rows[page_count++] = stored[i];
+        }
+        free(stored);
+        stored = NULL;
+    } else {
+        /* TIME_ASC: dem + pass 2 */
+        char temp_line[384];
+        while (fgets(temp_line, sizeof(temp_line), fp)) {
+            lv_port_feed_wdt();
+            char buf[384];
+            snprintf(buf, sizeof(buf), "%s", temp_line);
+            scan_log_parsed_row_t row;
+            if (!scan_log_parse_csv_line(buf, &row) ||
+                !scan_log_row_matches_query(&row, &jq, time_ok, today_ymd)) {
+                continue;
+            }
+            total_matched++;
+        }
+        int start_idx = 0, end_idx = 0;
+        scan_log_page_range(&jq, total_matched, &start_idx, &end_idx);
+        rewind(fp);
+        int current_match = 0;
+        while (fgets(temp_line, sizeof(temp_line), fp) && page_count < page_cap) {
+            lv_port_feed_wdt();
+            char buf[384];
+            snprintf(buf, sizeof(buf), "%s", temp_line);
+            scan_log_parsed_row_t row;
+            if (!scan_log_parse_csv_line(buf, &row) ||
+                !scan_log_row_matches_query(&row, &jq, time_ok, today_ymd)) {
+                continue;
+            }
+            if (current_match < start_idx) {
+                current_match++;
+                continue;
+            }
+            if (current_match >= end_idx) {
+                break;
+            }
+            scan_log_store_row(&row, &page_rows[page_count++]);
+            current_match++;
+        }
     }
 
-    int start_idx = 0;
-    int end_idx = 0;
-    scan_log_page_range(&jq, total_matched, &start_idx, &end_idx);
-    const int items_to_read = end_idx - start_idx;
+    fclose(fp);
+    sd_card_unlock();
+
+    ESP_LOGI(TAG, "api/log after SD free_int=%u dma=%u page=%d total=%d",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA), page_count, total_matched);
 
     char hdr[224];
     if (field_sort && sort_truncated) {
@@ -1351,68 +1668,33 @@ esp_err_t scan_log_send_json(httpd_req_t *req)
                  time_ok ? "true" : "false", total_matched, jq.page, jq.limit,
                  scan_log_sort_mode_str(jq.sort_mode));
     }
+
     esp_err_t e = httpd_resp_send_chunk(req, hdr, strlen(hdr));
     if (e != ESP_OK) {
-        fclose(fp);
-        free(stored);
-        sd_card_unlock();
+        free(page_rows);
         return e;
     }
 
-    int rows_out = 0;
     bool first = true;
-
-    if (field_sort) {
-        for (int i = start_idx; i < end_idx && rows_out < items_to_read; i++) {
-            e = scan_log_emit_json_stored(req, &stored[i], &first);
-            if (e != ESP_OK) {
-                fclose(fp);
-                free(stored);
-                sd_card_unlock();
-                return e;
-            }
-            rows_out++;
-        }
-    } else {
-        rewind(fp);
-        int current_match = 0;
-        char raw[384];
-        while (fgets(raw, sizeof(raw), fp) && rows_out < items_to_read) {
-            lv_port_feed_wdt();
-            char buf[384];
-            snprintf(buf, sizeof(buf), "%s", raw);
-            scan_log_parsed_row_t row;
-            if (!scan_log_parse_csv_line(buf, &row)) {
-                continue;
-            }
-            if (!scan_log_row_matches_query(&row, &jq, time_ok, today_ymd)) {
-                continue;
-            }
-            if (current_match < start_idx) {
-                current_match++;
-                continue;
-            }
-
-            e = scan_log_emit_json_row(req, &row, &first);
-            if (e != ESP_OK) {
-                fclose(fp);
-                sd_card_unlock();
-                return e;
-            }
-            current_match++;
-            rows_out++;
+    /* TIME_DESC: gui cu→moi trong trang; portal.html se reverse khi sort=desc. */
+    for (int i = 0; i < page_count; i++) {
+        e = scan_log_emit_json_stored(req, &page_rows[i], &first);
+        if (e != ESP_OK) {
+            free(page_rows);
+            return e;
         }
     }
 
-    fclose(fp);
-    free(stored);
-    sd_card_unlock();
-
+    free(page_rows);
     e = httpd_resp_send_chunk(req, "]}", 2);
     if (e != ESP_OK) {
         return e;
     }
-    return httpd_resp_send_chunk(req, NULL, 0);
+    e = httpd_resp_send_chunk(req, NULL, 0);
+    ESP_LOGI(TAG, "api/log done free_int=%u dma=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
+    return e;
 }
 
 void scan_log_append_admin(const char *uid_hex, const char *name, const char *id, const char *action,

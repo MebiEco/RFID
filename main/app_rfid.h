@@ -20,6 +20,14 @@ void app_rfid_start(void);
 /** OTA: tam dung quet the (task van chay, chi sleep). */
 void app_rfid_set_paused(bool paused);
 
+/**
+ * Dang xu ly quet the (log + Azure). Portal API nang phai nhường.
+ * Goi begin ngay khi co the hop le; end sau khi gui/xong audio queue.
+ */
+void app_rfid_swipe_busy_begin(void);
+void app_rfid_swipe_busy_end(void);
+bool app_rfid_swipe_busy(void);
+
 /** PIN NVS: goi mot lan khi boot task UI (truoc khi dang nhap). */
 void app_login_pin_init(void);
 /** Dang nhap: neu da luu PIN trong NVS thi chi khop chuoi luu; neu chua thi chap nhan ADMIN hoac 1234. */

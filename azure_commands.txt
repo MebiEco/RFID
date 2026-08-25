@@ -425,6 +425,10 @@ Payload bat buoc:
   - Url: string, bat buoc, khong rong. Thieu -> 400 Missing Url parameter.
   - URL phai reachable tu mang thiet bi (STA). Nen dung HTTP LAN / HTTPS public
     (tuy cau hinh TLS OTA trong firmware).
+  - Azure Blob SAS: URL co nhieu & — khi goi az CLI / shell PHAI quote payload dung
+    (neu khong, & cat URL → thiet bi nhan URL thieu sig → HTTP 403).
+  - Thiet bi can gio dung (SNTP). SAS co st/se; gio lech → Blob 403 AuthenticationFailed.
+  - Kiem tra tren PC: curl -I "<URL_SAS_DAY_DU>" phai 200 (khong 403).
 
 Phan hoi thanh cong (chap nhan, bat dau download — chua bao OTA xong):
 {

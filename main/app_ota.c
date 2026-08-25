@@ -34,6 +34,7 @@ static const char *TAG = "app_ota";
 
 static volatile bool s_ota_busy;
 static volatile int s_ota_pct = -1;
+static bool s_ota_resources_held_down;
 
 static esp_timer_handle_t s_ota_defer_timer;
 static esp_timer_handle_t s_ota_validate_timer;
@@ -276,14 +277,22 @@ static bool ota_pending_exists(void)
 
 static void ota_release_resources(void)
 {
+    if (s_ota_resources_held_down) {
+        return;
+    }
     ESP_LOGI(TAG, "OTA: dung dich vu khong can thiet (giu httpd)...");
-    app_audio_stop_and_clear();
+    /* Tra DMA I2S ve heap truoc khi tao ota_task Internal. */
+    if (!app_audio_wait_i2s_released(3000)) {
+        ESP_LOGW(TAG, "OTA: I2S chua release het — tiep tuc (co the thieu Internal)");
+    }
     app_audio_pause();
     app_azure_suspend_for_ota();
-    (void)app_azure_wait_suspended(1500);
-    vTaskDelay(pdMS_TO_TICKS(100));
+    (void)app_azure_wait_suspended(2500);
+    vTaskDelay(pdMS_TO_TICKS(200));
     app_rfid_set_paused(true);
     lv_port_suspend_for_ota();
+    vTaskDelay(pdMS_TO_TICKS(50));
+    s_ota_resources_held_down = true;
     ota_log_heap("sau dung dich vu");
 }
 
@@ -293,6 +302,8 @@ static void ota_restore_resources(void)
     lv_port_resume_after_ota();
     app_rfid_set_paused(false);
     app_azure_resume_after_ota();
+    app_audio_resume();
+    s_ota_resources_held_down = false;
     s_ota_pct = -1;
     s_ota_busy = false;
 }
@@ -326,14 +337,26 @@ static void ota_task(void *pvParameter)
 
     ota_release_resources();
 
+    const bool url_is_http = (strncmp(url, "http://", 7) == 0);
+    const bool url_has_sig = (strstr(url, "sig=") != NULL) || (strstr(url, "Signature=") != NULL);
+    const bool url_has_se = (strstr(url, "se=") != NULL);
+    ESP_LOGI(TAG, "OTA URL len=%u http=%d has_sig=%d has_se=%d",
+             (unsigned)strlen(url), (int)url_is_http, (int)url_has_sig, (int)url_has_se);
+    if (strstr(url, "blob.core.windows.net") && !url_has_sig) {
+        ESP_LOGW(TAG, "URL Azure Blob thieu sig= — thuong do shell cat tai & trong SAS. Can quote dung payload.");
+    }
+
     esp_http_client_config_t config = {
         .url = url,
         .crt_bundle_attach = esp_crt_bundle_attach,
         .keep_alive_enable = true,
-        .timeout_ms = 15000,
+        .timeout_ms = 30000,
         .buffer_size = 8192,
+        /* Chi skip CN/SNI khi HTTP LAN debug — HTTPS Blob can SNI dung. */
 #if CONFIG_OTA_ALLOW_HTTP
-        .skip_cert_common_name_check = true,
+        .skip_cert_common_name_check = url_is_http,
+#else
+        .skip_cert_common_name_check = false,
 #endif
     };
 
@@ -349,8 +372,8 @@ static void ota_task(void *pvParameter)
     esp_err_t ret = esp_https_ota_begin(&ota_config, &handle);
     ESP_LOGI(TAG, "HTTPS OTA begin xong: %s", esp_err_to_name(ret));
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "esp_https_ota_begin that bai: %s (0x%x). Kiem tra URL / ket noi mang / cert!",
-                 esp_err_to_name(ret), (unsigned)ret);
+        ESP_LOGE(TAG, "esp_https_ota_begin that bai: %s (0x%x).", esp_err_to_name(ret), (unsigned)ret);
+        ESP_LOGE(TAG, "Neu log co File not found(403): Azure Blob tu choi SAS (URL cat/& , het han, sai quyen, hoac gio thiet bi lech SNTP).");
         ota_fail_exit(url, false, esp_err_to_name(ret));
         return;
     }
@@ -475,6 +498,10 @@ void app_ota_start(const char *url)
 
     s_ota_busy = true;
 
+    /* Giai phong Azure/I2S/LVGL DMA TRUOC khi tao ota_task (can ~8KB Internal lien tuc). */
+    ota_release_resources();
+    ota_log_heap("truoc tao ota_task");
+
     char *url_copy = (char *)heap_caps_malloc(strlen(url) + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!url_copy) {
         url_copy = strdup(url);
@@ -491,6 +518,14 @@ void app_ota_start(const char *url)
     BaseType_t res = xTaskCreateWithCaps(ota_task, "ota_task", OTA_TASK_STACK, url_copy, 5, NULL,
                                          MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (res != pdPASS) {
+        /* Thu stack nho hon neu Internal manh. */
+        ESP_LOGW(TAG, "ota_task 8KB fail (int_free=%u largest=%u) — thu 6144",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+        res = xTaskCreateWithCaps(ota_task, "ota_task", 6144, url_copy, 5, NULL,
+                                  MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
+    if (res != pdPASS) {
         ESP_LOGE(TAG, "Khong du Internal RAM tao ota_task (int_free=%u largest=%u)",
                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
@@ -500,7 +535,7 @@ void app_ota_start(const char *url)
         return;
     }
 
-    ESP_LOGI(TAG, "ota_task da tao (stack=%d B internal)", OTA_TASK_STACK);
+    ESP_LOGI(TAG, "ota_task da tao");
 }
 
 bool app_ota_request_persistent(const char *url)

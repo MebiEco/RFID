@@ -146,14 +146,11 @@ static esp_err_t draw_rgba_scaled_at(const uint8_t *rgba, int w, int h, int src_
     /* Viền = nền UI (lcd_color.h), không qua rgb888_to_rgb565/SWAP_RB — pixel ảnh JPEG vẫn qua rgb888_to_rgb565. */
     const uint16_t letter_pix = lcd_color_letterbox_bus();
 
-    /* Buffer RGB565: ưu tiên SPIRAM để tiết kiệm RAM nội bộ cho Azure TLS. */
+    /* Buffer RGB565: chi PSRAM — khong fallback Internal (an ~153KB → DMA chet). */
     const size_t fb_bytes = total_px * sizeof(uint16_t);
-    uint16_t *fb = heap_caps_malloc(fb_bytes, MALLOC_CAP_SPIRAM);
+    uint16_t *fb = heap_caps_malloc(fb_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!fb) {
-        fb = heap_caps_malloc(fb_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    }
-    if (!fb) {
-        ESP_LOGE(TAG, "draw_rgba_scaled_at: het RAM cho framebuffer (%u bytes)", (unsigned)fb_bytes);
+        ESP_LOGE(TAG, "draw_rgba_scaled_at: het PSRAM framebuffer (%u bytes)", (unsigned)fb_bytes);
         return ESP_ERR_NO_MEM;
     }
 
@@ -190,7 +187,26 @@ static esp_err_t draw_rgba_scaled_at(const uint8_t *rgba, int w, int h, int src_
         }
     }
 
-    esp_err_t e = lcd_ui_draw_bitmap_sync(panel, tgt_x, tgt_y, tgt_x + tgt_w, tgt_y + tgt_h, fb);
+    /* Ve theo dai — khong vuot BOARD_LCD_SPI_MAX_TRANSFER / chunk (hien ~2.5KB). */
+#ifndef BOARD_LCD_SPI_MAX_TRANSFER
+#define BOARD_LCD_SPI_MAX_TRANSFER \
+    ((size_t)BOARD_LCD_H_RES * (size_t)BOARD_LCD_SPI_CHUNK_LINES * 2u)
+#endif
+    const size_t max_xfer = (size_t)BOARD_LCD_SPI_MAX_TRANSFER;
+    const int max_lines = (tgt_w > 0) ? (int)(max_xfer / ((size_t)tgt_w * 2u)) : 1;
+    const int strip = (max_lines > 0) ? max_lines : 1;
+    esp_err_t e = ESP_OK;
+    for (int y = 0; y < tgt_h; y += strip) {
+        int h = tgt_h - y;
+        if (h > strip) {
+            h = strip;
+        }
+        e = lcd_ui_draw_bitmap_sync(panel, tgt_x, tgt_y + y, tgt_x + tgt_w, tgt_y + y + h,
+                                    fb + (size_t)y * (size_t)tgt_w);
+        if (e != ESP_OK) {
+            break;
+        }
+    }
     heap_caps_free(fb);
     return e;
 }
@@ -229,13 +245,10 @@ esp_err_t sd_png_show_image_at(const char *path, int tgt_x, int tgt_y, int tgt_w
         return ESP_ERR_INVALID_SIZE;
     }
 
-    /* Cấp buffer từ PSRAM; fallback internal RAM */
-    uint8_t *raw_buf = heap_caps_malloc((size_t)file_size, MALLOC_CAP_SPIRAM);
+    /* Chi PSRAM — file JPEG toi 192KB; fallback Internal/DEFAULT se an DMA. */
+    uint8_t *raw_buf = heap_caps_malloc((size_t)file_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!raw_buf) {
-        raw_buf = heap_caps_malloc((size_t)file_size, MALLOC_CAP_DEFAULT);
-    }
-    if (!raw_buf) {
-        ESP_LOGE(TAG, "Het RAM cho raw_buf (%ld B)", file_size);
+        ESP_LOGE(TAG, "Het PSRAM cho raw_buf (%ld B)", file_size);
         fclose(f);
         sd_card_unlock();
         return ESP_ERR_NO_MEM;

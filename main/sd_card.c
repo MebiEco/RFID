@@ -6,6 +6,7 @@
 #include "driver/gpio.h"
 #include "driver/sdspi_host.h"
 #include "driver/spi_common.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_vfs_fat.h"
 #include "freertos/FreeRTOS.h"
@@ -14,16 +15,54 @@
 
 static const char *TAG = "sd_card";
 
+/** 1 sector — bounce toi thieu; de Internal cho LCD SPI + I2S. */
+#define SD_DMA_BOUNCE_BYTES 512
+
 static sdmmc_card_t *s_card;
 static bool s_mounted;
 static SemaphoreHandle_t s_sd_mutex;
 static bool s_spi_bus_inited;
+static void *s_dma_bounce;
 
 static void sd_mutex_ensure(void)
 {
     if (!s_sd_mutex) {
         s_sd_mutex = xSemaphoreCreateRecursiveMutex();
     }
+}
+
+esp_err_t sd_card_reserve_dma_bounce(void)
+{
+    sd_mutex_ensure();
+    if (s_dma_bounce) {
+        return ESP_OK;
+    }
+    s_dma_bounce = heap_caps_malloc(SD_DMA_BOUNCE_BYTES, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    if (!s_dma_bounce) {
+        s_dma_bounce = heap_caps_malloc(512, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    }
+    if (!s_dma_bounce) {
+        ESP_LOGE(TAG, "Khong cap duoc SD DMA bounce (can Internal DMA som luc boot)");
+        return ESP_ERR_NO_MEM;
+    }
+    ESP_LOGI(TAG, "SD DMA bounce %u B @%p (largest_dma con %u)",
+             (unsigned)heap_caps_get_allocated_size(s_dma_bounce), s_dma_bounce,
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
+    return ESP_OK;
+}
+
+static void sd_host_attach_bounce(sdmmc_host_t *host)
+{
+    if (!host || !s_dma_bounce) {
+        return;
+    }
+    host->dma_aligned_buffer = s_dma_bounce;
+    size_t sz = heap_caps_get_allocated_size(s_dma_bounce);
+    size_t sectors = sz / 512;
+    if (sectors < 1) {
+        sectors = 1;
+    }
+    host->unaligned_multi_block_rw_max_chunk_size = sectors;
 }
 
 esp_err_t sd_spi_bus_ensure_init(void)
@@ -83,19 +122,22 @@ esp_err_t sd_card_mount(void)
         return ret;
     }
 
+    (void)sd_card_reserve_dma_bounce();
+
     sd_card_lock();
     /* Cắm module / nguồn yếu: thêm ổn định trước CMD8 (0x108 khi thẻ chưa sẵn sàng). */
     vTaskDelay(pdMS_TO_TICKS(100));
 
     esp_vfs_fat_sdmmc_mount_config_t mount_config = {
         .format_if_mount_failed = false,
-        .max_files = 10,
+        .max_files = 4,
         .allocation_unit_size = 16 * 1024,
     };
 
     sdmmc_host_t host = SDSPI_HOST_DEFAULT();
     host.slot = BOARD_SD_SPI_HOST;
     host.max_freq_khz = BOARD_SD_SPI_MAX_FREQ_KHZ;
+    sd_host_attach_bounce(&host);
 
     sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
     slot_config.gpio_cs = BOARD_SD_CS_GPIO;
@@ -113,6 +155,7 @@ esp_err_t sd_card_mount(void)
         gpio_set_level(BOARD_SD_CS_GPIO, 1);
         vTaskDelay(pdMS_TO_TICKS(120));
         host.max_freq_khz = (int)slow_khz;
+        sd_host_attach_bounce(&host);
         ret = esp_vfs_fat_sdspi_mount(BOARD_SD_MOUNT_POINT, &host, &slot_config, &mount_config, &s_card);
     }
     if (ret != ESP_OK) {
@@ -121,6 +164,17 @@ esp_err_t sd_card_mount(void)
         sd_card_unlock();
         /* Giữ bus SPI3: RC522 có thể đang dùng chung SPI3 với SD (BOARD_RC522_SHARE_SD_SPI_BUS). */
         return ret;
+    }
+
+    /* Dam bao card->host giu bounce (copy host luc mount). */
+    if (s_card && s_dma_bounce) {
+        s_card->host.dma_aligned_buffer = s_dma_bounce;
+        size_t sz = heap_caps_get_allocated_size(s_dma_bounce);
+        size_t sectors = sz / 512;
+        if (sectors < 1) {
+            sectors = 1;
+        }
+        s_card->host.unaligned_multi_block_rw_max_chunk_size = sectors;
     }
 
     s_mounted = true;
@@ -137,11 +191,30 @@ bool sd_card_is_mounted(void)
     return s_mounted;
 }
 
+static volatile int s_service_waiters;
+
 void sd_card_lock(void)
 {
+    sd_mutex_ensure();
     if (s_sd_mutex) {
         (void)xSemaphoreTakeRecursive(s_sd_mutex, portMAX_DELAY);
     }
+}
+
+void sd_card_lock_service(void)
+{
+    sd_mutex_ensure();
+    if (!s_sd_mutex) {
+        return;
+    }
+    s_service_waiters++;
+    (void)xSemaphoreTakeRecursive(s_sd_mutex, portMAX_DELAY);
+    s_service_waiters--;
+}
+
+bool sd_card_service_waiting(void)
+{
+    return s_service_waiters > 0;
 }
 
 void sd_card_unlock(void)
@@ -150,4 +223,3 @@ void sd_card_unlock(void)
         (void)xSemaphoreGiveRecursive(s_sd_mutex);
     }
 }
-

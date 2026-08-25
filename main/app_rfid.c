@@ -179,6 +179,7 @@ void app_rfid_start(void)
 
 static const char *TAG = "app_rfid";
 static volatile bool s_rfid_paused;
+static volatile bool s_swipe_busy;
 
 void app_rfid_set_paused(bool paused)
 {
@@ -186,6 +187,21 @@ void app_rfid_set_paused(bool paused)
     if (paused) {
         ESP_LOGI(TAG, "OTA: tam dung quet RFID");
     }
+}
+
+void app_rfid_swipe_busy_begin(void)
+{
+    s_swipe_busy = true;
+}
+
+void app_rfid_swipe_busy_end(void)
+{
+    s_swipe_busy = false;
+}
+
+bool app_rfid_swipe_busy(void)
+{
+    return s_swipe_busy;
 }
 
 typedef enum {
@@ -658,6 +674,9 @@ static void rfid_task(void *arg)
             int log_reg = -1;
             int check_type = 0;
 
+            /* Uu tien quet+gui: portal API nang phai nhường (RAM/SD). */
+            app_rfid_swipe_busy_begin();
+
             const rfid_time_gate_t time_gate = rfid_time_gate_check();
             if (time_gate != RFID_TIME_GATE_OK) {
                 const char *err_msg = (time_gate == RFID_TIME_GATE_WAIT_NTP) ? "Đang lấy thời gian"
@@ -667,6 +686,7 @@ static void rfid_task(void *arg)
                 dtline[0] = '\0';
                 lv_port_show_swipe_result(line1, line_ma, dtline, false, 0);
                 taskYIELD();
+                app_rfid_swipe_busy_end();
                 strncpy(last_uid, uid_colon, sizeof(last_uid) - 1);
                 last_uid[sizeof(last_uid) - 1] = '\0';
                 had_card = true;
@@ -677,9 +697,9 @@ static void rfid_task(void *arg)
             /* --- BLOCK 1: Đọc SD lấy thông tin thẻ --- */
             if (sd_card_is_mounted()) {
 
-                sd_card_lock();
                 bool reg = false;
                 bool created = false;
+                /* lookup / determine_check_type tu khoa SD (recursive) — khong boc lock ngoai. */
                 esp_err_t prof_err = card_profile_lookup(uid_nc, name, sizeof(name), id, sizeof(id), &reg, &created);
                 if (prof_err == ESP_OK) {
                     log_reg = reg ? 1 : 0;
@@ -688,7 +708,6 @@ static void rfid_task(void *arg)
                 } else {
                     log_reg = -2;
                 }
-                sd_card_unlock();
 
                 /* Định dạng văn bản tên và mã */
                 if (log_reg >= 0) {
@@ -711,7 +730,7 @@ static void rfid_task(void *arg)
                         log_reg == 1 ? MSG_IDX_SWIPE : MSG_IDX_UNKNOWN);
 
                     /* Ghi log trước khi phát — audio đã dừng ở đầu quẹt thẻ */
-                    sd_card_lock();
+                    sd_card_lock_service();
                     scan_log_append(uid_nc, name, id, log_reg, msg_idx);
                     sd_card_unlock();
 
@@ -728,7 +747,7 @@ static void rfid_task(void *arg)
 #endif
 #if !BOARD_AUDIO_STRESS_TEST
                         if (wav_path) {
-                            sd_card_lock();
+                            sd_card_lock_service();
                             bool wav_ok = sd_file_exists(wav_path);
                             sd_card_unlock();
                             if (wav_ok) {
@@ -760,6 +779,8 @@ static void rfid_task(void *arg)
                 lv_port_show_swipe_result(line1, line_ma, dtline, false, 0);
                 taskYIELD();
             }
+
+            app_rfid_swipe_busy_end();
 
             strncpy(last_uid, uid_colon, sizeof(last_uid) - 1);
             last_uid[sizeof(last_uid) - 1] = '\0';

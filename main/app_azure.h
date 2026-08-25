@@ -50,6 +50,14 @@ void app_azure_send_card_event(const char *uid, const char *name, const char *id
  */
 int app_azure_is_connected(void);
 
+/**
+ * Dang publish MQTT (quet the / day lai). Portal API nang phai nhường —
+ * KHONG dung de tat Azure. Quet + Azure luon bat (tru OTA tam ngung).
+ */
+void app_azure_tx_busy_begin(void);
+void app_azure_tx_busy_end(void);
+bool app_azure_tx_busy(void);
+
 /** OTA: bao azure_task ngat MQTT (khong destroy client tu task khac). */
 void app_azure_suspend_for_ota(void);
 /** Cho MQTT da ngat xong. Tra ve true neu client da duoc destroy. */

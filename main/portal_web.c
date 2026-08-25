@@ -14,10 +14,10 @@
 
 #include "app_rfid.h"
 #include "attendance_day.h"
+#include "app_azure.h"
 #include "board_pins.h"
 #include "card_profile.h"
 #include "lcd_ui.h"
-#include "app_azure.h"
 #include "app_ota.h"
 #include "scan_log.h"
 #include "sd_card.h"
@@ -165,12 +165,9 @@ static esp_err_t api_terminal_log_get_handler(httpd_req_t *req)
     size_t start = (s_web_log_tail + (len - send_len)) % WEB_LOG_BUF_SIZE;
     char *temp = heap_caps_malloc(send_len + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!temp) {
-        temp = malloc(send_len + 1);
-    }
-    if (!temp) {
         s_web_log_busy = false;
         httpd_resp_set_status(req, "500 Internal Server Error");
-        return httpd_resp_sendstr(req, "Out of memory");
+        return httpd_resp_sendstr(req, "Het PSRAM dem log");
     }
 
     size_t first = WEB_LOG_BUF_SIZE - start;
@@ -276,6 +273,7 @@ static esp_err_t api_hardware_get_handler(httpd_req_t *req)
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store, no-cache, must-revalidate");
+    httpd_resp_set_hdr(req, "Connection", "close");
     return httpd_resp_sendstr(req, resp);
 }
 
@@ -418,6 +416,32 @@ bool portal_auth_section(httpd_req_t *req, const char *section)
         }
     }
     return false;
+}
+
+bool portal_reject_heavy_if_busy(httpd_req_t *req)
+{
+    const char *err = NULL;
+    /* Chi chan WEB nang — khong bao gio tat quet the / Azure. */
+    if (app_rfid_swipe_busy() || sd_card_service_waiting() || app_azure_tx_busy()) {
+        err = "Dang quet the / day Azure — web thu lai sau";
+    } else {
+        const uint32_t free_int = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+        const uint32_t dma = heap_caps_get_largest_free_block(MALLOC_CAP_DMA);
+        if (free_int < 16384 || dma < 6144) {
+            err = "Thiet bi dang ban (RAM) — thu lai sau";
+        }
+    }
+    if (!err) {
+        return false;
+    }
+    ESP_LOGW(TAG, "portal heavy reject: %s", err);
+    httpd_resp_set_type(req, "application/json; charset=utf-8");
+    httpd_resp_set_hdr(req, "Connection", "close");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    char buf[192];
+    snprintf(buf, sizeof(buf), "{\"ok\":false,\"error\":\"%s\",\"rows\":[]}", err);
+    (void)httpd_resp_sendstr(req, buf);
+    return true;
 }
 
 static bool sess_create(const char *section, char *tok_out, size_t tok_sz)
@@ -603,11 +627,8 @@ static esp_err_t api_cards_get_handler(httpd_req_t *req)
     CardProfileEntry_t *entries = heap_caps_malloc(limit * sizeof(CardProfileEntry_t),
                                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!entries) {
-        entries = malloc(limit * sizeof(CardProfileEntry_t));
-    }
-    if (!entries) {
         httpd_resp_set_status(req, "500 Internal Server Error");
-        return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"Out of memory\"}");
+        return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"Het PSRAM (danh sach the)\"}");
     }
     int n = card_profile_list_page(entries, limit, only_u, skip_first, id_filter);
 
@@ -1066,6 +1087,8 @@ static esp_err_t api_status_get_handler(httpd_req_t *req)
              g_app_build_stamp[0] ? g_app_build_stamp : (app ? app->date : "?"),
              run ? run->label : "?");
     httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Connection", "close");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     return httpd_resp_sendstr(req, resp);
 }
 
@@ -1195,14 +1218,13 @@ static esp_err_t api_ota_post_handler(httpd_req_t *req)
      * TCP window day, trinh duyet dung o vai % va man hinh cung dung. */
     app_rfid_set_paused(true);
 
-    char *recv_buf = heap_caps_malloc(8192, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    if (!recv_buf) recv_buf = malloc(8192);
+    char *recv_buf = heap_caps_malloc(8192, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!recv_buf) {
         esp_ota_abort(ota_h);
         app_rfid_set_paused(false);
         httpd_resp_set_status(req, "500 Internal Error");
         httpd_resp_set_type(req, "application/json");
-        return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"Het bo nho dem\"}");
+        return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"Het PSRAM dem OTA\"}");
     }
 
     int cur_len = 0;
@@ -1344,14 +1366,14 @@ void portal_web_register_handlers(httpd_handle_t server)
 
     if (!s_web_log_buf) {
         s_web_log_buf = heap_caps_malloc(WEB_LOG_BUF_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        if (!s_web_log_buf) {
-            s_web_log_buf = malloc(WEB_LOG_BUF_SIZE);
-        }
         if (s_web_log_buf) {
             s_web_log_head = 0;
             s_web_log_tail = 0;
             s_web_log_len = 0;
             s_old_vprintf = esp_log_set_vprintf(web_log_vprintf);
+        } else {
+            ESP_LOGW(TAG, "Khong cap PSRAM %uKB cho terminal log — bo qua",
+                     (unsigned)(WEB_LOG_BUF_SIZE / 1024));
         }
     }
 

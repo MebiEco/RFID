@@ -47,8 +47,8 @@ uint8_t app_audio_get_volume(void)
 #define AUDIO_TASK_STACK    16384
 /** I2S luon 48 kHz — ESP32-S3 clock on dinh; 44.1 file se resample. */
 #define AUDIO_OUT_RATE_HZ   48000u
-/** Chunk Internal day DMA (stereo int16). */
-#define STEREO_SAMPLES_MAX  4096
+/** Chunk Internal day DMA — khop 2×64 (~512B). */
+#define STEREO_SAMPLES_MAX  128
 /** Raw WAV preload (PSRAM); convert stereo 48k co the ~2x. */
 #define AUDIO_PRELOAD_MAX_BYTES (512 * 1024)
 
@@ -60,13 +60,20 @@ static QueueHandle_t s_audio_q;
 static i2s_chan_handle_t s_tx_chan;
 static uint32_t s_open_rate_hz;
 static bool s_i2s_on;
+static volatile bool s_audio_playing;
+static volatile bool s_teardown_req;
 
 static DRAM_ATTR int16_t s_pcm_stereo[STEREO_SAMPLES_MAX] __attribute__((aligned(4)));
+/** Silence flush — DRAM (khong dung stack PSRAM cua audio task). */
+static DRAM_ATTR int16_t s_i2s_silence[64] __attribute__((aligned(4)));
+
+static void audio_i2s_flush_silence(void);
 
 static void audio_i2s_teardown(void)
 {
     if (s_tx_chan) {
         if (s_i2s_on) {
+            audio_i2s_flush_silence();
             (void)i2s_channel_disable(s_tx_chan);
             s_i2s_on = false;
         }
@@ -77,7 +84,7 @@ static void audio_i2s_teardown(void)
 }
 
 /** DMA descriptor phải nằm trong internal DMA-capable RAM (không dùng được PSRAM). */
-static esp_err_t audio_i2s_init_channel(uint32_t sample_rate_hz, int dma_desc_num, int dma_frame_num)
+static esp_err_t audio_i2s_init_channel(uint32_t sample_rate_hz, int dma_desc_num, int dma_frame_num, bool start_enabled)
 {
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
     chan_cfg.dma_desc_num = dma_desc_num;
@@ -113,43 +120,35 @@ static esp_err_t audio_i2s_init_channel(uint32_t sample_rate_hz, int dma_desc_nu
         return err;
     }
 
-    err = i2s_channel_enable(s_tx_chan);
-    if (err != ESP_OK) {
-        audio_i2s_teardown();
-        return err;
+    if (start_enabled) {
+        err = i2s_channel_enable(s_tx_chan);
+        if (err != ESP_OK) {
+            audio_i2s_teardown();
+            return err;
+        }
+        s_i2s_on = true;
+    } else {
+        s_i2s_on = false;
     }
-    s_i2s_on = true;
     return ESP_OK;
 }
 
 volatile bool g_audio_abort = false;
 
-/** Ghi im lặng vài chunk để thay mẫu PCM cuối trong DMA — tránh rè "nnn". */
+/** Ghi im lặng vài chunk — size khop DMA nho (2×64), tranh TIMEOUT. */
 static void audio_i2s_flush_silence(void)
 {
     if (!s_tx_chan || !s_i2s_on) {
         return;
     }
-    int16_t silence[256];
-    memset(silence, 0, sizeof(silence));
-    for (int i = 0; i < 6; i++) {
+    memset(s_i2s_silence, 0, sizeof(s_i2s_silence));
+    for (int i = 0; i < 3; i++) {
         size_t written = 0;
-        esp_err_t err = i2s_channel_write(s_tx_chan, silence, sizeof(silence), &written, pdMS_TO_TICKS(20));
+        esp_err_t err = i2s_channel_write(s_tx_chan, s_i2s_silence, sizeof(s_i2s_silence), &written,
+                                          pdMS_TO_TICKS(50));
         if (err != ESP_OK) {
             break;
         }
-    }
-}
-
-/** MAX98357A unmute khi co BCLK. Tat clock sau moi bai — tranh re khi HTTP/SD/WiFi. */
-static void audio_i2s_clocks_off(void)
-{
-    if (!s_tx_chan || !s_i2s_on) {
-        return;
-    }
-    audio_i2s_flush_silence();
-    if (i2s_channel_disable(s_tx_chan) == ESP_OK) {
-        s_i2s_on = false;
     }
 }
 
@@ -171,8 +170,69 @@ void app_audio_clear_queue(void)
 
 void app_audio_stop_and_clear(void)
 {
+    /* Chi abort + xoa queue + yeu cau teardown. Xoa I2S chi trong app_audio_task
+     * (teardown tu rfid_task khi dang i2s_channel_write → reset). */
     g_audio_abort = true;
     app_audio_clear_queue();
+    s_teardown_req = true;
+}
+
+bool app_audio_wait_i2s_released(uint32_t timeout_ms)
+{
+    app_audio_stop_and_clear();
+    if (timeout_ms == 0) {
+        return (s_tx_chan == NULL && !s_audio_playing);
+    }
+    const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
+    while (s_tx_chan != NULL || s_audio_playing || s_teardown_req) {
+        if ((int32_t)(xTaskGetTickCount() - deadline) >= 0) {
+            ESP_LOGW(TAG, "wait I2S release timeout (chan=%p playing=%d req=%d)",
+                     (void *)s_tx_chan, (int)s_audio_playing, (int)s_teardown_req);
+            return false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    return true;
+}
+
+void app_audio_release_dma_for_sd(void)
+{
+    /* Deprecated no-op: SD dung dma_aligned_buffer co dinh; khong cat I2S tu task khac. */
+}
+
+esp_err_t app_audio_reserve_i2s_dma(void)
+{
+    if (s_tx_chan && s_open_rate_hz == AUDIO_OUT_RATE_HZ) {
+        return ESP_OK;
+    }
+
+    /* Khong teardown truoc khi chac co cho DMA — neu fail se mat channel mai. */
+    const uint32_t dma_largest = heap_caps_get_largest_free_block(MALLOC_CAP_DMA);
+    if (dma_largest < 1024) {
+        ESP_LOGW(TAG, "I2S reserve skip (largest_dma=%u, keep_chan=%d)", (unsigned)dma_largest,
+                 (int)(s_tx_chan != NULL));
+        return ESP_ERR_NO_MEM;
+    }
+
+    audio_i2s_teardown();
+
+    /* 2×64 ≈ 0.5KB DMA — de con Internal cho LCD SPI (tranh panel ESP_ERR_NO_MEM). */
+    esp_err_t err = audio_i2s_init_channel(AUDIO_OUT_RATE_HZ, 2, 64, false);
+    if (err == ESP_ERR_NO_MEM) {
+        ESP_LOGW(TAG, "I2S reserve 2x64 fail (largest_dma=%u)",
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
+        return err;
+    }
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "I2S reserve fail: %s (free_int=%u largest_dma=%u)", esp_err_to_name(err),
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
+        return err;
+    }
+    s_open_rate_hz = AUDIO_OUT_RATE_HZ;
+    ESP_LOGI(TAG, "I2S DMA reserved @%" PRIu32 " Hz (disabled, largest_dma con %u)", AUDIO_OUT_RATE_HZ,
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
+    return ESP_OK;
 }
 
 /** Giữ tương thích — I2S được bật lại trong play_wav_file khi phát tiếp. */
@@ -183,45 +243,21 @@ void app_audio_resume(void)
 static esp_err_t audio_i2s_prepare(uint32_t sample_rate_hz)
 {
     (void)sample_rate_hz;
-    /* Luon 48 kHz — tranh doi clock 44.1↔48 (nghe cham/kho chiu). */
-    /* Kenh da tao: chi can bat lai clock neu dang mute. */
-    if (s_tx_chan && s_open_rate_hz == AUDIO_OUT_RATE_HZ) {
-        if (!s_i2s_on) {
-            esp_err_t en = i2s_channel_enable(s_tx_chan);
-            if (en != ESP_OK) {
-                ESP_LOGW(TAG, "i2s re-enable: %s — tao lai kenh", esp_err_to_name(en));
-                audio_i2s_teardown();
-            } else {
-                s_i2s_on = true;
-                return ESP_OK;
-            }
-        } else {
-            return ESP_OK;
+    if (!s_tx_chan || s_open_rate_hz != AUDIO_OUT_RATE_HZ) {
+        esp_err_t r = app_audio_reserve_i2s_dma();
+        if (r != ESP_OK) {
+            return r;
         }
     }
-
-    audio_i2s_teardown();
-
-    /* 8×960 ≈ 30KB DMA (~160 ms @48k stereo). */
-    esp_err_t err = audio_i2s_init_channel(AUDIO_OUT_RATE_HZ, 8, 960);
-    if (err == ESP_ERR_NO_MEM) {
-        size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_DMA);
-        ESP_LOGW(TAG, "I2S DMA 8x960 fail (largest=%u) — thu 8x512", (unsigned)largest);
-        err = audio_i2s_init_channel(AUDIO_OUT_RATE_HZ, 8, 512);
+    if (!s_i2s_on) {
+        esp_err_t en = i2s_channel_enable(s_tx_chan);
+        if (en != ESP_OK) {
+            ESP_LOGW(TAG, "i2s enable: %s", esp_err_to_name(en));
+            return en;
+        }
+        s_i2s_on = true;
+        vTaskDelay(pdMS_TO_TICKS(5));
     }
-    if (err == ESP_ERR_NO_MEM) {
-        err = audio_i2s_init_channel(AUDIO_OUT_RATE_HZ, 6, 240);
-    }
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "i2s init: %s (free_internal=%u largest_dma=%u)", esp_err_to_name(err),
-                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
-        return err;
-    }
-
-    s_open_rate_hz = AUDIO_OUT_RATE_HZ;
-    ESP_LOGI(TAG, "I2S TX %" PRIu32 " Hz fixed (BCLK=%d WS=%d DOUT=%d)", AUDIO_OUT_RATE_HZ,
-             (int)BOARD_I2S_BCLK_GPIO, (int)BOARD_I2S_WS_GPIO, (int)BOARD_I2S_DOUT_GPIO);
     return ESP_OK;
 }
 
@@ -376,9 +412,7 @@ static esp_err_t audio_convert_to_48k_stereo(const uint8_t *src, size_t src_byte
     const size_t nbytes = out_frames * 2u * sizeof(int16_t);
     int16_t *dst = (int16_t *)heap_caps_malloc(nbytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!dst) {
-        dst = (int16_t *)malloc(nbytes);
-    }
-    if (!dst) {
+        ESP_LOGE(TAG, "Het PSRAM convert stereo (%u B)", (unsigned)nbytes);
         return ESP_ERR_NO_MEM;
     }
 
@@ -419,7 +453,7 @@ static esp_err_t audio_feed_stereo_48k(const int16_t *stereo, size_t nbytes)
 {
     size_t off = 0;
     while (off < nbytes) {
-        if (g_audio_abort) {
+        if (g_audio_abort || !s_tx_chan || !s_i2s_on) {
             return ESP_ERR_INVALID_STATE;
         }
         size_t n = nbytes - off;
@@ -433,11 +467,25 @@ static esp_err_t audio_feed_stereo_48k(const int16_t *stereo, size_t nbytes)
         }
         memcpy(s_pcm_stereo, (const uint8_t *)stereo + off, n);
         size_t written = 0;
-        esp_err_t e = i2s_channel_write(s_tx_chan, s_pcm_stereo, n, &written, portMAX_DELAY);
+        esp_err_t e = ESP_OK;
+        for (int try = 0; try < 4; try++) {
+            if (g_audio_abort) {
+                return ESP_ERR_INVALID_STATE;
+            }
+            written = 0;
+            e = i2s_channel_write(s_tx_chan, s_pcm_stereo, n, &written, pdMS_TO_TICKS(500));
+            if (e == ESP_OK) {
+                break;
+            }
+            if (e != ESP_ERR_TIMEOUT) {
+                return e;
+            }
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
         if (e != ESP_OK) {
             return e;
         }
-        off += n;
+        off += (written > 0) ? written : n;
     }
     return ESP_OK;
 }
@@ -482,12 +530,9 @@ static esp_err_t play_wav_file(const char *path)
 
     uint8_t *preload = (uint8_t *)heap_caps_malloc(data_len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!preload) {
-        preload = (uint8_t *)malloc(data_len);
-    }
-    if (!preload) {
         fclose(f);
         sd_card_unlock();
-        ESP_LOGE(TAG, "Het RAM preload");
+        ESP_LOGE(TAG, "Het PSRAM preload (%u B)", (unsigned)data_len);
         return ESP_ERR_NO_MEM;
     }
 
@@ -517,17 +562,21 @@ static esp_err_t play_wav_file(const char *path)
     err = audio_i2s_prepare(AUDIO_OUT_RATE_HZ);
     if (err != ESP_OK) {
         heap_caps_free(stereo48);
+        ESP_LOGW(TAG, "Bo qua phat (I2S chua san sang): %s", esp_err_to_name(err));
         return err;
     }
 
     esp_err_t out_err = audio_feed_stereo_48k(stereo48, stereo_bytes);
     heap_caps_free(stereo48);
 
-    if (out_err != ESP_OK && out_err != ESP_ERR_INVALID_STATE) {
+    if (out_err == ESP_ERR_TIMEOUT) {
+        ESP_LOGW(TAG, "i2s feed TIMEOUT — giai phong I2S (khong crash)");
+    } else if (out_err != ESP_OK && out_err != ESP_ERR_INVALID_STATE) {
         ESP_LOGE(TAG, "i2s feed: %s", esp_err_to_name(out_err));
     }
-    audio_i2s_clocks_off();
-    return (out_err == ESP_ERR_INVALID_STATE) ? ESP_OK : out_err;
+    /* Teardown het — tra DMA Internal ve heap (chi clocks_off van chiem DMA → portal 100%). */
+    audio_i2s_teardown();
+    return (out_err == ESP_ERR_INVALID_STATE || out_err == ESP_ERR_TIMEOUT) ? ESP_OK : out_err;
 }
 
 static void app_audio_task(void *arg)
@@ -535,22 +584,19 @@ static void app_audio_task(void *arg)
     (void)arg;
     audio_msg_t msg;
     for (;;) {
-        if (xQueueReceive(s_audio_q, &msg, portMAX_DELAY) != pdTRUE) {
-            continue;
+        const BaseType_t got = xQueueReceive(s_audio_q, &msg, pdMS_TO_TICKS(50));
+        if (got == pdTRUE) {
+            ESP_LOGI(TAG, "Phat: %s", msg.path);
+            g_audio_abort = false;
+            s_audio_playing = true;
+            (void)play_wav_file(msg.path);
+            s_audio_playing = false;
         }
-        ESP_LOGI(TAG, "Phat: %s", msg.path);
-        g_audio_abort = false;
-        (void)play_wav_file(msg.path);
-
-        /* Log stack watermark sau mỗi 5 lần phát */
-        // if (++s_play_count % 5 == 0) {
-        //     UBaseType_t wm = uxTaskGetStackHighWaterMark(NULL);
-        //     ESP_LOGW(TAG, "[STACK] audio_task free: %4u words (%5u bytes) / 12288 total",
-        //              (unsigned)wm, (unsigned)(wm * sizeof(StackType_t)));
-        //     if (wm * sizeof(StackType_t) < 512) {
-        //         ESP_LOGE(TAG, "[STACK] audio_task SAP STACK OVERFLOW!");
-        //     }
-        // }
+        /* Teardown chi o day — OTA/RFID chi set s_teardown_req. */
+        if (s_teardown_req && !s_audio_playing) {
+            audio_i2s_teardown();
+            s_teardown_req = false;
+        }
     }
 }
 
@@ -569,13 +615,14 @@ void app_audio_start(void)
         ESP_LOGE(TAG, "xQueueCreate thất bại");
         return;
     }
+    /* Stack 16KB → PSRAM truoc: Internal dang 98% / DMA 400B thi SD 0x101. */
     BaseType_t ok = xTaskCreatePinnedToCoreWithCaps(app_audio_task, "app_audio", AUDIO_TASK_STACK, NULL,
                                                     BOARD_AUDIO_TASK_PRIO, NULL, 1,
-                                                    MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+                                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (ok != pdPASS) {
         ok = xTaskCreatePinnedToCoreWithCaps(app_audio_task, "app_audio", AUDIO_TASK_STACK, NULL,
                                             BOARD_AUDIO_TASK_PRIO, NULL, 1,
-                                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+                                            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     }
     if (ok != pdPASS) {
         ok = xTaskCreatePinnedToCore(app_audio_task, "app_audio", AUDIO_TASK_STACK, NULL, BOARD_AUDIO_TASK_PRIO, NULL, 1);
@@ -598,6 +645,7 @@ esp_err_t app_audio_queue_wav(const char *path)
         ESP_LOGW(TAG, "app_audio_start() chua goi");
         return ESP_ERR_INVALID_STATE;
     }
+    /* Cho phep queue ca khi chua reserve — play se thu tao I2S luc can. */
     if (!path || !path[0]) {
         return ESP_ERR_INVALID_ARG;
     }

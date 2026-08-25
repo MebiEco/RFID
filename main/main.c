@@ -65,6 +65,13 @@ void app_main(void)
 
     app_ota_boot_guard();
 
+#if BOARD_ENABLE_SD
+    /* Bounce DMA Internal SOM — truoc LCD/LVGL/WiFi an manh Internal. */
+    if (sd_card_reserve_dma_bounce() != ESP_OK) {
+        ESP_LOGW(TAG, "SD DMA bounce: chua cap duoc — SD co the 0x101 khi heap manh");
+    }
+#endif
+
 #if BOARD_ENABLE_LCD
     ESP_ERROR_CHECK(lcd_panel_config_init());
 #endif
@@ -156,15 +163,20 @@ void app_main(void)
 #endif
 
 #if BOARD_ENABLE_AUDIO
-    /* Âm thanh: 1=WiFi+NTP+SD, 2/3=IN/OUT — trước app_rfid */
+    /* Khong reserve I2S luc boot — tranh chiem DMA Internal (LCD SPI can headroom).
+     * Loa: thu tao kenh luc phat; fail thi bo qua, UI/SD van chay. */
     app_audio_start();
 #if BOARD_AUDIO_STRESS_TEST
-    /* Thử nghiệm: xếp hàng 1+2+3.wav; tắt bằng BOARD_AUDIO_STRESS_TEST 0 trong board_pins.h */
     if (sd_card_is_mounted()) {
         app_audio_stress_queue_all_three();
     }
 #endif
 #endif
+
+    ESP_LOGI(TAG, "Boot heap: free_int=%u largest_dma=%u free_psram=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 
 #if BOARD_ENABLE_RFID
     app_rfid_start();

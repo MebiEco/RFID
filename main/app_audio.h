@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stdint.h>
 #include "esp_err.h"
 
 /** Khởi tạo task âm thanh + hàng đợi (gọi một lần sau khi NVS/init cơ bản). */
@@ -32,8 +33,28 @@ void app_audio_pause(void);
 /** Xóa WAV đang chờ trong hàng đợi (không abort bài đang phát). */
 void app_audio_clear_queue(void);
 
-/** Dừng phát + xóa hàng đợi — dùng trước khi xếp 2/3.wav mới sau quẹt thẻ. */
+/**
+ * Dừng phát + xóa hàng đợi — dùng trước khi xếp 2/3.wav mới sau quẹt thẻ.
+ * Chi set abort + yeu cau teardown; I2S chi duoc xoa boi app_audio_task (an toan thread).
+ */
 void app_audio_stop_and_clear(void);
+
+/**
+ * Abort + doi app_audio_task teardown I2S (tra DMA Internal). Dung truoc OTA.
+ * timeout_ms: 0 = chi yeu cau, khong doi.
+ */
+bool app_audio_wait_i2s_released(uint32_t timeout_ms);
+
+/**
+ * No-op (giu API). SD dung dma_aligned_buffer co dinh — khong cat I2S tu task khac.
+ */
+void app_audio_release_dma_for_sd(void);
+
+/**
+ * Cap/khoi tao lai kenh I2S + DMA Internal khi can phat.
+ * Sau moi bai audio_task teardown — khong giu DMA vinh vien (tranh portal Internal 100%).
+ */
+esp_err_t app_audio_reserve_i2s_dma(void);
 
 /** Giữ tương thích — hiện không cần gọi sau pause (I2S tự bật lại khi phát tiếp). */
 void app_audio_resume(void);

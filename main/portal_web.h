@@ -17,3 +17,9 @@ int portal_recv_small_body(httpd_req_t *req, char *buf, size_t bufsz);
 
 /** Dang ky them URI (/api/cards, /api/log, /api/pin_change, /api/azure, ...). */
 void portal_web_register_handlers(httpd_handle_t server);
+
+/**
+ * Chan API nang (log/tong quan) khi dang quet the hoac Internal thap.
+ * true = da gui JSON loi, caller return ngay.
+ */
+bool portal_reject_heavy_if_busy(httpd_req_t *req);

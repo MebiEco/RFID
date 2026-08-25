@@ -11,6 +11,9 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_task_wdt.h"
+#include "portal_web.h"
+#include "app_rfid.h"
+#include "app_azure.h"
 #include "scan_log.h"
 #include "sd_card.h"
 #include "wifi_portal.h"
@@ -277,10 +280,226 @@ static bool att_ymd_ok(const char *s)
     return y >= 2000 && y <= 2100 && m >= 1 && m <= 12 && d >= 1 && d <= 31;
 }
 
+/**
+ * Doc cua so tu EOF (append-only). Xu ly dong moi→cu; gap ngay < hist_ymd thi dung.
+ * Mo rong toi ATT_TAIL_WIN_MAX; van chua gap ngay cu → fallback quet xuoi (nad).
+ */
+#define ATT_TAIL_WIN_START (256 * 1024)
+#define ATT_TAIL_WIN_MAX   (1024 * 1024)
+
+static void att_apply_line(att_emp_t *emps, int nemp, char *line, const char *today_ymd, const char *hist_ymd,
+                           int *day_out, bool *older_out)
+{
+    if (day_out) {
+        *day_out = -1;
+    }
+    if (older_out) {
+        *older_out = false;
+    }
+    char *p = line;
+    char *ts = strsep(&p, "|");
+    char *uid = strsep(&p, "|");
+    (void)strsep(&p, "|");
+    (void)strsep(&p, "|");
+    char *reg_s = strsep(&p, "|");
+    if (!ts || !uid || ts[0] == '\0') {
+        return;
+    }
+    if (reg_s && strcmp(reg_s, "99") == 0) {
+        return;
+    }
+    int reg = reg_s ? atoi(reg_s) : -1;
+    if (reg != 1) {
+        return;
+    }
+    char row_ymd[12];
+    scan_log_ts_field_ymd_local(ts, row_ymd, sizeof(row_ymd));
+    if (row_ymd[0] == '\0') {
+        return;
+    }
+    if (strcmp(row_ymd, hist_ymd) < 0) {
+        if (older_out) {
+            *older_out = true;
+        }
+        return;
+    }
+    int day = -1;
+    if (strcmp(row_ymd, today_ymd) == 0) {
+        day = 1;
+    } else if (strcmp(row_ymd, hist_ymd) == 0) {
+        day = 0;
+    } else {
+        return; /* ngay giua / lech — bo */
+    }
+    if (day_out) {
+        *day_out = day;
+    }
+    int idx = att_find_uid(emps, nemp, uid);
+    if (idx < 0) {
+        return;
+    }
+    int mins = -1;
+    att_hm_from_ts(ts, &mins, NULL, 0);
+    att_apply_swipe(&emps[idx], day, mins);
+}
+
+/**
+ * Doc tu EOF… Tra ve: true=ok, false=loi/abort (xem *aborted).
+ */
+static bool att_scan_log_for_overview(FILE *fp, att_emp_t *emps, int nemp, const char *today_ymd,
+                                      const char *hist_ymd, bool *aborted)
+{
+    if (aborted) {
+        *aborted = false;
+    }
+    if (!fp || !emps || nemp <= 0) {
+        return false;
+    }
+    if (fseek(fp, 0, SEEK_END) != 0) {
+        return false;
+    }
+    long fsz = ftell(fp);
+    if (fsz <= 0) {
+        return true;
+    }
+
+    size_t win = (size_t)ATT_TAIL_WIN_START;
+    if ((long)win > fsz) {
+        win = (size_t)fsz;
+    }
+    bool saw_older = false;
+    bool covered_all = false;
+
+    while (1) {
+        att_feed_wdt();
+        if (app_rfid_swipe_busy() || sd_card_service_waiting() || app_azure_tx_busy()) {
+            ESP_LOGW(TAG, "overview abort — uu tien quet/Azure");
+            if (aborted) {
+                *aborted = true;
+            }
+            return false;
+        }
+        long start = fsz - (long)win;
+        if (start < 0) {
+            start = 0;
+        }
+        covered_all = (start == 0);
+        size_t n = (size_t)(fsz - start);
+        char *buf = (char *)heap_caps_malloc(n + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!buf) {
+            return false;
+        }
+        if (fseek(fp, start, SEEK_SET) != 0 || fread(buf, 1, n, fp) != n) {
+            free(buf);
+            return false;
+        }
+        buf[n] = '\0';
+
+        char *body = buf;
+        if (start > 0) {
+            char *nl = strchr(buf, '\n');
+            if (!nl) {
+                free(buf);
+                if (covered_all) {
+                    break;
+                }
+                goto expand;
+            }
+            body = nl + 1;
+        }
+
+        /* Thu thap con tro dong; duyet moi → cu. */
+        int max_lines = (int)(n / 40) + 8;
+        if (max_lines < 32) {
+            max_lines = 32;
+        }
+        char **lines = (char **)heap_caps_malloc((size_t)max_lines * sizeof(char *), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!lines) {
+            free(buf);
+            return false;
+        }
+        int nlines = 0;
+        char *line = body;
+        while (line && *line && nlines < max_lines) {
+            char *nl = strchr(line, '\n');
+            lines[nlines++] = line;
+            if (!nl) {
+                break;
+            }
+            *nl = '\0';
+            line = nl + 1;
+        }
+
+        saw_older = false;
+        for (int i = nlines - 1; i >= 0; i--) {
+            bool older = false;
+            att_apply_line(emps, nemp, lines[i], today_ymd, hist_ymd, NULL, &older);
+            if (older) {
+                saw_older = true;
+                break;
+            }
+        }
+        free(lines);
+        free(buf);
+
+        if (saw_older || covered_all) {
+            ESP_LOGI(TAG, "overview tail-win=%u saw_older=%d covered=%d", (unsigned)win, (int)saw_older,
+                     (int)covered_all);
+            return true;
+        }
+expand:
+        if (win >= (size_t)ATT_TAIL_WIN_MAX || (long)win >= fsz) {
+            break;
+        }
+        win *= 2;
+        if (win > (size_t)ATT_TAIL_WIN_MAX) {
+            win = (size_t)ATT_TAIL_WIN_MAX;
+        }
+        if ((long)win > fsz) {
+            win = (size_t)fsz;
+        }
+        /* Reset swipe stats truoc khi quet lai cua so lon hon. */
+        for (int i = 0; i < nemp; i++) {
+            emps[i].y_swipes = 0;
+            emps[i].y_first_min = -1;
+            emps[i].y_last_min = -1;
+            emps[i].t_swipes = 0;
+            emps[i].t_first_min = -1;
+            emps[i].t_last_min = -1;
+        }
+    }
+
+    /* Fallback: quet xuoi, bo ngay cu (van feed WDT). */
+    ESP_LOGW(TAG, "overview tail miss — fallback full forward");
+    for (int i = 0; i < nemp; i++) {
+        emps[i].y_swipes = 0;
+        emps[i].y_first_min = -1;
+        emps[i].y_last_min = -1;
+        emps[i].t_swipes = 0;
+        emps[i].t_first_min = -1;
+        emps[i].t_last_min = -1;
+    }
+    rewind(fp);
+    char linebuf[384];
+    int line_n = 0;
+    while (fgets(linebuf, sizeof(linebuf), fp)) {
+        if ((++line_n & 31) == 0) {
+            att_feed_wdt();
+        }
+        att_apply_line(emps, nemp, linebuf, today_ymd, hist_ymd, NULL, NULL);
+    }
+    return true;
+}
+
 esp_err_t attendance_day_send_overview_json(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "application/json; charset=utf-8");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_set_hdr(req, "Connection", "close");
+
+    if (portal_reject_heavy_if_busy(req)) {
+        return ESP_OK;
+    }
 
     if (!wifi_portal_time_is_valid()) {
         return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"Chua dong bo gio NTP\"}");
@@ -302,7 +521,6 @@ esp_err_t attendance_day_send_overview_json(httpd_req_t *req)
     char yest_ymd[16];
     att_format_ymd(&yest_tm, yest_ymd, sizeof(yest_ymd));
 
-    /* Ngày tổng quát: mặc định hôm qua; ?date=YYYY-MM-DD để xem ngày trước */
     char hist_ymd[16];
     snprintf(hist_ymd, sizeof(hist_ymd), "%s", yest_ymd);
     char qry[96];
@@ -321,20 +539,14 @@ esp_err_t attendance_day_send_overview_json(httpd_req_t *req)
 
     att_emp_t *emps = (att_emp_t *)heap_caps_calloc(ATT_MAX_EMP, sizeof(att_emp_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!emps) {
-        emps = (att_emp_t *)calloc(ATT_MAX_EMP, sizeof(att_emp_t));
-    }
-    if (!emps) {
-        return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"Out of memory\"}");
+        return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"Het PSRAM (tong quan)\"}");
     }
 
     CardProfileEntry_t *profiles =
         (CardProfileEntry_t *)heap_caps_malloc(ATT_MAX_EMP * sizeof(CardProfileEntry_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!profiles) {
-        profiles = (CardProfileEntry_t *)malloc(ATT_MAX_EMP * sizeof(CardProfileEntry_t));
-    }
-    if (!profiles) {
         free(emps);
-        return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"Out of memory\"}");
+        return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"Het PSRAM (profiles)\"}");
     }
 
     int nprof = card_profile_list_page(profiles, ATT_MAX_EMP, false, 0, NULL);
@@ -356,62 +568,21 @@ esp_err_t attendance_day_send_overview_json(httpd_req_t *req)
         nemp++;
     }
     free(profiles);
-    profiles = NULL;
 
     sd_card_lock();
     FILE *fp = fopen(BOARD_SD_RFID_LOG_PATH, "r");
+    bool aborted = false;
     if (fp) {
-        char line[384];
-        int line_n = 0;
-        while (fgets(line, sizeof(line), fp)) {
-            if ((++line_n & 31) == 0) {
-                att_feed_wdt();
-            }
-            char *p = line;
-            char *ts = strsep(&p, "|");
-            char *uid = strsep(&p, "|");
-            (void)strsep(&p, "|"); /* name */
-            (void)strsep(&p, "|"); /* id */
-            char *reg_s = strsep(&p, "|");
-            if (!ts || !uid || ts[0] == '\0') {
-                continue;
-            }
-            if (reg_s && strcmp(reg_s, "99") == 0) {
-                continue; /* admin */
-            }
-            int reg = reg_s ? atoi(reg_s) : -1;
-            if (reg != 1) {
-                continue; /* chi the da DK */
-            }
-            char row_ymd[12];
-            scan_log_ts_field_ymd_local(ts, row_ymd, sizeof(row_ymd));
-            if (row_ymd[0] == '\0') {
-                continue;
-            }
-            int day = -1;
-            if (strcmp(row_ymd, today_ymd) == 0) {
-                day = 1;
-            } else if (strcmp(row_ymd, hist_ymd) == 0) {
-                day = 0;
-            } else {
-                continue;
-            }
-            int idx = att_find_uid(emps, nemp, uid);
-            if (idx < 0) {
-                continue;
-            }
-            int mins = -1;
-            att_hm_from_ts(ts, &mins, NULL, 0);
-            att_apply_swipe(&emps[idx], day, mins);
-        }
+        (void)att_scan_log_for_overview(fp, emps, nemp, today_ymd, hist_ymd, &aborted);
         fclose(fp);
     }
     sd_card_unlock();
-
-    /* today — đầy đủ đi làm + đi về */
+    if (aborted) {
+        free(emps);
+        return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"Dang quet the / gui Azure — thu lai sau\"}");
+    }
     int t_abs = 0, t_late = 0, t_ontime = 0;
     int t_leave_abs = 0, t_forgot = 0, t_early = 0, t_out_ok = 0;
-    /* yesterday — tổng quát */
     int y_abs = 0, y_late = 0, y_early = 0, y_forgot = 0;
 
     int att_work_start_min = 8 * 60 + 30;
@@ -425,18 +596,14 @@ esp_err_t attendance_day_send_overview_json(httpd_req_t *req)
 
     for (int i = 0; i < nemp; i++) {
         att_emp_t *e = &emps[i];
-        /* today arrive — đi muộn chỉ khi lần đầu sau mốc bắt đầu.
-         * Quẹt từ ≥giờ tan làm mà không có vào = quên quẹt vào (không xếp đi muộn). */
         if (e->t_swipes == 0) {
             t_abs++;
         } else if (att_only_evening_swipe(e, 1, att_work_end_min)) {
-            /* bỏ qua arrive late/ontime */
         } else if (e->t_first_min > att_work_start_min) {
             t_late++;
         } else {
             t_ontime++;
         }
-        /* today leave — quên quẹt chỉ sau forgot_after_min & đã quẹt ≥1 mà chưa có lần ra */
         if (e->t_swipes == 0) {
             t_leave_abs++;
         } else if (att_is_forgot(e, 1, now_min, att_forgot_after_min)) {
@@ -446,7 +613,6 @@ esp_err_t attendance_day_send_overview_json(httpd_req_t *req)
         } else if (att_has_checkout(e, 1)) {
             t_out_ok++;
         }
-        /* yesterday summary */
         if (e->y_swipes == 0) {
             y_abs++;
         } else if (att_is_forgot(e, 0, -1, att_forgot_after_min)) {
@@ -459,6 +625,10 @@ esp_err_t attendance_day_send_overview_json(httpd_req_t *req)
             y_early++;
         }
     }
+
+    ESP_LOGI(TAG, "overview chunk free_int=%u dma=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
 
     char hdr[400];
     snprintf(hdr, sizeof(hdr),
@@ -568,7 +738,6 @@ esp_err_t attendance_day_send_overview_json(httpd_req_t *req)
             continue;
         }
         char hm[8];
-        /* Chỉ quẹt ≥giờ tan làm: hiện giờ kiểu về; còn lại là chỉ có vào (quên ra). */
         if (att_only_evening_swipe(e, 1, att_work_end_min)) {
             att_min_to_hm(e->t_last_min >= 0 ? e->t_last_min : e->t_first_min, hm, sizeof(hm));
             err = send_list_item(req, &first, e->name, e->id, "out", hm);
@@ -728,9 +897,8 @@ esp_err_t attendance_day_send_overview_json(httpd_req_t *req)
         return err;
     }
     ESP_LOGI(TAG,
-             "overview today %s in abs=%d late=%d on=%d | out abs=%d forgot=%d early=%d ok=%d | hist %s abs=%d late=%d forgot=%d early=%d (n=%d)",
+             "overview chunked | today %s in abs=%d late=%d on=%d | out abs=%d forgot=%d early=%d ok=%d | hist %s abs=%d late=%d forgot=%d early=%d (n=%d)",
              today_ymd, t_abs, t_late, t_ontime, t_leave_abs, t_forgot, t_early, t_out_ok, hist_ymd, y_abs, y_late,
              y_forgot, y_early, nemp);
     return httpd_resp_send_chunk(req, NULL, 0);
 }
-

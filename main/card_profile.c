@@ -676,10 +676,7 @@ static int scan_profile_txt(int mode, int skip_first, CardProfileEntry_t *entrie
     sorted_entry_t *temp = heap_caps_malloc(file_count * sizeof(sorted_entry_t),
                                             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!temp) {
-        temp = malloc(file_count * sizeof(sorted_entry_t));
-    }
-    if (!temp) {
-        ESP_LOGE(TAG, "Out of memory allocating %d sorted entries", file_count);
+        ESP_LOGE(TAG, "Het PSRAM sorted entries (%d)", file_count);
         closedir(dir);
         sd_card_unlock();
         return 0;

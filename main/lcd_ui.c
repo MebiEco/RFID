@@ -206,22 +206,26 @@ static size_t copy_for_lcd_font(const char *s, char *out, size_t out_sz)
 }
 
 /** Xóa một dải ngang (full chiều rộng) bằng màu nền — giảm “chấm”/ghost chữ cũ. */
+static DRAM_ATTR uint16_t s_lcd_line_buf[BOARD_LCD_H_RES * 4] __attribute__((aligned(16)));
+
 static void clear_hband_height(int y, int h, uint16_t bg_rgb565)
 {
     if (!s_panel || y < 0 || y + h > BOARD_LCD_V_RES) {
         return;
     }
-    static DRAM_ATTR uint16_t band[BOARD_LCD_H_RES * 24] __attribute__((aligned(16))); // support up to scale=3 (24 px height)
     const uint16_t bx = lcd_color_to_bus(bg_rgb565);
-    int limit = (h > 24) ? 24 : h;
-    for (size_t i = 0; i < (size_t)BOARD_LCD_H_RES * limit; i++) {
-        band[i] = bx;
+    for (int row = 0; row < h; ) {
+        int limit = h - row;
+        if (limit > 4) {
+            limit = 4;
+        }
+        for (size_t i = 0; i < (size_t)BOARD_LCD_H_RES * limit; i++) {
+            s_lcd_line_buf[i] = bx;
+        }
+        (void)lcd_ui_draw_bitmap_sync(s_panel, 0, y + row, BOARD_LCD_H_RES, y + row + limit, s_lcd_line_buf);
+        row += limit;
     }
-    (void)lcd_ui_draw_bitmap_sync(s_panel, 0, y, BOARD_LCD_H_RES, y + limit, band);
 }
-
-static DRAM_ATTR uint16_t s_glyph_scaled[2][24 * 24] __attribute__((aligned(16)));
-static uint8_t s_glyph_scaled_buf;
 
 static void draw_char_scaled(int x, int y, char c, uint16_t fg, uint16_t bg, int scale)
 {
@@ -237,8 +241,12 @@ static void draw_char_scaled(int x, int y, char c, uint16_t fg, uint16_t bg, int
         return;
     }
 
-    s_glyph_scaled_buf ^= 1u;
-    uint16_t *g = s_glyph_scaled[s_glyph_scaled_buf];
+    /* Tai dung s_lcd_line_buf (DRAM/DMA) — tranh giu them ~2.3KB Internal cho OTA text. */
+    const size_t need_px = (size_t)(8 * scale) * (size_t)(8 * scale);
+    if (need_px > (sizeof(s_lcd_line_buf) / sizeof(s_lcd_line_buf[0]))) {
+        return;
+    }
+    uint16_t *g = s_lcd_line_buf;
 
     for (int row = 0; row < 8; row++) {
         uint8_t bits = font8x8_basic[idx][row];
@@ -305,6 +313,11 @@ esp_err_t lcd_ui_init(void)
     esp_lcd_panel_io_handle_t io = NULL;
     bool lcd_spi_inited = false;
 
+    /* Chi can chunk LVGL/JPEG — max = chunk bytes (khong ep 8KB). */
+#ifndef BOARD_LCD_SPI_MAX_TRANSFER
+#define BOARD_LCD_SPI_MAX_TRANSFER \
+    ((size_t)BOARD_LCD_H_RES * (size_t)BOARD_LCD_SPI_CHUNK_LINES * 2u)
+#endif
     spi_bus_config_t bus = {
         .mosi_io_num = BOARD_LCD_MOSI_GPIO,
 #if BOARD_LCD_SHARE_SPI2_WITH_SD
@@ -317,7 +330,7 @@ esp_err_t lcd_ui_init(void)
         .sclk_io_num = BOARD_LCD_SCK_GPIO,
         .quadwp_io_num = -1,
         .quadhd_io_num = -1,
-        .max_transfer_sz = BOARD_LCD_H_RES * BOARD_LCD_V_RES * 3,
+        .max_transfer_sz = (int)BOARD_LCD_SPI_MAX_TRANSFER,
     };
     e = spi_bus_initialize(BOARD_LCD_SPI_HOST, &bus, SPI_DMA_CH_AUTO);
     lcd_spi_inited = (e == ESP_OK);
@@ -546,16 +559,15 @@ static void draw_fill_rect(int x, int y, int w, int h, uint16_t color_rgb565)
     if (y + h > BOARD_LCD_V_RES) h = BOARD_LCD_V_RES - y;
     if (w <= 0 || h <= 0) return;
 
-    static DRAM_ATTR uint16_t rect_buf[BOARD_LCD_H_RES * 16] __attribute__((aligned(16)));
     const uint16_t col = lcd_color_to_bus(color_rgb565);
-    int chunk_h = 16;
+    int chunk_h = 4;
     for (int cur_y = y; cur_y < y + h; cur_y += chunk_h) {
         int lines = (y + h - cur_y > chunk_h) ? chunk_h : (y + h - cur_y);
         size_t total_px = (size_t)w * lines;
         for (size_t i = 0; i < total_px; i++) {
-            rect_buf[i] = col;
+            s_lcd_line_buf[i] = col;
         }
-        (void)lcd_ui_draw_bitmap_sync(s_panel, x, cur_y, x + w, cur_y + lines, rect_buf);
+        (void)lcd_ui_draw_bitmap_sync(s_panel, x, cur_y, x + w, cur_y + lines, s_lcd_line_buf);
     }
 }
 
@@ -579,8 +591,8 @@ void lcd_ui_show_ota_progress(int pct, int read_bytes, int total_bytes)
     int bar_h = 18;
 
     if (!s_ota_ui_initialized) {
-        /* Xóa toàn màn hình với màu nền OTA (chunk 10 dòng = 6.4KB, luôn vừa Internal DMA RAM) */
-        const int lines_per_chunk = 10;
+        /* Xóa toàn màn — chunk 4 dòng (~2.5KB DMA), khớp LVGL/headroom Internal. */
+        const int lines_per_chunk = BOARD_LCD_SPI_CHUNK_LINES;
         const size_t chunk_px = (size_t)BOARD_LCD_H_RES * lines_per_chunk;
         uint16_t *fb = lcd_ui_alloc_fb(chunk_px);
         if (fb) {
