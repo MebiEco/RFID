@@ -7,11 +7,14 @@
 ![Cloud](https://img.shields.io/badge/Cloud-Azure%20IoT%20Hub%20%28MQTT%29-0078D4.svg?style=for-the-badge&logo=microsoftazure)
 
 > **Hệ thống Chấm công & Quản lý Vào/Ra thông minh** chạy firmware trên vi điều khiển **ESP32-S3**, tích hợp đầu đọc thẻ RFID MFRC522, màn hình LCD hiển thị LVGL tiếng Việt, kết nối Cloud Azure IoT Hub, lưu trữ nhật ký SD Card, âm thanh I2S và Web Portal cấu hình qua WiFi.
+>
+> 📖 **Xem Tài liệu Kỹ thuật Chi tiết Chuẩn**: [DOCUMENTATION.md](DOCUMENTATION.md)
 
 ---
 
 ## 📌 Mục lục
 
+- [📘 Tài liệu Kỹ thuật Chi tiết (DOCUMENTATION.md)](DOCUMENTATION.md)
 - [Tổng quan Hệ thống](#-tổng-quan-hệ-thống)
 - [✨ Tính năng Nổi bật](#-tính-năng-nổi-bật)
 - [🏗️ Sơ đồ Kiến trúc System](#️-sơ-đồ-kiến-trúc-system)

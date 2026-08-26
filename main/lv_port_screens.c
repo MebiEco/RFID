@@ -495,7 +495,7 @@ void lv_port_wifi_scan_poll_ui(void)
 
 static void wifi_scan_worker_task(void *arg)
 {
-    (void)arg;
+    const bool stack_caps = (arg != NULL);
 #if BOARD_ENABLE_WIFI
     wifi_scan_config_t scan_config = { 0 };
     esp_err_t err = esp_wifi_scan_start(&scan_config, true);
@@ -504,8 +504,11 @@ static void wifi_scan_worker_task(void *arg)
         g_wifi_scan_count = 0;
     } else {
         uint16_t ap_num = 0;
-        esp_wifi_scan_get_ap_num(&ap_num);
-        if (ap_num == 0) {
+        if (esp_wifi_scan_get_ap_num(&ap_num) != ESP_OK) {
+            (void)esp_wifi_clear_ap_list();
+            g_wifi_scan_count = 0;
+        } else if (ap_num == 0) {
+            (void)esp_wifi_clear_ap_list();
             g_wifi_scan_count = 0;
         } else {
             uint16_t max_rec = ap_num;
@@ -515,12 +518,14 @@ static void wifi_scan_worker_task(void *arg)
             wifi_ap_record_t *aps = malloc((size_t)max_rec * sizeof(wifi_ap_record_t));
             if (!aps) {
                 ESP_LOGW(TAG, "wifi scan: malloc AP list failed");
+                (void)esp_wifi_clear_ap_list();
                 g_wifi_scan_count = 0;
             } else {
                 uint16_t rec = max_rec;
                 esp_err_t gr = esp_wifi_scan_get_ap_records(&rec, aps);
                 if (gr != ESP_OK) {
                     ESP_LOGW(TAG, "esp_wifi_scan_get_ap_records: %s", esp_err_to_name(gr));
+                    (void)esp_wifi_clear_ap_list();
                     g_wifi_scan_count = 0;
                 } else {
                     g_wifi_scan_count = (int)rec;
@@ -541,7 +546,11 @@ static void wifi_scan_worker_task(void *arg)
     ESP_LOGW(TAG, "WiFi disabled (BOARD_ENABLE_WIFI=0)");
 #endif
     s_wifi_scan_ui_pending = true;
-    vTaskDelete(NULL);
+    if (stack_caps) {
+        vTaskDeleteWithCaps(NULL);
+    } else {
+        vTaskDelete(NULL);
+    }
 }
 
 void lv_port_wifi_request_scan(void)
@@ -551,7 +560,7 @@ void lv_port_wifi_request_scan(void)
     }
     s_wifi_scan_busy = true;
     BaseType_t ok = xTaskCreateWithCaps(wifi_scan_worker_task, "wifi_scan", WIFI_SCAN_WORKER_STACK_BYTES,
-                                        NULL, 5, NULL, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+                                        (void *)1, 5, NULL, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (ok != pdPASS) {
         ok = xTaskCreate(wifi_scan_worker_task, "wifi_scan", WIFI_SCAN_WORKER_STACK_BYTES, NULL, 5, NULL);
     }

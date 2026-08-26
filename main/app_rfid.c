@@ -76,30 +76,46 @@ static void rfid_task(void *arg)
 #endif
         static int s_rfid_err_count_only = 0;
         mfrc522_status_t st = mfrc522_picc_is_new_card_present(mfrc522_spi());
+        if (st == MFRC522_TIMEOUT) {
+            /* Khong co the — binh thuong, khong reset RC522. */
+            s_rfid_err_count_only = 0;
+#if BOARD_RC522_SHARE_SD_SPI_BUS && BOARD_ENABLE_SD
+            sd_card_unlock();
+#endif
+            if (had_card) {
+                miss_count++;
+                if (miss_count >= 1) {
+                    had_card = false;
+                    last_uid[0] = '\0';
+                    miss_count = 0;
+                }
+            }
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
         if (st != MFRC522_OK) {
             s_rfid_err_count_only++;
-            if (s_rfid_err_count_only >= 25) {
+            if (s_rfid_err_count_only >= 20) {
                 s_rfid_err_count_only = 0;
                 (void)mfrc522_init_bitbang(RC522_SCK_GPIO, RC522_MOSI_GPIO, RC522_MISO_GPIO, RC522_CS_GPIO, (int)RC522_RST_GPIO);
             }
             uint64_t tn = esp_timer_get_time();
             if (tn - last_poll_status_log_us >= 3000000ULL) {
                 last_poll_status_log_us = tn;
-                ESP_LOGW(TAG, "Chua bat duoc the (REQA/WUPA): %s — TIMEOUT=xa/khong thay; ERROR=loi RF/FIFO",
-                         mfrc522_status_name(st));
+                ESP_LOGW(TAG, "RC522 poll loi: %s", mfrc522_status_name(st));
             }
 #if BOARD_RC522_SHARE_SD_SPI_BUS && BOARD_ENABLE_SD
             sd_card_unlock();
 #endif
             if (had_card) {
                 miss_count++;
-                if (miss_count > 5) {
+                if (miss_count >= 1) {
                     had_card = false;
                     last_uid[0] = '\0';
                     miss_count = 0;
                 }
             }
-            vTaskDelay(pdMS_TO_TICKS(120));
+            vTaskDelay(pdMS_TO_TICKS(30));
             continue;
         }
         s_rfid_err_count_only = 0;
@@ -111,7 +127,7 @@ static void rfid_task(void *arg)
         sd_card_unlock();
 #endif
         if (st != MFRC522_OK) {
-            vTaskDelay(pdMS_TO_TICKS(80));
+            vTaskDelay(pdMS_TO_TICKS(20));
             continue;
         }
         uid_to_hex_nocolon(&uid, uid_nc, sizeof(uid_nc));
@@ -618,18 +634,37 @@ static void rfid_task(void *arg)
 #endif
         static int s_rfid_err_count = 0;
         mfrc522_status_t st = mfrc522_picc_is_new_card_present(mfrc522_spi());
+        if (st == MFRC522_TIMEOUT) {
+            /* Khong co the — binh thuong; khong dem loi / khong reset RC522. */
+            s_rfid_err_count = 0;
+#if BOARD_RC522_SHARE_SD_SPI_BUS && BOARD_ENABLE_SD
+            sd_card_unlock();
+#endif
+            if (had_card) {
+                miss_count++;
+                if (miss_count >= 1) {
+                    had_card = false;
+                    last_uid[0] = '\0';
+                    miss_count = 0;
+                }
+            }
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
         if (st != MFRC522_OK) {
 #if BOARD_RC522_SHARE_SD_SPI_BUS && BOARD_ENABLE_SD
             sd_card_unlock();
 #endif
-            s_rfid_err_count++;
-            if (s_rfid_err_count >= 50) {
+            /* Chi reset khi loi RF/FIFO that su lien tiep — khong tinh TIMEOUT. */
+            if (++s_rfid_err_count >= 20) {
                 s_rfid_err_count = 0;
-                (void)mfrc522_init_bitbang(RC522_SCK_GPIO, RC522_MOSI_GPIO, RC522_MISO_GPIO, RC522_CS_GPIO, (int)RC522_RST_GPIO);
+                (void)mfrc522_init_bitbang(RC522_SCK_GPIO, RC522_MOSI_GPIO, RC522_MISO_GPIO, RC522_CS_GPIO,
+                                           (int)RC522_RST_GPIO);
+                ESP_LOGW(TAG, "RC522 soft-reset sau loi poll lien tiep");
             }
             if (had_card) {
                 miss_count++;
-                if (miss_count > 2) {
+                if (miss_count >= 1) {
                     had_card = false;
                     last_uid[0] = '\0';
                     miss_count = 0;
@@ -639,8 +674,6 @@ static void rfid_task(void *arg)
             continue;
         }
         s_rfid_err_count = 0;
-
-        /* Lấy lại được kết nối thẻ, reset bộ đếm */
         miss_count = 0;
 
         mfrc522_uid_t uid;
@@ -649,9 +682,8 @@ static void rfid_task(void *arg)
 #if BOARD_RC522_SHARE_SD_SPI_BUS && BOARD_ENABLE_SD
         sd_card_unlock();
 #endif
-        if (st == MFRC522_TIMEOUT || st == MFRC522_ERROR) {
-            /* Tăng delay lên 100ms khi nhàn rỗi để giảm tải CPU và tranh chấp bus */
-            vTaskDelay(pdMS_TO_TICKS(100));
+        if (st != MFRC522_OK) {
+            vTaskDelay(pdMS_TO_TICKS(20));
             continue;
         }
 

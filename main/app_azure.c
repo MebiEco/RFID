@@ -78,6 +78,33 @@ static void trim_inplace(char *s)
     s[n] = '\0';
 }
 
+/** Chi con hostname: ten-iot-hub.azure-devices.net (bo mqtts://, :8883, /, space). */
+static void normalize_azure_host(char *host)
+{
+    if (!host || !host[0]) {
+        return;
+    }
+    trim_inplace(host);
+    char *scheme = strstr(host, "://");
+    if (scheme) {
+        memmove(host, scheme + 3, strlen(scheme + 3) + 1);
+    }
+    char *slash = strchr(host, '/');
+    if (slash) {
+        *slash = '\0';
+    }
+    char *colon = strchr(host, ':');
+    if (colon) {
+        *colon = '\0';
+    }
+    trim_inplace(host);
+    for (char *p = host; *p; p++) {
+        if (*p >= 'A' && *p <= 'Z') {
+            *p = (char)(*p - 'A' + 'a');
+        }
+    }
+}
+
 static void azure_note_publish(int msg_id, const char *payload);
 static const char *azure_lookup_publish(int msg_id);
 
@@ -523,6 +550,7 @@ static bool azure_load_cred(wifi_cred_t *cred)
         return false;
     }
     trim_inplace(cred->azure_host);
+    normalize_azure_host(cred->azure_host);
     trim_inplace(cred->azure_dev);
     trim_inplace(cred->azure_sas);
     return (cred->azure_host[0] != '\0' && cred->azure_dev[0] != '\0');
@@ -1343,7 +1371,7 @@ static void azure_task(void *arg)
                     .verification = {
                         .certificate = azure_ca,
                         .certificate_len = azure_ca_len,
-                        .skip_cert_common_name_check = true,
+                        /* Mac dinh false: verify CA + CN/SAN khop azure_host (SNI tu URI). */
                     },
                 },
                 .credentials = {

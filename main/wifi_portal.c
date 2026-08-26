@@ -273,9 +273,10 @@ __attribute__((unused)) static int match_strongest_wifi(void)
     return best_idx;
 }
 
+/** arg != NULL: stack tao bang xTaskCreateWithCaps — phai xoa bang vTaskDeleteWithCaps. */
 static void sta_delayed_connect_task(void *arg)
 {
-    (void)arg;
+    const bool stack_caps = (arg != NULL);
     uint32_t dly = 1500;
     if (s_wifi_list.count > 0 && s_sta_reconnect_count > s_wifi_list.count * 3) {
         dly = 15000;
@@ -292,7 +293,11 @@ static void sta_delayed_connect_task(void *arg)
             esp_wifi_connect();
         }
     }
-    vTaskDelete(NULL);
+    if (stack_caps) {
+        vTaskDeleteWithCaps(NULL);
+    } else {
+        vTaskDelete(NULL);
+    }
 }
 
 /** Goi tu WIFI_EVENT_STA_DISCONNECTED — khong block event loop */
@@ -303,7 +308,8 @@ static void schedule_sta_reconnect(void)
     }
     s_sta_reconnect_count++;
     s_sta_reconnect_task_live = true;
-    BaseType_t ok = xTaskCreateWithCaps(sta_delayed_connect_task, "sta_reco", 6144, NULL, 4, NULL,
+    /* pvParameters != NULL => CreateWithCaps (de task chon dung Delete*). */
+    BaseType_t ok = xTaskCreateWithCaps(sta_delayed_connect_task, "sta_reco", 6144, (void *)1, 4, NULL,
                                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (ok != pdPASS) {
         ok = xTaskCreate(sta_delayed_connect_task, "sta_reco", 6144, NULL, 4, NULL);
@@ -806,6 +812,7 @@ static void wifi_scan_cache_fill(void)
 {
     uint16_t ap_count = 0;
     if (esp_wifi_scan_get_ap_num(&ap_count) != ESP_OK) {
+        (void)esp_wifi_clear_ap_list();
         s_wifi_scan.valid = false;
         s_wifi_scan.scanning = false;
         return;
@@ -813,10 +820,19 @@ static void wifi_scan_cache_fill(void)
     if (ap_count > WIFI_SCAN_CACHE_MAX) {
         ap_count = WIFI_SCAN_CACHE_MAX;
     }
-    s_wifi_scan.count = ap_count;
+    s_wifi_scan.count = 0;
     if (ap_count > 0) {
-        (void)esp_wifi_scan_get_ap_records(&ap_count, s_wifi_scan.aps);
+        esp_err_t err = esp_wifi_scan_get_ap_records(&ap_count, s_wifi_scan.aps);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "scan_get_ap_records: %s", esp_err_to_name(err));
+            (void)esp_wifi_clear_ap_list();
+            s_wifi_scan.valid = false;
+            s_wifi_scan.scanning = false;
+            return;
+        }
         s_wifi_scan.count = ap_count;
+    } else {
+        (void)esp_wifi_clear_ap_list();
     }
     s_wifi_scan.valid = true;
     s_wifi_scan.scanning = false;
@@ -1253,7 +1269,7 @@ static void sntp_start_or_restart(void)
  */
 static void sntp_retry_task(void *arg)
 {
-    (void)arg;
+    const bool stack_caps = (arg != NULL);
     int attempt = 0;
 
     /* Cho DNS/router on dinh sau GOT_IP */
@@ -1283,7 +1299,11 @@ static void sntp_retry_task(void *arg)
     }
 
     s_sntp_retry_task_live = false;
-    vTaskDelete(NULL);
+    if (stack_caps) {
+        vTaskDeleteWithCaps(NULL);
+    } else {
+        vTaskDelete(NULL);
+    }
 }
 
 static void schedule_sntp_retry(void)
@@ -1292,7 +1312,7 @@ static void schedule_sntp_retry(void)
         return;
     }
     s_sntp_retry_task_live = true;
-    BaseType_t ok = xTaskCreateWithCaps(sntp_retry_task, "sntp_retry", 6144, NULL, 3, NULL,
+    BaseType_t ok = xTaskCreateWithCaps(sntp_retry_task, "sntp_retry", 6144, (void *)1, 3, NULL,
                                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (ok != pdPASS) {
         ok = xTaskCreate(sntp_retry_task, "sntp_retry", 6144, NULL, 3, NULL);
