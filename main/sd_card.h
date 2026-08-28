@@ -26,6 +26,8 @@ bool sd_card_is_mounted(void);
  * Tránh race condition giữa app_audio_task (đọc WAV) và rfid_task (đọc profile/log).
  */
 void sd_card_lock(void);
+/** true neu lay duoc mutex trong timeout_ms (dung cho rfid poll — khong block lau). */
+bool sd_card_try_lock(uint32_t timeout_ms);
 void sd_card_unlock(void);
 
 /**

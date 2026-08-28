@@ -35,8 +35,97 @@
 #include "wifi_portal.h"
 #endif
 #include "app_ota.h"
+#if BOARD_ENABLE_WIFI
+#include "portal_web.h"
+#include "ds3231.h"
+#endif
 
 static const char *TAG = "main";
+
+/** Giam log linh tinh: mac dinh WARN; boot + app_azure INFO (khoi dong + JSON gui Azure). */
+static void app_configure_log_levels(void)
+{
+    esp_log_level_set("*", ESP_LOG_WARN);
+    esp_log_level_set("boot", ESP_LOG_INFO);
+    esp_log_level_set("main", ESP_LOG_INFO);
+#if BOARD_ENABLE_RFID
+    esp_log_level_set("app_rfid", ESP_LOG_INFO);
+#endif
+    /* ESP-IDF / stack hay spam khi chay binh thuong */
+    esp_log_level_set("wifi", ESP_LOG_ERROR);
+    esp_log_level_set("wifi_init", ESP_LOG_ERROR);
+    esp_log_level_set("wpa", ESP_LOG_ERROR);
+    esp_log_level_set("phy", ESP_LOG_ERROR);
+    esp_log_level_set("pp", ESP_LOG_WARN);
+    esp_log_level_set("net80211", ESP_LOG_ERROR);
+    esp_log_level_set("mqtt_client", ESP_LOG_NONE);
+    esp_log_level_set("esp-tls", ESP_LOG_NONE);
+    esp_log_level_set("transport", ESP_LOG_NONE);
+    esp_log_level_set("httpd", ESP_LOG_ERROR);
+    esp_log_level_set("httpd_uri", ESP_LOG_ERROR);
+    esp_log_level_set("httpd_txrx", ESP_LOG_ERROR);
+    esp_log_level_set("esp_netif", ESP_LOG_ERROR);
+    esp_log_level_set("esp_netif_handlers", ESP_LOG_ERROR);
+    esp_log_level_set("system_api", ESP_LOG_ERROR);
+    esp_log_level_set("gpio", ESP_LOG_ERROR);
+    esp_log_level_set("lvgl", ESP_LOG_ERROR);
+    esp_log_level_set("LVGL", ESP_LOG_ERROR);
+    esp_log_level_set("card_profile", ESP_LOG_ERROR);
+    esp_log_level_set("card_prof", ESP_LOG_ERROR);
+    esp_log_level_set("scan_log", ESP_LOG_ERROR);
+    esp_log_level_set("app_audio", ESP_LOG_ERROR);
+    esp_log_level_set("app_azure", ESP_LOG_INFO);
+    esp_log_level_set("wifi_portal", ESP_LOG_ERROR);
+    esp_log_level_set("lv_port", ESP_LOG_ERROR);
+    esp_log_level_set("lv_port_ui", ESP_LOG_ERROR);
+    esp_log_level_set("lv_port_jpeg", ESP_LOG_ERROR);
+    esp_log_level_set("portal_web", ESP_LOG_ERROR);
+    esp_log_level_set("sd_card", ESP_LOG_ERROR);
+    esp_log_level_set("ds3231", ESP_LOG_ERROR);
+    esp_log_level_set("app_ota", ESP_LOG_WARN);
+}
+
+/** Tom tat trang thai khoi dong — hien tren Log Terminal. */
+static void app_log_boot_status(void)
+{
+    ESP_LOGI("boot", "--- Boot ---");
+    ESP_LOGI("boot", "NVS: OK");
+#if BOARD_ENABLE_SD
+    ESP_LOGI("boot", "SD: %s", sd_card_is_mounted() ? "OK" : "LOI");
+#endif
+#if BOARD_ENABLE_LCD
+    ESP_LOGI("boot", "LCD/LVGL: OK");
+#endif
+#if BOARD_ENABLE_WIFI
+    {
+        int wn = wifi_list_get_count();
+        wifi_conn_status_t ws = wifi_portal_get_conn_status();
+        const char *wst = (ws == WIFI_STATUS_CONNECTED) ? "OK" :
+                          (ws == WIFI_STATUS_CONNECTING) ? "dang ket noi" :
+                          (ws == WIFI_STATUS_FAIL) ? "LOI" :
+                          (wn > 0) ? "dang ket noi" : "chua cau hinh";
+        ESP_LOGI("boot", "WiFi STA: %s", wst);
+        ESP_LOGI("boot", "Portal web: OK (192.168.4.1)");
+        ESP_LOGI("boot", "Gio: %s", wifi_portal_time_is_valid() ? "OK" : "cho NTP/RTC");
+#if BOARD_ENABLE_DS3231
+        ESP_LOGI("boot", "DS3231: %s", ds3231_is_ready() ? "OK" : "khong co / loi");
+#endif
+        char ah[64], ad[64], am[16];
+        wifi_portal_get_azure(ah, sizeof(ah), ad, sizeof(ad), am, sizeof(am));
+        ESP_LOGI("boot", "Azure: %s", (ad[0] != '\0') ? "dang ket noi..." : "chua cau hinh");
+    }
+#endif
+#if BOARD_ENABLE_RFID
+    ESP_LOGI("boot", "RC522: OK");
+#endif
+#if BOARD_ENABLE_AUDIO
+    ESP_LOGI("boot", "Audio: san sang");
+#endif
+#if BOARD_ENABLE_RFID
+    ESP_LOGI("boot", "RFID task: OK");
+#endif
+    ESP_LOGI("boot", "------------");
+}
 
 void app_main(void)
 {
@@ -54,7 +143,9 @@ void app_main(void)
     case ESP_RST_DEEPSLEEP: rrs = "DEEPSLEEP"; break;
     default: break;
     }
-    ESP_LOGW(TAG, "Reset reason: %s (%d)", rrs, (int)rr);
+    if (rr != ESP_RST_POWERON) {
+        ESP_LOGW(TAG, "Reset reason: %s (%d)", rrs, (int)rr);
+    }
 
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) { 
@@ -62,6 +153,12 @@ void app_main(void)
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
+
+    app_configure_log_levels();
+
+#if BOARD_ENABLE_WIFI
+    portal_web_log_init();
+#endif
 
     app_ota_boot_guard();
 
@@ -74,17 +171,6 @@ void app_main(void)
 
 #if BOARD_ENABLE_LCD
     ESP_ERROR_CHECK(lcd_panel_config_init());
-#endif
-
-#if BOARD_ENABLE_WIFI
-    /* Bớt log dư (ADDBA, wpa, phy...) — chỉ còn ERROR+ cho các tag ồn hệ thống */
-    // esp_log_level_set("wifi", ESP_LOG_ERROR);
-    // esp_log_level_set("wpa", ESP_LOG_ERROR);
-    // esp_log_level_set("wifi_init", ESP_LOG_ERROR);
-    // esp_log_level_set("esp_netif", ESP_LOG_WARN);
-    // esp_log_level_set("esp_netif_handlers", ESP_LOG_WARN);
-    // esp_log_level_set("phy", ESP_LOG_ERROR);
-    // esp_log_level_set("pp", ESP_LOG_WARN);
 #endif
 
 #if BOARD_ENABLE_LCD
@@ -113,7 +199,6 @@ void app_main(void)
         lcd_ui_show_centered("Loi File");
 #endif
     } else {
-        ESP_LOGI(TAG, "SD mount OK — %s", BOARD_SD_MOUNT_POINT);
         scan_log_flush_pending();
         scan_log_trim_at_boot();
     }
@@ -148,8 +233,6 @@ void app_main(void)
 #endif
         return;
     }
-
-    ESP_LOGI(TAG, "RC522 bit-bang init OK (3-bus mode)");
 #endif /* BOARD_ENABLE_RFID */
 
 #if BOARD_RC522_SHARE_SD_SPI_BUS && BOARD_ENABLE_RFID && !BOARD_ENABLE_SD
@@ -173,26 +256,11 @@ void app_main(void)
 #endif
 #endif
 
-    ESP_LOGI(TAG, "Boot heap: free_int=%u largest_dma=%u free_psram=%u",
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA),
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
-
 #if BOARD_ENABLE_RFID
     app_rfid_start();
 #endif
 
-    /* Xac nhan firmware sau 45s on dinh — tranh rollback bi huy som + boot loop. */
     app_ota_schedule_validate_delayed();
 
-    {
-        const size_t in_tot = heap_caps_get_total_size(MALLOC_CAP_INTERNAL);
-        const size_t in_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
-        const size_t sp_tot = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
-        const size_t sp_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
-        ESP_LOGI(TAG,
-                 "Heap: INTERNAL dung ~%u / %u bytes | SPIRAM dung ~%u / %u bytes",
-                 (unsigned)(in_tot - in_free), (unsigned)in_tot,
-                 (unsigned)(sp_tot > 0 ? sp_tot - sp_free : 0), (unsigned)sp_tot);
-    }
+    app_log_boot_status();
 }

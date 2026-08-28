@@ -724,7 +724,7 @@ static void build_idle_screen(void)
     static bool s_timers_created = false;
     if (!s_timers_created) {
         lv_timer_create(update_ui_timer_cb, 500, NULL);
-        lv_timer_create(swipe_check_timer_cb, 40, NULL);
+        lv_timer_create(swipe_check_timer_cb, 16, NULL);
         s_timers_created = true;
     }
 }

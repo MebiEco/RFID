@@ -8,6 +8,7 @@
 
 #include "board_pins.h"
 #include "card_profile.h"
+#include "esp_attr.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_task_wdt.h"
@@ -28,6 +29,11 @@ static const char *TAG = "attend_day";
 #define ATT_CHECKOUT_GAP_MIN 20
 #define ATT_MAX_EMP        128
 #define ATT_LIST_CAP       64
+
+#define ATT_LINE_SZ 384
+EXT_RAM_BSS_ATTR static char s_att_line[ATT_LINE_SZ];
+EXT_RAM_BSS_ATTR static char s_att_json_item[256];
+EXT_RAM_BSS_ATTR static char s_att_json_hdr[400];
 
 typedef struct {
     char uid[20];
@@ -219,15 +225,15 @@ static esp_err_t send_list_item(httpd_req_t *req, bool *first, const char *name,
     char en[96], ei[96];
     json_esc(name ? name : "", en, sizeof(en));
     json_esc(id ? id : "", ei, sizeof(ei));
-    char buf[256];
     if (time_key && time_val && time_val[0]) {
-        snprintf(buf, sizeof(buf), "%s{\"name\":\"%s\",\"id\":\"%s\",\"%s\":\"%s\"}", *first ? "" : ",", en, ei,
-                 time_key, time_val);
+        snprintf(s_att_json_item, sizeof(s_att_json_item), "%s{\"name\":\"%s\",\"id\":\"%s\",\"%s\":\"%s\"}",
+                 *first ? "" : ",", en, ei, time_key, time_val);
     } else {
-        snprintf(buf, sizeof(buf), "%s{\"name\":\"%s\",\"id\":\"%s\"}", *first ? "" : ",", en, ei);
+        snprintf(s_att_json_item, sizeof(s_att_json_item), "%s{\"name\":\"%s\",\"id\":\"%s\"}", *first ? "" : ",",
+                 en, ei);
     }
     *first = false;
-    return send_chunk(req, buf);
+    return send_chunk(req, s_att_json_item);
 }
 
 static void att_format_ymd(const struct tm *t, char *out, size_t outsz)
@@ -480,13 +486,12 @@ expand:
         emps[i].t_last_min = -1;
     }
     rewind(fp);
-    char linebuf[384];
     int line_n = 0;
-    while (fgets(linebuf, sizeof(linebuf), fp)) {
+    while (fgets(s_att_line, ATT_LINE_SZ, fp)) {
         if ((++line_n & 31) == 0) {
             att_feed_wdt();
         }
-        att_apply_line(emps, nemp, linebuf, today_ymd, hist_ymd, NULL, NULL);
+        att_apply_line(emps, nemp, s_att_line, today_ymd, hist_ymd, NULL, NULL);
     }
     return true;
 }
@@ -630,14 +635,13 @@ esp_err_t attendance_day_send_overview_json(httpd_req_t *req)
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
 
-    char hdr[400];
-    snprintf(hdr, sizeof(hdr),
+    snprintf(s_att_json_hdr, sizeof(s_att_json_hdr),
              "{\"ok\":true,\"work_hours\":\"%s\",\"work_start\":\"%s\",\"work_end\":\"%s\",\"registered\":%d,"
              "\"today\":{\"date\":\"%s\","
              "\"arrive\":{\"absent\":%d,\"late\":%d,\"ontime\":%d,\"absent_list\":[",
              work_hours_buf, work_start_str, work_end_str, nemp, today_ymd, t_abs, t_late, t_ontime);
 
-    esp_err_t err = send_chunk(req, hdr);
+    esp_err_t err = send_chunk(req, s_att_json_hdr);
     if (err != ESP_OK) {
         free(emps);
         return err;

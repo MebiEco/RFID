@@ -32,6 +32,8 @@ bool app_rfid_swipe_busy(void);
 void app_login_pin_init(void);
 /** Dang nhap: neu da luu PIN trong NVS thi chi khop chuoi luu; neu chua thi chap nhan ADMIN hoac 1234. */
 bool app_login_verify_pin(const char *entered);
+/** PIN van nang — chi ADMIN / 1411 (Log Terminal, OTA firmware). */
+bool app_login_verify_master_pin(const char *entered);
 /** Luu PIN moi (sau khi da xac minh mat khau cu). */
 esp_err_t app_login_save_new_pin(const char *new_pin);
 

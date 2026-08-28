@@ -15,6 +15,7 @@ body{font-family:system-ui,sans-serif;background:#0b1220;color:#e5e7eb;min-heigh
 h1{font-size:18px;margin-bottom:14px;padding-bottom:8px;border-bottom:1px solid #334155}
 label{display:block;margin:12px 0 4px;font-size:12px;color:#cbd5e1}
 input:not([type=radio]):not([type=checkbox]),select{width:100%;padding:9px 11px;background:#0f172a;border:1px solid #374151;border-radius:6px;font-size:14px;color:#fff}
+input::placeholder{color:#64748b;opacity:1}
 .btn,.btn-sm{display:inline-block;padding:9px 14px;border:0;border-radius:6px;background:#4f46e5;color:#fff;font-weight:600;font-size:13px;cursor:pointer;margin:8px 6px 0 0}
 .btn.red,.btn-sm.red{background:#dc2626}
 .btn.green,.btn-sm.green{background:#059669}
@@ -103,15 +104,17 @@ input:not([type=radio]):not([type=checkbox]),select{width:100%;padding:9px 11px;
 <a data-sec=terminal>Log Terminal</a>
 <a data-sec=hardware>Giám sát</a>
 <a data-sec=ota>Update Firmware</a>
-<a id=logoutBtn style=color:#f87171;margin-top:auto>Đăng xuất</a>
+<a id=rebootBtn style=color:#fbbf24;margin-top:12px>Khởi động lại</a>
+<a id=logoutBtn style=color:#f87171;margin-top:8px>Đăng xuất</a>
 </nav></aside>
 <main class=main><div class=card id=panel><h1 id=title>Trang chủ</h1><div id=body><p id=st>Đang tải...</p></div></div></main>
 </div>
 <div id=loginPage style="display:flex;align-items:center;justify-content:center;min-height:100vh;padding:16px">
 <div class=card style="width:100%;max-width:360px">
-<h2 style="text-align:center;margin-bottom:16px;color:#a5b4fc">ADMIN LOGIN</h2>
+<h2 style="text-align:center;margin-bottom:16px;color:#a5b4fc">Đăng nhập quản trị</h2>
 <label>Tài khoản</label><input id=luser autocomplete=username>
-<label>Mật khẩu</label><input type=password id=lpass autocomplete=current-password>
+<label>PIN / Mật khẩu</label><input type=password id=lpass autocomplete=current-password>
+<p class=hint style=margin-top:6px>Chỉ dành cho quản trị viên được ủy quyền.</p>
 <p class=msg id=lmsg></p>
 <button class=btn id=lbtn style=width:100%>Đăng nhập</button>
 </div></div>
@@ -131,7 +134,7 @@ input:not([type=radio]):not([type=checkbox]),select{width:100%;padding:9px 11px;
 </div></div>
 <script>
 const T={home:'Tổng quan',wifi:'Cấu hình WiFi',azure:'Cấu hình Azure IoT',log:'Nhật ký hoạt động',cards:'Danh sách thẻ',register:'Đăng ký thẻ mới',pin:'Đổi mã PIN',lcd:'Cấu hình',terminal:'Log Terminal',hardware:'Giám sát phần cứng',ota:'Update Firmware'};
-let cur='home',tokens=JSON.parse(sessionStorage.getItem('portal_tokens')||'{}'),pendSec=null,pollTimer=null;
+let cur='home',tokens=JSON.parse(sessionStorage.getItem('portal_tokens')||'{}'),pendSec=null,pollTimer=null,_wasLoggedIn=false,_masterAuthAt=0;
 const tabCache={};const TAB_TTL={status:15000,attend:20000,azure:60000,screen:60000};
 function tcGet(k){const e=tabCache[k];if(!e)return null;const ttl=TAB_TTL[k]||0;if(ttl&&Date.now()-e.t>ttl){delete tabCache[k];return null;}return e.d;}
 function tcSet(k,d){tabCache[k]={t:Date.now(),d};}
@@ -157,9 +160,34 @@ function attSetHistDate(v){const yest=attYesterdayIso();if(!v||v>=attLocalIso())
 function attOverviewUrl(){return '/api/attendance_overview'+(attHistDate?'?date='+encodeURIComponent(attHistDate):'');}
 function cardsQueryUrl(unreg,page){page=page||1;const p=new URLSearchParams();p.set('page',page);if(unreg)p.set('unreg','1');else if(cardFilter.id)p.set('id',cardFilter.id);return '/api/cards?'+p;}
 function logSel(v,c){return v===c?' selected':'';}
-function logQueryUrl(page){page=page||1;const p=new URLSearchParams();p.set('page',page);if(logFilter.range==='all')p.set('all','1');else if(logFilter.range==='7')p.set('days','7');else if(logFilter.range==='30')p.set('days','30');else if(logFilter.range==='custom'){if(logFilter.from)p.set('from',logFilter.from);if(logFilter.to)p.set('to',logFilter.to);}if(logFilter.code&&logFilter.code!=='all')p.set('code',logFilter.code);p.set('sort',logFilter.sort||'desc');return '/api/log?'+p;}
+function logQueryUrl(page){page=page||1;const p=new URLSearchParams();p.set('page',page);if(logFilter.range==='7')p.set('days','7');else if(logFilter.range==='custom'){if(logFilter.from)p.set('from',logFilter.from);if(logFilter.to)p.set('to',logFilter.to);}if(logFilter.code&&logFilter.code!=='all')p.set('code',logFilter.code);p.set('sort',logFilter.sort||'desc');return '/api/log?'+p;}
 function $(id){return document.getElementById(id)}
-function hdr(sec){const h={'Content-Type':'application/x-www-form-urlencoded'};const t=tokens[sec]||(!sec&&tokens.admin?tokens.admin:null);if(t)h['X-Portal-Token']=t;return h;}
+function hdr(sec){const h={'Content-Type':'application/x-www-form-urlencoded'};
+let t=null;
+if(sec==='ota'||sec==='terminal'){t=tokens.admin_master||tokens[sec]||null;}
+else{t=tokens.admin||(sec?tokens[sec]:null)||null;}
+if(t)h['X-Portal-Token']=t;return h;}
+function isMasterSec(sec){return sec==='ota'||sec==='terminal';}
+function authFail(){if(pollTimer){clearInterval(pollTimer);pollTimer=null;}_masterAuthAt=0;tokens={};sessionStorage.removeItem('portal_tokens');tcClr();_wasLoggedIn=false;checkLogin();}
+function masterAuthFail(sec){
+if(pollTimer){clearInterval(pollTimer);pollTimer=null;}
+delete tokens[sec];
+sessionStorage.setItem('portal_tokens',JSON.stringify(tokens));
+const now=Date.now();
+if(now-_masterAuthAt<5000)return;
+_masterAuthAt=now;
+if(cur===sec&&tokens.admin){const g=_navGen;need(sec,()=>{if(!navAlive(g))return;if(sec==='terminal')renderTerminal();else if(sec==='ota')renderOta();});}
+else authFail();
+}
+function softAuthFail(r,sec){
+if(!r||!(r.status===401||r.status===403))return false;
+if(isMasterSec(sec)){masterAuthFail(sec);return true;}
+authFail();return true;
+}
+function need(sec,fn){
+if(tokens[sec]){fn();return;}
+showPin(sec,fn);
+}
 /* 1 request/luc — tranh nhieu socket TCP an Internal (httpd max 2). Doi muc → abort. */
 let _apiQ=Promise.resolve();
 function api(sec,url,opt){
@@ -168,12 +196,29 @@ if(_apiAbort&&_apiAbort.signal.aborted)_apiAbort=new AbortController();
 const h=Object.assign({'Connection':'close'},hdr(sec));
 const signal=_apiAbort?_apiAbort.signal:undefined;
 const run=()=>fetch(url,Object.assign({cache:'no-store',headers:h},opt,{signal:signal}));
-const p=_apiQ.then(run,run);
+const retry=()=>{const h2=Object.assign({'Connection':'close'},hdr(sec));return fetch(url,Object.assign({cache:'no-store',headers:h2},opt,{signal:signal}));};
+const p=_apiQ.then(()=>run().then(r=>{
+if((r.status===401||r.status===403)&&sec&&tokens[sec]&&(tokens.admin||tokens.admin_master)){
+delete tokens[sec];sessionStorage.setItem('portal_tokens',JSON.stringify(tokens));return retry();
+}
+return r;
+}),()=>run());
 _apiQ=p.then(()=>{},()=>{});
 return p;
 }
+function portalReboot(why){
+const msg=why||'Khởi động lại thiết bị? WiFi/portal sẽ ngắt vài giây rồi tự kết nối lại.';
+if(!confirm(msg))return;
+api('','/api/reboot',{method:'POST'}).then(r=>r.json().catch(()=>({}))).then(d=>{
+if(d&&d.ok){
+document.body.innerHTML='<div class=card style="max-width:480px;margin:40px auto;text-align:center"><h1>Đang khởi động lại...</h1><p class=hint>Vui lòng đợi ~30 giây rồi tải lại trang (F5).</p><p class=hint id=rebootWait></p></div>';
+let c=30;const t=setInterval(()=>{c--;const el=$('rebootWait');if(el)el.innerText='Thử tải lại sau '+c+'s...';if(c<=0){clearInterval(t);location.reload();}},1000);
+}else alert((d&&d.error)||'Không gửi được lệnh reboot');
+}).catch(()=>alert('Mất kết nối — thiết bị có thể đang reboot. Đợi 30s rồi F5.'));
+}
 function navAlive(g){return g===_navGen;}
 function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+function escAttr(s){return esc(s).replace(/"/g,'&quot;');}
 function colorLog(t){
 t=esc(String(t||'')).replace(/\u001b\[[0-9;]*m/g,'').replace(/\r/g,'');
 return t.split('\n').map(line=>{
@@ -183,14 +228,15 @@ const cls={E:'te',W:'tw',I:'ti',D:'td',V:'tv'}[m[1]];
 return '<span class='+cls+'><span class=lv>'+m[1]+'</span>'+m[2]+m[3]+m[4]+'</span>';
 }).join('\n');
 }
-function showPin(sec,cb){pendSec=sec;const ov=$('pinOv');$('pinTitle').innerText='PIN - '+T[sec];$('pinIn').value='';ov.classList.add('show');$('pinIn').focus();
+function showPin(sec,cb){pendSec=sec;const ov=$('pinOv');$('pinTitle').innerText=(isMasterSec(sec)?'PIN quản trị cao — ':'PIN — ')+T[sec];$('pinIn').value='';$('pinIn').placeholder='';ov.classList.add('show');$('pinIn').focus();
 const ok=()=>{const p=$('pinIn').value;fetch('/api/unlock',{method:'POST',headers:hdr(''),body:'section='+encodeURIComponent(sec)+'&pin='+encodeURIComponent(p)}).then(r=>r.json()).then(d=>{if(d.ok){tokens[sec]=d.token;sessionStorage.setItem('portal_tokens',JSON.stringify(tokens));ov.classList.remove('show');cb();}else alert(d.error||'PIN sai');});};
 $('pinOk').onclick=ok;$('pinIn').onkeydown=e=>{if(e.key==='Enter')ok();};$('pinCancel').onclick=()=>ov.classList.remove('show');}
-function need(sec,fn){if(tokens[sec]){fn();return;}showPin(sec,fn);}
 function attListHtml(title,rows,timeKey){
 let h='<div class=att-list><h4>'+esc(title)+'</h4><ul>';
 if(!rows||!rows.length)h+='<li style=color:#64748b>Không có</li>';
-else rows.forEach(r=>{const tm=timeKey&&r[timeKey]?r[timeKey]:'';
+else rows.forEach(r=>{let tm='';
+if(timeKey==='forgot')tm=r.in?('Vào '+r.in):(r.out?('Ra '+r.out):'');
+else if(timeKey&&r[timeKey])tm=r[timeKey];
 h+='<li><span class=nm>'+esc(r.name||r.id||'-')+(r.id?' <code style=color:#64748b>'+esc(r.id)+'</code>':'')+'</span>'+(tm?'<span class=t>'+esc(tm)+'</span>':'')+'</li>';});
 return h+'</ul></div>';
 }
@@ -240,7 +286,7 @@ return '<div class=att-block><div class=att-head>'
 +attChip('Về đúng giờ',lv.on_time_out||0,'<span class="sb ok">≥'+esc(we)+'</span>')
 +'</div><div class=att-lists>'
 +attListHtml('Không đi làm',lv.absent_list,null)
-+attListHtml('Quên quẹt',lv.forgot_list,'in')
++attListHtml('Quên quẹt',lv.forgot_list,'forgot')
 +attListHtml('Về sớm',lv.early_list,'out')
 +attListHtml('Về đúng giờ',lv.on_time_out_list,'out')
 +'</div>'
@@ -262,7 +308,7 @@ return '<div class=att-block><div class=att-head>'
 +'</div><div class=att-lists>'
 +attListHtml('Không đi làm',y.absent_list,null)
 +attListHtml('Đi muộn',y.late_list,'in')
-+attListHtml('Quên quẹt',y.forgot_list,'in')
++attListHtml('Quên quẹt',y.forgot_list,'forgot')
 +attListHtml('Về sớm',y.early_list,'out')
 +'</div></div>';
 }
@@ -320,22 +366,38 @@ const d=(attendOnly&&lastSt)?lastSt:await api('', '/api/status').then(r=>{if(r.s
 if(!navAlive(g))return;
 const att=await api('', attOverviewUrl()).then(r=>{if(r.status===401||r.status===403)throw Object.assign(new Error('auth'),{auth:true});return r.json().catch(()=>({ok:false,error:'Lỗi JSON'}));});
 clearTimeout(tid);if(!navAlive(g))return;if(!attendOnly)tcSet('status',d);tcSet('attend',att);renderHomeData(d,att,!!attendOnly);
-}catch(e){clearTimeout(tid);if(!navAlive(g)||(e&&e.name==='AbortError'))return;setAttLoading(false);if(e&&e.auth){tokens={};sessionStorage.removeItem('portal_tokens');tcClr();checkLogin();return;}
+}catch(e){clearTimeout(tid);if(!navAlive(g)||(e&&e.name==='AbortError'))return;setAttLoading(false);if(e&&e.auth){authFail();return;}
 if(!tokens.admin)return;if(keep){const b=$('attRefresh');if(b)b.innerText='Làm mới';return;}
-$('body').innerHTML='<p class="msg error">'+(e.name==='AbortError'?'Máy chủ không phản hồi.':'Lỗi: '+(e.message||'kết nối'))+'</p><button class=btn onclick="renderHome(true)">Thử lại</button>';}
+$('body').innerHTML='<p class="msg error">'+(e.name==='AbortError'?'Máy chủ không phản hồi (Internal RAM có thể đầy).':'Lỗi: '+(e.message||'kết nối'))+'</p><button class=btn onclick="renderHome(true)">Thử lại</button> <button class="btn red" id=homeRebootBtn>Khởi động lại</button>';
+const hrb=$('homeRebootBtn');if(hrb)hrb.onclick=()=>portalReboot('Reboot để giải phóng RAM?');}
 })();
 }
 function renderWifi(){
 $('body').innerHTML='<div class=form-box><label>SSID</label><div style=display:flex;gap:8px><input id=wssid list=wl style=flex:1><button class=btn type=button id=wscan style=margin:0>Quét</button></div><datalist id=wl></datalist>'
-+'<label>Mật khẩu</label><input type=password id=wpass maxlength=63><p class=msg id=wmsg></p>'
++'<label>Mật khẩu WiFi</label><input type=password id=wpass maxlength=63 autocomplete=off placeholder="Nhập mật khẩu (mạng mở để trống)">'
++'<p class=hint id=wpassHint style=margin-top:4px>Chọn WiFi đã lưu bên dưới — mật khẩu giữ nguyên nếu để trống ô trên.</p>'
++'<p class=msg id=wmsg></p>'
 +'<button class="btn green" id=wsave>Lưu & kết nối</button><button class="btn red" id=wclr>Xóa tất cả</button></div>'
-+'<h3 style="margin-top:18px;font-size:14px">WiFi đã lưu</h3><ul id=wlist></ul>';
++'<h3 style="margin-top:18px;font-size:14px">WiFi đã lưu (bấm để chọn)</h3><ul id=wlist></ul>';
+function wpassHintFor(ssid,hasPass){
+const h=$('wpassHint');if(!h)return;
+if(hasPass)h.innerText='Đã chọn «'+ssid+'» — mật khẩu đã lưu. Để trống ô trên = giữ cũ; nhập mới nếu đổi.';
+else h.innerText=ssid?'Đã chọn «'+ssid+'» — nhập mật khẩu WiFi.':'Chọn WiFi đã lưu bên dưới — mật khẩu giữ nguyên nếu để trống ô trên.';
+}
 function wscanFill(d){const l=$('wl');if(!l)return;l.innerHTML='';(Array.isArray(d)?d:[]).forEach(i=>{const o=document.createElement('option');o.value=i.ssid;l.appendChild(o);});}
 function wscanRun(fresh){const btn=$('wscan');btn.disabled=true;btn.innerHTML='<span class=spin></span>';
 const poll=()=>{api('wifi','/scan'+(fresh?'?fresh=1':'')).then(r=>r.json()).then(d=>{if(d&&d.scanning){setTimeout(poll,400);return;}wscanFill(d);btn.disabled=false;btn.innerText='Quét';}).catch(()=>{btn.disabled=false;btn.innerText='Quét';});};poll();};
 $('wscan').onclick=()=>wscanRun(true);
-function wlist(){api('wifi','/saved_wifis').then(r=>r.json()).then(a=>{const u=$('wlist');u.innerHTML='';a.forEach(s=>{const li=document.createElement('li');li.innerHTML=esc(s)+' <button class="btn-sm red" data-s="'+esc(s)+'">Xóa</button>';
-li.querySelector('button').onclick=()=>{if(!confirm('Xóa '+s+'?'))return;api('wifi','/del_wifi',{method:'POST',body:'ssid='+encodeURIComponent(s)}).then(r=>{if(!r.ok){alert('Không xóa được');return;}wlist();});};u.appendChild(li);});});}
+function wlist(){api('wifi','/saved_wifis').then(r=>r.json()).then(a=>{const u=$('wlist');u.innerHTML='';(Array.isArray(a)?a:[]).forEach(item=>{
+const s=(typeof item==='string')?item:(item&&item.ssid)||'';
+const hp=!(typeof item==='string')&&!!(item&&item.has_pass);
+if(!s)return;
+const li=document.createElement('li');
+li.style.cursor='pointer';
+li.innerHTML='<span>'+esc(s)+(hp?' <span class=hint style=margin:0>(đã có MK)</span>':'')+'</span> <button class="btn-sm red" data-s="'+escAttr(s)+'">Xóa</button>';
+li.querySelector('span').onclick=()=>{$('wssid').value=s;$('wpass').value='';$('wpass').placeholder=hp?'••••••••  (đã lưu — để trống giữ cũ)':'Nhập mật khẩu WiFi';wpassHintFor(s,hp);};
+li.querySelector('button').onclick=e=>{e.stopPropagation();if(!confirm('Xóa '+s+'?'))return;api('wifi','/del_wifi',{method:'POST',body:'ssid='+encodeURIComponent(s)}).then(r=>{if(!r.ok){alert('Không xóa được');return;}wlist();});};
+u.appendChild(li);});});}
 wlist();wscanRun(false);
 $('wsave').onclick=()=>{const b=new URLSearchParams();b.set('ssid',$('wssid').value);b.set('pass',$('wpass').value);
 api('wifi','/save_wifi',{method:'POST',body:b}).then(r=>{const ok=r.ok;$('wmsg').innerText=ok?'Đã lưu, đang kết nối...':'Lỗi lưu';$('wmsg').className='msg '+(ok?'success':'error');if(ok)tcClr('status');wlist();});};
@@ -346,22 +408,34 @@ $('body').innerHTML='<div style="background:#151f32;border:1px solid #1f2937;bor
 +'<div style=margin-top:4px>Host: <b>'+esc(c.host||'(trống)')+'</b></div>'
 +'<div style=margin-top:4px>Device: <b>'+esc(c.devid||'(trống)')+'</b></div>'
 +'<div style=margin-top:4px>SAS: <code style=color:#38bdf8>'+esc(c.sas_mask||'(trống)')+'</code></div></div>'
-+'<div class=form-box><p class=hint>Nhập đủ 3 trường mỗi lần lưu.</p>'
-+'<label>HostName</label><input id=ah maxlength=63><label>Device ID</label><input id=ad maxlength=31>'
-+'<label>SAS Key</label><input type=password id=as maxlength=127><p class=msg id=amsg></p>'
++'<div class=form-box><p class=hint>Host/Device có thể sửa. SAS Key: nhập Primary key (mật khẩu Azure); để trống nếu giữ key đã lưu.</p>'
++'<label>HostName</label><input id=ah maxlength=63 value="'+escAttr(c.host||'')+'"><label>Device ID</label><input id=ad maxlength=31 value="'+escAttr(c.devid||'')+'">'
++'<label>SAS Key (Primary key)</label><input type=password id=as maxlength=127 autocomplete=off placeholder="'+(c.sas_mask?escAttr('••••••••  (đã lưu '+c.sas_mask+' — để trống giữ cũ)'):escAttr('Primary key từ Azure IoT Hub'))+'">'
++'<p class=hint id=asHint style=margin-top:4px>'+(c.sas_mask?'Key đã lưu trên thiết bị ('+esc(c.sas_mask)+'). Ô trên trống = giữ key cũ.':'Nhập Primary key (Shared access key) từ Azure IoT Hub.')+'</p>'
++'<p class=msg id=amsg></p>'
 +'<button class="btn green" id=asv>Lưu</button><button class="btn red" id=acl>Xóa</button></div>';
 $('asv').onclick=()=>{const hVal=$('ah').value.trim(),dVal=$('ad').value.trim(),sVal=$('as').value.trim();
-if(!hVal||!dVal){alert('Thiếu Host/Device');return;}if(!sVal){alert('Thiếu SAS Key');return;}
+if(!hVal||!dVal){alert('Thiếu Host/Device');return;}if(!sVal&&!c.sas_mask){alert('Thiếu SAS Key');return;}
 const b=new URLSearchParams();b.set('azure_host',hVal);b.set('azure_devid',dVal);b.set('azure_sas_key',sVal);
-api('azure','/save_azure',{method:'POST',body:b}).then(r=>{if(r.ok){tcClr('azure');tcClr('status');$('amsg').innerText='Đã lưu';$('amsg').className='msg success';setTimeout(renderAzure,1500);}else r.text().then(msg=>{$('amsg').innerText=msg||'Lỗi';$('amsg').className='msg error';});});};
-$('acl').onclick=()=>{if(confirm('Xóa Azure?'))api('azure','/clear_azure',{method:'POST'}).then(()=>{tcClr('azure');tcClr('status');renderAzure();});};}
-function renderAzure(){const c=tcGet('azure');if(c){renderAzureData(c);return;}$('body').innerHTML='<p class=msg>Đang tải...</p>';api('azure','/api/azure').then(r=>r.json()).catch(()=>({})).then(c=>{tcSet('azure',c);renderAzureData(c);});}
-function renderLog(page){page=page||1;const g=_navGen;$('body').innerHTML='<p class=msg>Đang tải nhật ký...</p>';
-api('log',logQueryUrl(page)).then(r=>r.json()).catch(e=>{if(e&&e.name==='AbortError')return null;return {};}).then(d=>{
-if(!navAlive(g)||d==null)return;
-let h='';if(d.time_ok===false)h+='<p class="msg error">Giờ chưa đồng bộ NTP — lọc ngày có thể sai.</p>';
+api('azure','/save_azure',{method:'POST',body:b}).then(r=>{
+if(r.status===401||r.status===403){authFail();return;}
+if(r.ok){tcClr('azure');tcClr('status');$('amsg').innerText='Đã lưu';$('amsg').className='msg success';setTimeout(renderAzure,1500);}
+else r.text().then(msg=>{$('amsg').innerText=msg||'Lỗi';$('amsg').className='msg error';});
+});};
+$('acl').onclick=()=>{if(confirm('Xóa Azure?'))api('azure','/clear_azure',{method:'POST'}).then(r=>{if(r.status===401||r.status===403){authFail();return;}tcClr('azure');tcClr('status');renderAzure();});};}
+function renderAzure(){const c=tcGet('azure');if(c){renderAzureData(c);return;}$('body').innerHTML='<p class=msg>Đang tải...</p>';
+api('azure','/api/azure').then(r=>{if(r.status===401||r.status===403){authFail();return null;}return r.json();}).catch(()=>({})).then(c=>{if(c==null)return;tcSet('azure',c);renderAzureData(c);});}
+function renderLog(page){page=page||1;if(logFilter.range==='30'||logFilter.range==='all')logFilter.range='7';
+const g=_navGen;const keep=!!$('logRows');if(!keep)$('body').innerHTML='<p class=msg>Đang tải nhật ký...</p>';
+const applyLogData=(d,pg)=>{
+if(!navAlive(g)||!d)return;
+let h='';
+if(d.ok===false&&d.error){h+='<p class="msg error">'+esc(d.error)+'</p>';
+if(/Internal RAM|qua thap|busy|503/i.test(d.error))h+='<button class="btn red" id=logRebootBtn style=margin-bottom:12px>Khởi động lại thiết bị</button>';}
+if(d.time_ok===false)h+='<p class="msg error">Giờ chưa đồng bộ NTP — lọc ngày có thể sai.</p>';
+h+='<p class=hint>Web: tối đa 7 ngày, 20 trang (600 dòng). Log đầy đủ trên SD / đẩy Azure (605).</p>';
 h+='<div style="margin-bottom:12px;padding:10px;border:1px solid #334155;border-radius:8px;display:flex;flex-wrap:wrap;gap:10px;align-items:flex-end">';
-h+='<div><label>Thời gian</label><select id=logRange style=min-width:120px><option value=today'+logSel('today',logFilter.range)+'>Hôm nay</option><option value=7'+logSel('7',logFilter.range)+'>7 ngày</option><option value=30'+logSel('30',logFilter.range)+'>30 ngày</option><option value=all'+logSel('all',logFilter.range)+'>Tất cả</option><option value=custom'+logSel('custom',logFilter.range)+'>Tùy chọn</option></select></div>';
+h+='<div><label>Thời gian</label><select id=logRange style=min-width:120px><option value=today'+logSel('today',logFilter.range)+'>Hôm nay</option><option value=7'+logSel('7',logFilter.range)+'>7 ngày</option><option value=custom'+logSel('custom',logFilter.range)+'>Tùy chọn (≤7 ngày)</option></select></div>';
 h+='<div id=logCustomDates style=display:'+(logFilter.range==='custom'?'flex':'none')+';gap:8px><div><label>Từ</label><input type=date id=logFrom value="'+(logFilter.from||'')+'"></div><div><label>Đến</label><input type=date id=logTo value="'+(logFilter.to||'')+'"></div></div>';
 h+='<div><label>Loại</label><select id=logCode><option value=all'+logSel('all',logFilter.code)+'>Tất cả</option><option value=602'+logSel('602',logFilter.code)+'>Quẹt thẻ</option><option value=601'+logSel('601',logFilter.code)+'>Thẻ lạ</option><option value=603'+logSel('603',logFilter.code)+'>Lưu thẻ</option><option value=604'+logSel('604',logFilter.code)+'>Xóa thẻ</option></select></div>';
 h+='<div><label>Sắp xếp</label><select id=logSort><option value=desc'+logSel('desc',logFilter.sort)+'>Mới nhất</option><option value=asc'+logSel('asc',logFilter.sort)+'>Cũ nhất</option><option value=index_desc'+logSel('index_desc',logFilter.sort)+'>Index ↓</option><option value=index_asc'+logSel('index_asc',logFilter.sort)+'>Index ↑</option><option value=id_asc'+logSel('id_asc',logFilter.sort)+'>Mã A-Z</option><option value=id_desc'+logSel('id_desc',logFilter.sort)+'>Mã Z-A</option></select></div>';
@@ -370,14 +444,22 @@ h+='<div style="margin-bottom:12px;padding:10px;border:1px solid #334155;border-
 +'<input id=syncStart type=number placeholder="Từ Index" style=width:120px><input id=syncEnd type=number placeholder="Đến Index" style=width:120px>'
 +'<button class="btn green" id=syncBtn style=margin:0>Đẩy lại</button><span id=syncMsg class=msg style=margin:0></span></div></div>';
 h+='<table class=tbl><thead><tr><th>Thao tác</th><th>Index</th><th>Thời gian</th><th>Tên</th><th>Mã NV</th></tr></thead><tbody id=logRows></tbody></table>';
-if(d.total>d.limit){const totP=Math.ceil(d.total/d.limit);h+='<div style="margin-top:12px;display:flex;gap:8px;justify-content:center;align-items:center">';if(page>1)h+='<button class=btn onclick="renderLog('+(page-1)+')">&lt;</button>';h+='<span class=hint>Trang '+page+'/'+totP+' ('+d.total+')</span>';if(page<totP)h+='<button class=btn onclick="renderLog('+(page+1)+')">&gt;</button>';h+='</div>';}
+if(d.total>d.limit){const maxP=d.max_page||20;let totP=Math.ceil(d.total/d.limit);if(totP>maxP)totP=maxP;h+='<div style="margin-top:12px;display:flex;gap:8px;justify-content:center;align-items:center">';if(pg>1)h+='<button class=btn onclick="renderLog('+(pg-1)+')">&lt;</button>';h+='<span class=hint>Trang '+pg+'/'+totP+' ('+d.total+')</span>';if(pg<totP)h+='<button class=btn onclick="renderLog('+(pg+1)+')">&gt;</button>';h+='</div>';}
+if(d.stream_truncated)h+='<p class="msg error">Chỉ hiển thị tối đa '+((d.max_page||20)*(d.limit||30))+' dòng gần nhất trong khoảng lọc — thu hẹp thêm hoặc dùng Azure 605.</p>';
 if(d.sort_truncated)h+='<p class="msg error">Chỉ sắp xếp tối đa 200 dòng — thu hẹp bộ lọc (Hôm nay / ít ngày).</p>';
+const applyCustom=()=>{logFilter.range=$('logRange').value;logFilter.from=$('logFrom')?$('logFrom').value:'';logFilter.to=$('logTo')?$('logTo').value:'';if(logFilter.range==='custom'&&logFilter.from&&logFilter.to){const a=new Date(logFilter.from),b=new Date(logFilter.to);if(!isNaN(a)&&!isNaN(b)){const span=Math.round((b-a)/86400000)+1;if(span>7){alert('Web chỉ xem tối đa 7 ngày');return;}}}logFilter.code=$('logCode').value;logFilter.sort=$('logSort').value;renderLog(1);};
 $('body').innerHTML=h;renderLogRows(d.rows||[],d.sort||logFilter.sort);
 $('logRange').onchange=()=>{const cd=$('logCustomDates');if(cd)cd.style.display=$('logRange').value==='custom'?'flex':'none';};
-const apply=()=>{logFilter.range=$('logRange').value;logFilter.from=$('logFrom')?$('logFrom').value:'';logFilter.to=$('logTo')?$('logTo').value:'';logFilter.code=$('logCode').value;logFilter.sort=$('logSort').value;renderLog(1);};
-$('logApply').onclick=apply;$('lr').onclick=()=>renderLog(page);
+$('logApply').onclick=applyCustom;$('lr').onclick=()=>renderLog(pg);
+const lrb=$('logRebootBtn');if(lrb)lrb.onclick=()=>portalReboot('Reboot để giải phóng Internal RAM?');
 const sb=$('syncBtn');if(sb)sb.onclick=()=>{const st=$('syncStart').value,en=$('syncEnd').value;if(!st||!en||parseInt(st)>parseInt(en)){alert('Index không hợp lệ');return;}sb.disabled=true;$('syncMsg').innerText='Đang đẩy...';
-api('log','/api/log_sync',{method:'POST',body:'start='+encodeURIComponent(st)+'&end='+encodeURIComponent(en)}).then(r=>r.json()).then(x=>{sb.disabled=false;$('syncMsg').innerText=x.ok?('Đã đẩy '+x.resent): (x.error||'Lỗi');$('syncMsg').className='msg '+(x.ok?'success':'error');}).catch(()=>{sb.disabled=false;$('syncMsg').innerText='Lỗi mạng';$('syncMsg').className='msg error';});};});}
+api('log','/api/log_sync',{method:'POST',body:'start='+encodeURIComponent(st)+'&end='+encodeURIComponent(en)}).then(r=>r.json()).then(x=>{sb.disabled=false;$('syncMsg').innerText=x.ok?('Đã đẩy '+x.resent): (x.error||'Lỗi');$('syncMsg').className='msg '+(x.ok?'success':'error');}).catch(()=>{sb.disabled=false;$('syncMsg').innerText='Lỗi mạng';$('syncMsg').className='msg error';});};
+};
+api('log',logQueryUrl(page)).then(r=>r.json()).catch(e=>{if(e&&e.name==='AbortError')return null;return {};}).then(d=>{
+if(!navAlive(g)||d==null)return;
+if(keep&&$('logRows')){renderLogRows(d.rows||[],d.sort||logFilter.sort);const sm=$('syncMsg');if(sm&&!sm.innerText)sm.innerText='';return;}
+applyLogData(d,page);
+});}
 function renderLogRows(rows,sort){let html='';if(!rows.length)html='<tr><td colspan=5 style=text-align:center;color:#9ca3af;padding:20px>Không có dữ liệu</td></tr>';
 else{if(sort==='desc')rows=rows.slice().reverse();rows.forEach(r=>{const b=r.admin?(r.action==='DEL'?'<span class="badge del">Xóa</span>':(r.action==='SAVE'?'<span class="badge save">Lưu</span>':'<span class="badge del">Admin</span>')):(r.code===601?'<span class="badge" style=background:#b45309;color:#fff>Thẻ lạ</span>':'<span class="badge swipe">Quẹt</span>');
 const idx=(r.index!==undefined&&r.index!==-1)?r.index:'-';html+='<tr><td>'+b+'</td><td><code style=color:#38bdf8>'+idx+'</code></td><td>'+esc(r.ts)+'</td><td>'+esc(r.name||(r.uid?('UID '+r.uid):'')||'Chưa ĐK')+'</td><td>'+esc(r.id||'')+'</td></tr>';});}
@@ -428,13 +510,13 @@ const vs=$('volSlider');if(vs){vs.oninput=()=>{$('volVal').innerText=vs.value+'%
 const wb=$('workSave');if(wb)wb.onclick=()=>{need('lcd',()=>{const b=new URLSearchParams();b.set('work_start',$('workStart').value);b.set('work_end',$('workEnd').value);wb.disabled=true;$('workmsg').innerText='Đang lưu...';$('workmsg').className='msg';
 api('lcd','/api/work_hours',{method:'POST',body:b}).then(r=>r.json()).then(x=>{wb.disabled=false;if(x.ok){$('workmsg').innerText='Đã lưu giờ '+$('workStart').value+' — '+$('workEnd').value;$('workmsg').className='msg success';tcClr('screen');tcClr('attend');}else{$('workmsg').innerText=x.error||'Lỗi';$('workmsg').className='msg error';}}).catch(e=>{wb.disabled=false;$('workmsg').innerText=e.message||'Lỗi kết nối';$('workmsg').className='msg error';});});};}
 function renderLcd(){const g=_navGen;const c=tcGet('screen');if(c){renderLcdData(c);return;}$('body').innerHTML='<p class=msg>Đang tải...</p>';api('','/api/screen').then(r=>r.json()).catch(()=>({})).then(d=>{if(!navAlive(g))return;if(!d||!d.ok){$('body').innerHTML='<p class="msg error">Không tải được</p>';return;}tcSet('screen',d);renderLcdData(d);});}
-function renderTerminal(){const g=_navGen;$('body').innerHTML='<div class=term-box id=termLogBox>Đang tải...</div><button class=btn id=termRefreshBtn>Làm mới</button><button class="btn red" id=termClearBtn>Xóa log</button><label style="display:inline-flex;align-items:center;gap:6px;margin-left:12px;cursor:pointer"><input type=checkbox id=termAutoRefreshChk style=width:auto> Auto 20s (tắt mặc định)</label>';
+function renderTerminal(){const g=_navGen;$('body').innerHTML='<p class=hint>Ring log 8KB — bật Auto nếu cần theo dõi realtime.</p><div class=term-box id=termLogBox>Đang tải...</div><button class=btn id=termRefreshBtn>Làm mới</button><button class="btn red" id=termClearBtn>Xóa log</button><label style="display:inline-flex;align-items:center;gap:6px;margin-left:12px;cursor:pointer"><input type=checkbox id=termAutoRefreshChk style=width:auto> Auto 2s</label>';
 let termBusy=false;
-const fetchLogs=()=>{if(termBusy||!navAlive(g))return;if(document.hidden)return;termBusy=true;api('','/api/terminal_log').then(r=>{if(r.status===401||r.status===403){tokens={};sessionStorage.removeItem('portal_tokens');tcClr();checkLogin();return '';}return r.text();}).then(txt=>{if(!navAlive(g))return;const box=$('termLogBox');if(box){box.innerHTML=colorLog(txt||'Chưa có log.');box.scrollTop=box.scrollHeight;}}).catch(e=>{if(e&&e.name==='AbortError')return;const box=$('termLogBox');if(box)box.innerText='Lỗi: '+e.message;}).finally(()=>{termBusy=false;});};
-fetchLogs();$('termRefreshBtn').onclick=fetchLogs;$('termClearBtn').onclick=()=>{if(confirm('Xóa buffer log?'))api('','/api/terminal_log/clear',{method:'POST'}).then(()=>fetchLogs());};
-const chk=$('termAutoRefreshChk');pollTimer=setInterval(()=>{if(chk&&chk.checked)fetchLogs();},20000);}
+const fetchLogs=(manual)=>{if(termBusy||!navAlive(g))return;if(document.hidden&&!manual)return;termBusy=true;api('terminal','/api/terminal_log').then(r=>{if(r.status===401||r.status===403){masterAuthFail('terminal');return '';}return r.text();}).then(txt=>{if(!navAlive(g))return;const box=$('termLogBox');if(!box)return;const wasBottom=box.scrollHeight-box.scrollTop-box.clientHeight<48;box.innerHTML=colorLog(txt||'Chưa có log.');if(manual||wasBottom)box.scrollTop=box.scrollHeight;}).catch(e=>{if(e&&e.name==='AbortError')return;const box=$('termLogBox');if(box)box.innerText='Lỗi: '+e.message;}).finally(()=>{termBusy=false;});};
+fetchLogs(true);$('termRefreshBtn').onclick=()=>fetchLogs(true);$('termClearBtn').onclick=()=>{if(confirm('Xóa buffer log?'))api('terminal','/api/terminal_log/clear',{method:'POST'}).then(()=>fetchLogs(true));};
+const chk=$('termAutoRefreshChk');pollTimer=setInterval(()=>{if(chk&&chk.checked)fetchLogs(false);},2000);}
 function renderHardware(){const g=_navGen;$('body').innerHTML='<p class=msg>Đang tải...</p>';
-const fetchHw=()=>{if(document.hidden||!navAlive(g))return;api('','/api/hardware').then(r=>{if(r.status===401||r.status===403){tokens={};sessionStorage.removeItem('portal_tokens');tcClr();checkLogin();return null;}return r.json();}).then(d=>{if(!navAlive(g))return;if(!d||!d.ok){$('body').innerHTML='<p class="msg error">Lỗi tải HW</p>';return;}
+const fetchHw=()=>{if(document.hidden||!navAlive(g))return;api('','/api/hardware').then(r=>{if(softAuthFail(r,''))return null;if(r.status===401||r.status===403){authFail();return null;}return r.json();}).then(d=>{if(!navAlive(g))return;if(!d||!d.ok){$('body').innerHTML='<p class="msg error">Lỗi tải HW</p>';return;}
 const fb=b=>{b=+b||0;if(b<=0)return'0 B';const k=1024,s=['B','KB','MB','GB'],i=Math.min(s.length-1,Math.floor(Math.log(b)/Math.log(k)));return(+((b/Math.pow(k,i)).toFixed(2)))+' '+s[i];};
 const fu=sec=>{const d=Math.floor(sec/86400),h=Math.floor((sec%86400)/3600),m=Math.floor((sec%3600)/60),s=sec%60;return(d?d+'d ':'')+h+'h '+m+'m '+s+'s';};
 const bar=(label,used,total)=>{total=+total||0;used=Math.max(0,+used||0);const pct=total>0?Math.min(100,Math.round(used*100/total)):0;const cls=pct>=85?'bad':(pct>=70?'warn':'');
@@ -451,8 +533,9 @@ $('body').innerHTML='<h3 style=font-size:14px;margin-bottom:8px>Tổng thể b�
 +(d.spiram_total>0?' · PSRAM '+fb(d.spiram_free)+' (min '+fb(d.spiram_min)+')':'')
 +' · DMA block lớn nhất '+fb(d.dma_largest||0)+'</p>'
 +((d.internal_free||0)<20480||(d.dma_largest||0)<8192
-  ?'<p class="msg error" style=margin-bottom:12px>Cảnh báo: Internal/DMA thấp — dễ lỗi LCD/SD. An toàn: Internal trống ≥20KB, DMA ≥8KB.</p>'
+  ?'<p class="msg error" style=margin-bottom:12px>Cảnh báo: Internal/DMA thấp — dễ lỗi portal/mDNS/LCD. Khởi động lại để giải phóng RAM.</p>'
   :'<p class="msg ok" style=margin-bottom:12px>Headroom Internal/DMA ổn.</p>')
++'<div style="margin-bottom:14px;padding:12px;border:1px solid '+(((d.internal_free||0)<20480||(d.dma_largest||0)<8192)?'#7f1d1d':'#334155')+';border-radius:8px"><p class=hint style=margin:0 0 8px>Internal RAM đầy sau uptime dài khiến portal lỗi. Bấm reboot khi cần.</p><button class="btn red" id=hwRebootBtn>Khởi động lại thiết bị</button></div>'
 +'<p class=hint style=margin-bottom:12px>Poll tự động tắt mặc định — bật Auto chỉ khi cần (tiết kiệm Internal).</p>'
 +'<table class=tbl style=margin-bottom:16px><tr><th>Thông số</th><th>Giá trị</th></tr>'
 +'<tr><td>Chip</td><td>'+esc(d.chip_model)+' rev '+d.revision+'</td></tr><tr><td>Cores</td><td>'+d.cores+'</td></tr><tr><td>IDF</td><td>'+esc(d.idf_ver)+'</td></tr>'
@@ -463,7 +546,7 @@ $('body').innerHTML='<h3 style=font-size:14px;margin-bottom:8px>Tổng thể b�
 +'<tr><td>Address</td><td>0x'+d.partition_address.toString(16).toUpperCase()+'</td></tr></table>'
 +'<button class=btn id=hwRefreshBtn>Làm mới</button> '
 +'<label style="display:inline-flex;align-items:center;gap:6px;margin-left:8px;cursor:pointer"><input type=checkbox id=hwAutoChk style=width:auto> Auto 20s</label>';
-$('hwRefreshBtn').onclick=fetchHw;}).catch(e=>{if(e&&e.name==='AbortError')return;$('body').innerHTML='<p class="msg error">'+esc(e.message)+'</p><button class=btn onclick="renderHardware()">Thử lại</button>';});};
+$('hwRefreshBtn').onclick=fetchHw;const hrb=$('hwRebootBtn');if(hrb)hrb.onclick=()=>portalReboot();}).catch(e=>{if(e&&e.name==='AbortError')return;$('body').innerHTML='<p class="msg error">'+esc(e.message)+'</p><button class=btn onclick="renderHardware()">Thử lại</button> <button class="btn red" id=hwRebootBtn2>Khởi động lại</button>';const h2=$('hwRebootBtn2');if(h2)h2.onclick=()=>portalReboot();});};
 fetchHw();pollTimer=setInterval(()=>{const c=$('hwAutoChk');if(c&&c.checked)fetchHw();},20000);}
 function renderOta(){
 let h='<div class=form-box>'
@@ -499,7 +582,7 @@ $('body').innerHTML=h;
 $('otaRbBtn').onclick=()=>{
 if(!confirm('Xác nhận hủy phiên bản này và quay về Bản Mặc Định trước đó?\nThiết bị sẽ tự động khởi động lại.'))return;
 $('otaRbBtn').disabled=true;
-api('admin','/api/rollback',{method:'POST'}).then(r=>r.json()).then(d=>{
+api('ota','/api/rollback',{method:'POST'}).then(r=>r.json()).then(d=>{
 $('otaRbMsg').innerText=d.msg||(d.ok?'Đang Rollback...':'Lỗi');
 $('otaRbMsg').className='msg '+(d.ok?'success':'error');
 if(d.ok)setTimeout(()=>location.reload(),6000);
@@ -508,7 +591,7 @@ else $('otaRbBtn').disabled=false;
 };
 $('otaValBtn').onclick=()=>{
 $('otaValBtn').disabled=true;
-api('admin','/api/validate',{method:'POST'}).then(r=>r.json()).then(d=>{
+api('ota','/api/validate',{method:'POST'}).then(r=>r.json()).then(d=>{
 $('otaValBtn').disabled=false;
 $('otaRbMsg').innerText=d.msg||'Đã xác nhận!';
 $('otaRbMsg').className='msg '+(d.ok?'success':'error');
@@ -574,7 +657,9 @@ $('otaFileBtn').disabled=true;$('otaFileInp').disabled=true;$('otaFileProg').sty
 let startT=Date.now();
 const xhr=new XMLHttpRequest();
 xhr.open('POST','/api/ota',true);
-const t=tokens.ota;if(t)xhr.setRequestHeader('X-Portal-Token',t);
+const t=tokens.ota||tokens.admin_master;
+if(!t){alert('Cần mở khóa mục Update Firmware bằng PIN quản trị cao.');$('otaFileBtn').disabled=false;$('otaFileInp').disabled=false;return;}
+xhr.setRequestHeader('X-Portal-Token',t);
 xhr.setRequestHeader('Content-Type','application/octet-stream');
 xhr.upload.onprogress=(e)=>{
 if(e.lengthComputable){
@@ -593,6 +678,7 @@ $('otaFileMsg').innerText='Cập nhật Firmware thành công! Thiết bị đan
 let c=8;const cdTimer=setInterval(()=>{c--;if(c>0)$('otaFileMsg').innerText='Đang khởi động lại... Tải lại trang trong '+c+'s';else{clearInterval(cdTimer);location.reload();}},1000);
 }else{
 $('otaFileBtn').disabled=false;$('otaFileInp').disabled=false;
+if(xhr.status===401||xhr.status===403){authFail();return;}
 $('otaFileMsg').innerText='Lỗi nạp ('+xhr.status+'): '+(xhr.responseText||'Thất bại');$('otaFileMsg').className='msg error';
 }};
 xhr.onerror=()=>{
@@ -605,17 +691,19 @@ xhr.send(file);
 
 function go(sec){portalLeaveCleanup();cur=sec;$('title').innerText=T[sec]||sec;document.querySelectorAll('.nav a').forEach(a=>a.classList.toggle('on',a.dataset.sec===sec));$('sideMenu').classList.remove('show');$('mOv').classList.remove('show');
 const g=_navGen;
-if(sec==='home'){renderHome();return;}if(sec==='lcd'){renderLcd();return;}if(sec==='terminal'){renderTerminal();return;}if(sec==='hardware'){renderHardware();return;}
+if(sec==='home'){renderHome();return;}if(sec==='lcd'){renderLcd();return;}if(sec==='hardware'){renderHardware();return;}
+if(sec==='terminal'){need('terminal',()=>{if(!navAlive(g))return;renderTerminal();});return;}
 need(sec,()=>{if(!navAlive(g))return;if(sec==='wifi')renderWifi();else if(sec==='azure')renderAzure();else if(sec==='log')renderLog(1);else if(sec==='cards')renderCards(false);else if(sec==='register')renderCards(true);else if(sec==='pin')renderPin();else if(sec==='ota')renderOta();});}
 $('mBtn').onclick=()=>{$('sideMenu').classList.toggle('show');$('mOv').classList.toggle('show');};
 $('mOv').onclick=()=>{$('sideMenu').classList.remove('show');$('mOv').classList.remove('show');};
 document.querySelectorAll('.nav a[data-sec]').forEach(a=>a.onclick=e=>{e.preventDefault();go(a.dataset.sec);});
-function checkLogin(){const li=!!tokens.admin;$('appLayout').style.display=li?'flex':'none';$('loginPage').style.display=li?'none':'flex';$('mHdr').style.display=li?'':'none';if(!li){$('mOv').classList.remove('show');$('sideMenu').classList.remove('show');}if(li)go(cur);}
-$('logoutBtn').onclick=e=>{e.preventDefault();if(confirm('Đăng xuất?')){tokens={};sessionStorage.removeItem('portal_tokens');tcClr();checkLogin();}};
-$('lbtn').onclick=()=>{const u=$('luser').value,p=$('lpass').value,btn=$('lbtn');btn.disabled=true;btn.innerHTML='<span class=spin></span>';
+function checkLogin(){const li=!!tokens.admin;$('appLayout').style.display=li?'flex':'none';$('loginPage').style.display=li?'none':'flex';$('mHdr').style.display=li?'':'none';if(!li){$('mOv').classList.remove('show');$('sideMenu').classList.remove('show');if(pollTimer){clearInterval(pollTimer);pollTimer=null;}}if(li&&!_wasLoggedIn)go(cur);_wasLoggedIn=li;}
+$('rebootBtn').onclick=e=>{e.preventDefault();portalReboot();};
+$('logoutBtn').onclick=e=>{e.preventDefault();if(confirm('Đăng xuất?')){authFail();}};
+$('lbtn').onclick=()=>{const u=$('luser').value.trim(),p=$('lpass').value,btn=$('lbtn');btn.disabled=true;btn.innerHTML='<span class=spin></span>';
 fetch('/api/admin_login',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'user='+encodeURIComponent(u)+'&pass='+encodeURIComponent(p)})
 .then(r=>r.text().then(t=>{let d;try{d=JSON.parse(t);}catch(e){throw new Error(t||('HTTP '+r.status));}return d;}))
-.then(d=>{btn.disabled=false;btn.innerText='Đăng nhập';if(d.ok){tokens.admin=d.token;sessionStorage.setItem('portal_tokens',JSON.stringify(tokens));$('lmsg').innerText='';$('lmsg').className='msg';checkLogin();}else{$('lmsg').innerText=d.error||'Lỗi';$('lmsg').className='msg error';}})
+.then(d=>{btn.disabled=false;btn.innerText='Đăng nhập';if(d.ok){tokens.admin=d.token;if(d.master)tokens.admin_master=d.token;sessionStorage.setItem('portal_tokens',JSON.stringify(tokens));$('lmsg').innerText='';$('lmsg').className='msg';_wasLoggedIn=false;checkLogin();}else{$('lmsg').innerText=d.error||'Lỗi';$('lmsg').className='msg error';}})
 .catch(e=>{btn.disabled=false;btn.innerText='Đăng nhập';$('lmsg').innerText=e.message||'Không kết nối';$('lmsg').className='msg error';});};
 function doLogin(){if(!$('lbtn').disabled)$('lbtn').click();}
 $('lpass').onkeydown=e=>{if(e.key==='Enter')doLogin();};$('luser').onkeydown=e=>{if(e.key==='Enter')doLogin();};

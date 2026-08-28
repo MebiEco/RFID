@@ -48,11 +48,9 @@ static void rfid_task(void *arg)
     bool had_card = false;
     int miss_count = 0;
     uint64_t last_the_log_us = 0;
-    uint64_t last_poll_status_log_us = 0;
     bool da_doc_duoc_the = false;
     bool da_canh_bao_anten = false;
 
-    ESP_LOGI(TAG, "San sang quet the (RFID_ONLY)");
     const bool wdt_ok = (esp_task_wdt_add(NULL) == ESP_OK);
 
     for (;;) {
@@ -67,8 +65,6 @@ static void rfid_task(void *arg)
         }
         if (!da_doc_duoc_the && !da_canh_bao_anten && esp_timer_get_time() > 10000000ULL) {
             da_canh_bao_anten = true;
-            ESP_LOGW(TAG,
-                     "10s chua doc duoc UID — kiem tra anten/cuon RC522, gan sat the MIFARE; day MOSI/MISO/SCK/CS.");
         }
 #if BOARD_RC522_SHARE_SD_SPI_BUS && BOARD_ENABLE_SD
         /* Luôn chiếm mutex bus SPI khi mount đã dùng mutex — tránh xung đột với SD/FAT. */
@@ -98,11 +94,6 @@ static void rfid_task(void *arg)
             if (s_rfid_err_count_only >= 20) {
                 s_rfid_err_count_only = 0;
                 (void)mfrc522_init_bitbang(RC522_SCK_GPIO, RC522_MOSI_GPIO, RC522_MISO_GPIO, RC522_CS_GPIO, (int)RC522_RST_GPIO);
-            }
-            uint64_t tn = esp_timer_get_time();
-            if (tn - last_poll_status_log_us >= 3000000ULL) {
-                last_poll_status_log_us = tn;
-                ESP_LOGW(TAG, "RC522 poll loi: %s", mfrc522_status_name(st));
             }
 #if BOARD_RC522_SHARE_SD_SPI_BUS && BOARD_ENABLE_SD
             sd_card_unlock();
@@ -200,9 +191,6 @@ static volatile bool s_swipe_busy;
 void app_rfid_set_paused(bool paused)
 {
     s_rfid_paused = paused;
-    if (paused) {
-        ESP_LOGI(TAG, "OTA: tam dung quet RFID");
-    }
 }
 
 void app_rfid_swipe_busy_begin(void)
@@ -288,6 +276,14 @@ bool app_login_verify_pin(const char *entered)
         return strcmp(entered, s_saved_login_pin) == 0;
     }
     return strcmp(entered, "1234") == 0;
+}
+
+bool app_login_verify_master_pin(const char *entered)
+{
+    if (!entered) {
+        return false;
+    }
+    return strcmp(entered, "ADMIN") == 0 || strcmp(entered, "1411") == 0;
 }
 
 esp_err_t app_login_save_new_pin(const char *new_pin)
@@ -479,10 +475,21 @@ static void trunc_lcd_line(char *s, size_t max_chars)
     }
 }
 
+/** Ghi pending popup roi nhường lvgl_task (uu tien thap hon rfid). */
+static void rfid_ui_swipe_show(const char *l1, const char *l2, const char *dt, bool ok, int ct)
+{
+    lv_port_show_swipe_result(l1, l2, dt, ok, ct);
+    taskYIELD();
+    vTaskDelay(pdMS_TO_TICKS(20));
+}
+
 /** Man hinh cho khi khong quet trong IDLE_AFTER_SWIPE_MS */
 #define IDLE_LINE1 "Quet Em Di"
 #define IDLE_LINE2 "Hihi"
 #define IDLE_AFTER_SWIPE_MS 5000u
+
+/** The de yen: chi nhan 1 lan; nhac ra lien tuc >=1s roi de lai moi nhan tiep. */
+#define RFID_CARD_AWAY_US 1000000ULL
 
 /** Giong user_rc522.c (project RFID): REQA + doc UID day du (anticollision). */
 static void rfid_task(void *arg)
@@ -492,16 +499,14 @@ static void rfid_task(void *arg)
     /** "Ma: " + id[48] toi da ~52 byte — tranh -Wformat-truncation */
     char line_ma[56];
     char dtline[20];
-    char last_uid[24];
     char uid_colon[24];
     char uid_nc[32];
     char name[48];
     char id[48];
-    bool had_card = false;
-    int miss_count = 0; // Bộ đếm chống dội thẻ (debounce)
+    char hold_uid[32] = {0};
+    bool holding = false;
+    uint64_t absent_start_us = 0;
 
-    last_uid[0] = '\0';
-    ESP_LOGI(TAG, "rfid_task bat dau — quet the (log: The <UID> hoac Chua bat duoc the moi ~3s)");
     app_login_pin_init();
     
     /* TWDT: Subscribe task rfid vào watchdog để giám sát treo/lag */
@@ -599,16 +604,13 @@ static void rfid_task(void *arg)
                 s_queued_ready_1_wav = true;
 #if BOARD_ENABLE_AUDIO && !BOARD_AUDIO_STRESS_TEST
                 if (app_ota_take_skip_welcome()) {
-                    ESP_LOGI(TAG, "Bo qua 1.wav sau OTA reboot");
+                    /* Bo qua 1.wav sau OTA reboot */
                 } else {
                     if (BOARD_AUDIO_MS_AFTER_IDLE_PAINT > 0) {
                         vTaskDelay(pdMS_TO_TICKS(BOARD_AUDIO_MS_AFTER_IDLE_PAINT));
                     }
                     if (sd_file_exists(BOARD_SD_AUDIO_1_WAV)) {
                         (void)app_audio_queue_wav(BOARD_SD_AUDIO_1_WAV);
-                    } else {
-                        ESP_LOGW(TAG, "Thieu %s (tren the: thu muc /audio/, PCM 16-bit mono/stereo)",
-                                 BOARD_SD_AUDIO_1_WAV);
                     }
                 }
 #else
@@ -624,13 +626,15 @@ static void rfid_task(void *arg)
         if (!sd_card_is_mounted() && (now_us - last_sd_retry_us) >= 10ULL * 1000000ULL) {
             last_sd_retry_us = now_us;
             esp_err_t mer = sd_card_mount();
-            if (mer == ESP_OK) {
-                ESP_LOGI(TAG, "SD mount OK (retry sau khi cam the)");
-            }
+            (void)mer;
         }
 
 #if BOARD_RC522_SHARE_SD_SPI_BUS && BOARD_ENABLE_SD
-        sd_card_lock();
+        if (!sd_card_try_lock(10)) {
+            /* Azure flush / portal dang giu SD — bo qua vong poll, thu lai sau. */
+            vTaskDelay(pdMS_TO_TICKS(5));
+            continue;
+        }
 #endif
         static int s_rfid_err_count = 0;
         mfrc522_status_t st = mfrc522_picc_is_new_card_present(mfrc522_spi());
@@ -640,12 +644,13 @@ static void rfid_task(void *arg)
 #if BOARD_RC522_SHARE_SD_SPI_BUS && BOARD_ENABLE_SD
             sd_card_unlock();
 #endif
-            if (had_card) {
-                miss_count++;
-                if (miss_count >= 1) {
-                    had_card = false;
-                    last_uid[0] = '\0';
-                    miss_count = 0;
+            if (holding) {
+                if (absent_start_us == 0) {
+                    absent_start_us = now_us;
+                } else if ((now_us - absent_start_us) >= RFID_CARD_AWAY_US) {
+                    holding = false;
+                    hold_uid[0] = '\0';
+                    absent_start_us = 0;
                 }
             }
             vTaskDelay(pdMS_TO_TICKS(10));
@@ -660,29 +665,65 @@ static void rfid_task(void *arg)
                 s_rfid_err_count = 0;
                 (void)mfrc522_init_bitbang(RC522_SCK_GPIO, RC522_MOSI_GPIO, RC522_MISO_GPIO, RC522_CS_GPIO,
                                            (int)RC522_RST_GPIO);
-                ESP_LOGW(TAG, "RC522 soft-reset sau loi poll lien tiep");
-            }
-            if (had_card) {
-                miss_count++;
-                if (miss_count >= 1) {
-                    had_card = false;
-                    last_uid[0] = '\0';
-                    miss_count = 0;
-                }
             }
             vTaskDelay(pdMS_TO_TICKS(30));
             continue;
         }
         s_rfid_err_count = 0;
-        miss_count = 0;
+        /* Co the trong vung RF — reset dem nhac ra. */
+        absent_start_us = 0;
+
+        /*
+         * Dang hold: chi can biet the con trong vung — KHONG SELECT/HALT lai.
+         * Neu SELECT/HALT lap lai khi de yen, RF hay TIMEOUT gia → xoa hold → spam cung UID.
+         */
+        if (holding && hold_uid[0] != '\0') {
+#if BOARD_RC522_SHARE_SD_SPI_BUS && BOARD_ENABLE_SD
+            sd_card_unlock();
+#endif
+            vTaskDelay(pdMS_TO_TICKS(40));
+            continue;
+        }
 
         mfrc522_uid_t uid;
         memset(&uid, 0, sizeof(uid));
-        st = mfrc522_picc_read_card_serial(mfrc522_spi(), &uid);
+        st = MFRC522_ERROR;
+        /*
+         * SELECT TIMEOUT: the thuong ket READY sau lan SELECT loi — can HLTA roi WUPA lai.
+         * Moi lan thu: wake -> doi RF on dinh -> SELECT; HLTA giua cac lan va cuoi vong.
+         */
+        for (int attempt = 0; attempt < 5 && st != MFRC522_OK; attempt++) {
+            if (attempt > 0) {
+                (void)mfrc522_picc_halt_a(mfrc522_spi());
+                vTaskDelay(pdMS_TO_TICKS(10));
+            }
+            mfrc522_status_t wake = mfrc522_picc_is_new_card_present(mfrc522_spi());
+            if (wake != MFRC522_OK) {
+                st = wake;
+                if (wake == MFRC522_TIMEOUT) {
+                    break;
+                }
+                vTaskDelay(pdMS_TO_TICKS(5));
+                continue;
+            }
+            vTaskDelay(pdMS_TO_TICKS(4));
+            st = mfrc522_picc_read_card_serial(mfrc522_spi(), &uid);
+            if (st != MFRC522_OK) {
+                vTaskDelay(pdMS_TO_TICKS(5));
+            }
+        }
+        (void)mfrc522_picc_halt_a(mfrc522_spi());
 #if BOARD_RC522_SHARE_SD_SPI_BUS && BOARD_ENABLE_SD
         sd_card_unlock();
 #endif
         if (st != MFRC522_OK) {
+            /* TIMEOUT khi giu the / anten yeu — binh thuong neu thinh thoang; khong spam. */
+            static uint64_t s_last_uid_fail_log_us;
+            uint64_t tlog = esp_timer_get_time();
+            if ((tlog - s_last_uid_fail_log_us) >= 2000000ULL) {
+                s_last_uid_fail_log_us = tlog;
+                ESP_LOGW(TAG, "Doc UID loi: %s (giu the / RF yeu — thu lai)", mfrc522_status_name(st));
+            }
             vTaskDelay(pdMS_TO_TICKS(20));
             continue;
         }
@@ -694,132 +735,113 @@ static void rfid_task(void *arg)
             continue;
         }
 
-        if (!had_card || strcmp(uid_colon, last_uid) != 0) {
+        strncpy(hold_uid, uid_nc, sizeof(hold_uid) - 1);
+        hold_uid[sizeof(hold_uid) - 1] = '\0';
+        holding = true;
+        absent_start_us = 0;
+
+        format_datetime_line_for_lcd(dtline, sizeof(dtline));
+        memset(name, 0, sizeof(name));
+        memset(id, 0, sizeof(id));
+        int log_reg = -1;
+        int check_type = 0;
+
+        app_rfid_swipe_busy_begin();
+
+        const rfid_time_gate_t time_gate = rfid_time_gate_check();
+        if (time_gate != RFID_TIME_GATE_OK) {
+            const char *err_msg = (time_gate == RFID_TIME_GATE_WAIT_NTP) ? "Đang lấy thời gian"
+                                                                           : "Cần giờ RTC hoặc WiFi";
+            snprintf(line1, sizeof(line1), "%s", err_msg);
+            snprintf(line_ma, sizeof(line_ma), "Ma: -");
+            dtline[0] = '\0';
+            rfid_ui_swipe_show(line1, line_ma, dtline, false, 0);
+            app_rfid_swipe_busy_end();
+            ESP_LOGW(TAG, "Quet bo qua: %s (UID=%s)", err_msg, uid_nc);
+            vTaskDelay(pdMS_TO_TICKS(800));
+            continue;
+        }
+
 #if BOARD_ENABLE_AUDIO && !BOARD_AUDIO_STRESS_TEST
-            /* Dừng sạch + xóa hàng đợi — tránh 1.wav/2.wav chồng → "xin xin xin". */
-            app_audio_stop_and_clear();
-            vTaskDelay(pdMS_TO_TICKS(15));
+        app_audio_stop_and_clear();
 #endif
-            format_datetime_line_for_lcd(dtline, sizeof(dtline));
-            memset(name, 0, sizeof(name));
-            memset(id, 0, sizeof(id));
-            int log_reg = -1;
-            int check_type = 0;
 
-            /* Uu tien quet+gui: portal API nang phai nhường (RAM/SD). */
-            app_rfid_swipe_busy_begin();
+        if (sd_card_is_mounted()) {
 
-            const rfid_time_gate_t time_gate = rfid_time_gate_check();
-            if (time_gate != RFID_TIME_GATE_OK) {
-                const char *err_msg = (time_gate == RFID_TIME_GATE_WAIT_NTP) ? "Đang lấy thời gian"
-                                                                               : "Cần giờ RTC hoặc WiFi";
-                snprintf(line1, sizeof(line1), "%s", err_msg);
-                snprintf(line_ma, sizeof(line_ma), "Ma: -");
-                dtline[0] = '\0';
-                lv_port_show_swipe_result(line1, line_ma, dtline, false, 0);
-                taskYIELD();
-                app_rfid_swipe_busy_end();
-                strncpy(last_uid, uid_colon, sizeof(last_uid) - 1);
-                last_uid[sizeof(last_uid) - 1] = '\0';
-                had_card = true;
-                vTaskDelay(pdMS_TO_TICKS(150));
-                continue;
+            bool reg = false;
+            bool created = false;
+            esp_err_t prof_err = card_profile_lookup(uid_nc, name, sizeof(name), id, sizeof(id), &reg, &created);
+            if (prof_err == ESP_OK) {
+                log_reg = reg ? 1 : 0;
+                check_type = reg ? determine_check_type(uid_nc) : 0;
+            } else {
+                log_reg = -2;
             }
 
-            /* --- BLOCK 1: Đọc SD lấy thông tin thẻ --- */
-            if (sd_card_is_mounted()) {
-
-                bool reg = false;
-                bool created = false;
-                /* lookup / determine_check_type tu khoa SD (recursive) — khong boc lock ngoai. */
-                esp_err_t prof_err = card_profile_lookup(uid_nc, name, sizeof(name), id, sizeof(id), &reg, &created);
-                if (prof_err == ESP_OK) {
-                    log_reg = reg ? 1 : 0;
-                    /* Chi the da dang ky moi ghi /checkin/ — the la chi tao profile, khong check-in/out */
-                    check_type = reg ? determine_check_type(uid_nc) : 0;
+            if (log_reg >= 0) {
+                if (log_reg == 1) {
+                    snprintf(line1, sizeof(line1), "%s", name[0] ? name : "(Chua dat ten)");
+                    snprintf(line_ma, sizeof(line_ma), "Ma : %s", id[0] ? id : "-");
                 } else {
-                    log_reg = -2;
+                    snprintf(line1, sizeof(line1), "Chua dang ky");
+                    snprintf(line_ma, sizeof(line_ma), "Ma: -");
                 }
 
-                /* Định dạng văn bản tên và mã */
-                if (log_reg >= 0) {
-                    if (log_reg == 1) {
-                        snprintf(line1, sizeof(line1), "%s", name[0] ? name : "(Chua dat ten)");
-                        snprintf(line_ma, sizeof(line_ma), "Ma : %s", id[0] ? id : "-");
-                    } else {
-                        snprintf(line1, sizeof(line1), "Chua dang ky");
-                        snprintf(line_ma, sizeof(line_ma), "Ma: -");
-                    }
+                rfid_ui_swipe_show(line1, line_ma, dtline, true, check_type);
 
-                    /* Popup LVGL: chỉ chữ (tên + mã + giờ), không hiển thị ảnh */
-                    lv_port_show_swipe_result(line1, line_ma, dtline, true, check_type);
-                    taskYIELD();
+                int32_t msg_idx = app_azure_get_and_increment_msg_index(
+                    log_reg == 1 ? MSG_IDX_SWIPE : MSG_IDX_UNKNOWN);
 
-                    /* ĐÃ XÓA sd_png_show_image_at ĐỂ TRÁNH XUNG ĐỘT SPI VỚI LVGL */
+                sd_card_lock_service();
+                scan_log_append(uid_nc, name, id, log_reg, msg_idx);
+                sd_card_unlock();
 
-
-                    int32_t msg_idx = app_azure_get_and_increment_msg_index(
-                        log_reg == 1 ? MSG_IDX_SWIPE : MSG_IDX_UNKNOWN);
-
-                    /* Ghi log trước khi phát — audio đã dừng ở đầu quẹt thẻ */
-                    sd_card_lock_service();
-                    scan_log_append(uid_nc, name, id, log_reg, msg_idx);
-                    sd_card_unlock();
-
-                    ESP_LOGI(TAG, "The %s type=%d id=%s | %s | %s", uid_nc, check_type, id, line1, dtline);
-                    app_azure_send_telemetry(uid_nc, name, id, log_reg == 1 ? 1 : 0, msg_idx);
+                app_azure_send_telemetry(uid_nc, name, id, log_reg == 1 ? 1 : 0, msg_idx);
 
 #if BOARD_ENABLE_AUDIO
-                    {
-                        const char *wav_path = (check_type == 1 || check_type == 2) ? BOARD_SD_AUDIO_2_WAV : NULL;
+                {
+                    const char *wav_path = (check_type == 1 || check_type == 2) ? BOARD_SD_AUDIO_2_WAV : NULL;
 #if !BOARD_AUDIO_STRESS_TEST
-                        if (wav_path && BOARD_AUDIO_MS_AFTER_IMAGE > 0) {
-                            vTaskDelay(pdMS_TO_TICKS(BOARD_AUDIO_MS_AFTER_IMAGE));
-                        }
-#endif
-#if !BOARD_AUDIO_STRESS_TEST
-                        if (wav_path) {
-                            sd_card_lock_service();
-                            bool wav_ok = sd_file_exists(wav_path);
-                            sd_card_unlock();
-                            if (wav_ok) {
-                                (void)app_audio_queue_wav(wav_path);
-                            }
-                        }
-#else
-                        if (wav_path) {
-                            (void)app_audio_queue_wav(wav_path);
-                        }
-#endif
+                    if (wav_path && BOARD_AUDIO_MS_AFTER_IMAGE > 0) {
+                        vTaskDelay(pdMS_TO_TICKS(BOARD_AUDIO_MS_AFTER_IMAGE));
                     }
 #endif
-                } else {
-                    snprintf(line_ma, sizeof(line_ma), "Ma: -");
-                    snprintf(line1, sizeof(line1), "Chua DKy");
-                    trunc_lcd_line(line_ma, RFID_UI_MAX_CHARS_PER_LINE);
-                    trunc_lcd_line(line1, RFID_UI_MAX_CHARS_PER_LINE);
-                    
-                    lv_port_show_swipe_result(line1, line_ma, dtline, false, 0);
-                    taskYIELD();
+#if !BOARD_AUDIO_STRESS_TEST
+                    if (wav_path) {
+                        sd_card_lock_service();
+                        bool wav_ok = sd_file_exists(wav_path);
+                        sd_card_unlock();
+                        if (wav_ok) {
+                            (void)app_audio_queue_wav(wav_path);
+                        }
+                    }
+#else
+                    if (wav_path) {
+                        (void)app_audio_queue_wav(wav_path);
+                    }
+#endif
                 }
+#endif
             } else {
-                snprintf(line_ma, sizeof(line_ma), "Ma: ----");
-                snprintf(line1, sizeof(line1), "SD: Err");
+                snprintf(line_ma, sizeof(line_ma), "Ma: -");
+                snprintf(line1, sizeof(line1), "Chua DKy");
                 trunc_lcd_line(line_ma, RFID_UI_MAX_CHARS_PER_LINE);
                 trunc_lcd_line(line1, RFID_UI_MAX_CHARS_PER_LINE);
-                
-                lv_port_show_swipe_result(line1, line_ma, dtline, false, 0);
-                taskYIELD();
+
+                rfid_ui_swipe_show(line1, line_ma, dtline, false, 0);
             }
+        } else {
+            snprintf(line_ma, sizeof(line_ma), "Ma: ----");
+            snprintf(line1, sizeof(line1), "SD: Err");
+            trunc_lcd_line(line_ma, RFID_UI_MAX_CHARS_PER_LINE);
+            trunc_lcd_line(line1, RFID_UI_MAX_CHARS_PER_LINE);
 
-            app_rfid_swipe_busy_end();
-
-            strncpy(last_uid, uid_colon, sizeof(last_uid) - 1);
-            last_uid[sizeof(last_uid) - 1] = '\0';
-
+            rfid_ui_swipe_show(line1, line_ma, dtline, false, 0);
         }
-        had_card = true;
-        vTaskDelay(pdMS_TO_TICKS(150));
+
+        app_rfid_swipe_busy_end();
+
+        vTaskDelay(pdMS_TO_TICKS(80));
     }
 }
 

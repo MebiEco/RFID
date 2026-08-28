@@ -48,9 +48,10 @@ esp_err_t scan_log_send_html_page(httpd_req_t *req);
 
 /**
  * JSON nhat ky: {"rows":[{"ts","name","id","admin","code","index"},...]}
- * Query: page, limit (mac dinh 50), all=1, days=N, from=YYYY-MM-DD, to=YYYY-MM-DD,
- *        code=601|602|603|604,
+ * Query: page, limit (mac dinh 30, toi da 30/trang), days=N (toi da 7), from/to (span toi da 7 ngay),
+ *        all=1 (tu thu ve 7 ngay), code=601|602|603|604,
  *        sort=desc|asc|index_desc|index_asc|id_desc|id_asc (mac dinh desc).
+ * Web: toi da 20 trang (600 dong); log day du tren SD / Azure 605.
  */
 esp_err_t scan_log_send_json(httpd_req_t *req);
 

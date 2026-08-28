@@ -18,6 +18,7 @@
 #include "esp_heap_caps.h"
 #include "esp_netif.h"
 #include "esp_netif_sntp.h"
+#include "mdns.h"
 #include "esp_sntp.h"
 #include "esp_wifi.h"
 #include "nvs.h"
@@ -106,6 +107,74 @@ static void normalize_azure_host(char *host)
     }
 }
 
+static void trim_azure_token(char *s)
+{
+    if (!s || !s[0]) {
+        return;
+    }
+    char *p = s;
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') {
+        p++;
+    }
+    if (p != s) {
+        memmove(s, p, strlen(p) + 1);
+    }
+    size_t n = strlen(s);
+    while (n > 0 && (s[n - 1] == ' ' || s[n - 1] == '\t' || s[n - 1] == '\r' || s[n - 1] == '\n')) {
+        s[--n] = '\0';
+    }
+}
+
+bool wifi_portal_parse_iot_conn_string(const char *conn, char *host, size_t host_sz, char *devid, size_t devid_sz,
+                                       char *sas, size_t sas_sz)
+{
+    if (!conn || !conn[0] || !host || host_sz == 0 || !sas || sas_sz == 0) {
+        return false;
+    }
+    host[0] = '\0';
+    sas[0] = '\0';
+    if (devid && devid_sz) {
+        devid[0] = '\0';
+    }
+
+    char buf[384];
+    snprintf(buf, sizeof(buf), "%s", conn);
+    char *p = buf;
+    while (*p) {
+        char *semi = strchr(p, ';');
+        if (semi) {
+            *semi = '\0';
+        }
+        char *eq = strchr(p, '=');
+        if (eq) {
+            *eq = '\0';
+            char *key = p;
+            char *val = eq + 1;
+            trim_azure_token(key);
+            trim_azure_token(val);
+            if (strcasecmp(key, "HostName") == 0 || strcasecmp(key, "Host") == 0) {
+                copy_field(host, host_sz, val);
+            } else if (devid && devid_sz &&
+                       (strcasecmp(key, "DeviceId") == 0 || strcasecmp(key, "DeviceID") == 0 ||
+                        strcasecmp(key, "Device") == 0)) {
+                copy_field(devid, devid_sz, val);
+            } else if (strcasecmp(key, "SharedAccessKey") == 0 || strcasecmp(key, "SasKey") == 0 ||
+                       strcasecmp(key, "SASKey") == 0 || strcasecmp(key, "Key") == 0) {
+                copy_field(sas, sas_sz, val);
+            }
+        }
+        if (!semi) {
+            break;
+        }
+        p = semi + 1;
+    }
+
+    if (host[0]) {
+        normalize_azure_host(host);
+    }
+    return host[0] != '\0' && sas[0] != '\0';
+}
+
 static void wifi_list_save(void)
 {
     nvs_handle_t h;
@@ -167,9 +236,10 @@ void wifi_list_get_item(int idx, char *ssid, char *pass) {
     }
 }
 
-/** SoftAP WPA2 — mật khẩu AP_PASS; vào http://192.168.4.1 sau khi nối */
+/** SoftAP WPA2 — mật khẩu AP_PASS; vào http://192.168.4.1 hoặc http://rfid.local sau khi nối */
 #define AP_SSID "Defuafl-AP"
 #define AP_PASS "12345678"
+#define PORTAL_MDNS_HOST "rfid"
 #define AP_CHANNEL 1
 #define AP_MAX_CONN 2 /* SoftAP it client — bot Internal khi bat APSTA */
 
@@ -187,6 +257,7 @@ static esp_netif_t *s_sta_netif;
 static bool s_sntp_retry_task_live;
 static uint8_t s_ntp_server_idx;
 static volatile bool s_httpd_ota_hold;
+static bool s_mdns_started;
 
 /** Xoay vong khi retry (LWIP chi cho 1 server trong config). */
 static const char *s_ntp_servers[] = {
@@ -607,6 +678,16 @@ static esp_err_t save_wifi_post_handler(httpd_req_t *req)
     }
     (void)form_get(buf, "pass", pass, sizeof(pass));
 
+    /* Mat khau de trong + SSID da luu -> giu pass cu (portal web). */
+    if (pass[0] == '\0') {
+        for (int i = 0; i < s_wifi_list.count; i++) {
+            if (strcmp(s_wifi_list.wifis[i].ssid, ssid) == 0 && s_wifi_list.wifis[i].pass[0] != '\0') {
+                copy_field(pass, sizeof(pass), s_wifi_list.wifis[i].pass);
+                break;
+            }
+        }
+    }
+
     wifi_list_add(ssid, pass);
     s_current_wifi_idx = s_wifi_list.count - 1; // Ưu tiên mạng vừa thêm
     s_sta_reconnect_count = 0;
@@ -624,11 +705,13 @@ static esp_err_t saved_wifis_get_handler(httpd_req_t *req)
     }
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send_chunk(req, "[", 1);
-    char buf[128];
+    char buf[160];
     char esc[68];
     for (int i = 0; i < s_wifi_list.count; i++) {
         json_escape_ssid(s_wifi_list.wifis[i].ssid, esc, sizeof(esc));
-        snprintf(buf, sizeof(buf), "\"%s\"%s", esc, (i < s_wifi_list.count - 1) ? "," : "");
+        const bool has_pass = (s_wifi_list.wifis[i].pass[0] != '\0');
+        snprintf(buf, sizeof(buf), "{\"ssid\":\"%s\",\"has_pass\":%s}%s", esc, has_pass ? "true" : "false",
+                 (i < s_wifi_list.count - 1) ? "," : "");
         httpd_resp_send_chunk(req, buf, strlen(buf));
     }
     httpd_resp_send_chunk(req, "]", 1);
@@ -709,8 +792,20 @@ static esp_err_t save_azure_post_handler(httpd_req_t *req)
         return httpd_resp_sendstr(req, "HostName và Device ID không được để trống!");
     }
     if (sas[0] == '\0') {
-        httpd_resp_set_status(req, "400 Bad Request");
-        return httpd_resp_sendstr(req, "Cần nhập SAS Key (Primary key)!");
+        wifi_cred_t existing;
+        memset(&existing, 0, sizeof(existing));
+        cred_load(&existing);
+        if (existing.azure_sas[0] == '\0') {
+            httpd_resp_set_status(req, "400 Bad Request");
+            return httpd_resp_sendstr(req, "Cần nhập SAS Key (Primary key)!");
+        }
+        esp_err_t err = wifi_portal_set_azure(host, devid, existing.azure_sas);
+        if (err != ESP_OK) {
+            httpd_resp_set_status(req, "500 Internal Server Error");
+            return httpd_resp_sendstr(req, "Lưu cấu hình Azure thất bại!");
+        }
+        httpd_resp_sendstr(req, "OK");
+        return ESP_OK;
     }
 
     esp_err_t err = wifi_portal_set_azure(host, devid, sas);
@@ -1051,6 +1146,44 @@ static void portal_health_start(void)
     s_portal_health_started = true;
 }
 
+/** mDNS: http://rfid.local — chi bat khi Internal du; buffer/task dung PSRAM (sdkconfig). */
+#define PORTAL_MDNS_MIN_INTERNAL_BYTES 16384u
+
+static void portal_mdns_start(void)
+{
+    if (s_mdns_started) {
+        return;
+    }
+    const uint32_t free_int = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    if (free_int < PORTAL_MDNS_MIN_INTERNAL_BYTES) {
+        ESP_LOGW(TAG, "mDNS bo qua — Internal %u B (can >= %u). Vao portal bang IP.",
+                 (unsigned)free_int, (unsigned)PORTAL_MDNS_MIN_INTERNAL_BYTES);
+        return;
+    }
+    esp_err_t e = mdns_init();
+    if (e != ESP_OK && e != ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(TAG, "mdns_init: %s", esp_err_to_name(e));
+        return;
+    }
+    e = mdns_hostname_set(PORTAL_MDNS_HOST);
+    if (e != ESP_OK) {
+        ESP_LOGW(TAG, "mdns_hostname_set: %s", esp_err_to_name(e));
+        return;
+    }
+    (void)mdns_instance_name_set("RFID Portal");
+    e = mdns_service_add(NULL, "_http", "_tcp", 80, NULL, 0);
+    if (e == ESP_ERR_NO_MEM) {
+        ESP_LOGW(TAG, "mDNS het RAM — dung IP (AP 192.168.4.1 hoac IP WiFi), khong dung .local");
+        return;
+    }
+    if (e != ESP_OK) {
+        ESP_LOGW(TAG, "mdns_service_add: %s", esp_err_to_name(e));
+        return;
+    }
+    s_mdns_started = true;
+    ESP_LOGI(TAG, "mDNS: http://%s.local/ (AP 192.168.4.1 hoac IP STA)", PORTAL_MDNS_HOST);
+}
+
 static esp_err_t start_httpd(void)
 {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
@@ -1095,7 +1228,8 @@ static esp_err_t start_httpd(void)
     httpd_register_uri_handler(s_server, &u_saved_wifis);
     httpd_register_uri_handler(s_server, &u_del_wifi);
     portal_web_register_handlers(s_server);
-    ESP_LOGI(TAG, "Web: http://192.168.4.1/ — menu trai, PIN theo muc (AP: %s)", AP_SSID);
+    portal_mdns_start();
+    ESP_LOGI(TAG, "Web: http://192.168.4.1/ | http://%s.local/ (AP: %s)", PORTAL_MDNS_HOST, AP_SSID);
     return ESP_OK;
 }
 
@@ -1143,10 +1277,12 @@ static bool wall_time_rtc_restore(void)
 {
 #if BOARD_ENABLE_DS3231
     if (ds3231_init() != ESP_OK) {
+        ESP_LOGI("boot", "DS3231: khong co / loi I2C");
         return false;
     }
     time_t utc = 0;
     if (ds3231_get_utc(&utc) != ESP_OK || !wall_time_valid(utc)) {
+        ESP_LOGI("boot", "DS3231: OK — chua co gio, cho NTP");
         ESP_LOGW(TAG, "DS3231 chua co gio hop le — cho NTP");
         return false;
     }
@@ -1158,6 +1294,9 @@ static bool wall_time_rtc_restore(void)
     s_time_synced = true;
     struct tm t;
     scan_log_wall_tm(utc, &t);
+    ESP_LOGI("boot", "DS3231: OK (gio offline %04d-%02d-%02d %02d:%02d:%02d)",
+             (int)(t.tm_year + 1900), (int)(t.tm_mon + 1), (int)t.tm_mday, (int)t.tm_hour, (int)t.tm_min,
+             (int)t.tm_sec);
     ESP_LOGI(TAG, "Gio tu DS3231 (OK offline): %04d-%02d-%02d %02d:%02d:%02d",
              (int)(t.tm_year + 1900), (int)(t.tm_mon + 1), (int)t.tm_mday, (int)t.tm_hour, (int)t.tm_min,
              (int)t.tm_sec);
@@ -1216,6 +1355,9 @@ static void sntp_adopt_wall_time_if_valid(void)
     struct tm t;
     scan_log_wall_tm(now, &t);
     wall_time_rtc_save(now);
+    ESP_LOGI("boot", "Gio: OK (NTP %04d-%02d-%02d %02d:%02d:%02d)",
+             (int)(t.tm_year + 1900), (int)(t.tm_mon + 1), (int)t.tm_mday,
+             (int)t.tm_hour, (int)t.tm_min, (int)t.tm_sec);
     ESP_LOGI(TAG, "NTP ok (poll), Real time: %04d-%02d-%02d %02d:%02d:%02d",
              (int)(t.tm_year + 1900), (int)(t.tm_mon + 1), (int)t.tm_mday,
              (int)t.tm_hour, (int)t.tm_min, (int)t.tm_sec);
@@ -1336,6 +1478,9 @@ static void time_synced_cb(struct timeval *tv)
     struct tm t;
     scan_log_wall_tm(now, &t);
     wall_time_rtc_save(now);
+    ESP_LOGI("boot", "Gio: OK (NTP %04d-%02d-%02d %02d:%02d:%02d)",
+             (int)(t.tm_year + 1900), (int)(t.tm_mon + 1), (int)t.tm_mday,
+             (int)t.tm_hour, (int)t.tm_min, (int)t.tm_sec);
     ESP_LOGI(TAG, "NTP ok, Real time: %04d-%02d-%02d %02d:%02d:%02d",
              (int)(t.tm_year + 1900), (int)(t.tm_mon + 1), (int)t.tm_mday,
              (int)t.tm_hour, (int)t.tm_min, (int)t.tm_sec);
@@ -1409,6 +1554,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
             wifi_list_add(s_pending_ssid, s_pending_pass);
             s_pending_ssid[0] = '\0';
         }
+        ESP_LOGI("boot", "WiFi: OK (STA co IP)");
         ESP_LOGI(TAG, "STA da co IP");
         /* AP+STA: route NTP/Internet qua STA, khong qua softAP 192.168.4.x */
         if (s_sta_netif) {

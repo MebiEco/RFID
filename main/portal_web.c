@@ -5,6 +5,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include <time.h>
 
@@ -28,6 +29,7 @@
 #include "esp_netif.h"
 #include "app_audio.h"
 #include "lv_port.h"
+#include "esp_attr.h"
 #include "esp_heap_caps.h"
 #include "esp_flash.h"
 #include "esp_chip_info.h"
@@ -53,7 +55,7 @@ static const unsigned char s_favicon_png[] = {
 
 static const char *TAG = "portal_web";
 
-#define PORTAL_SESS_MAX 6
+#define PORTAL_SESS_MAX 12
 #define PORTAL_TOKEN_LEN 33
 #define PORTAL_SESS_TTL_SEC 1800
 
@@ -61,6 +63,7 @@ typedef struct {
     bool active;
     char token[PORTAL_TOKEN_LEN];
     char section[16];
+    bool master;
     int64_t expiry;
 } portal_sess_t;
 
@@ -95,15 +98,30 @@ static void url_decode_inplace(char *s)
     *dst = '\0';
 }
 
-#define WEB_LOG_BUF_SIZE (256 * 1024)
-/** Chi gui duoi log — Auto 3s keo het 256KB se ngat socket (errno 104) va lam WiFi/RFID do. */
-#define WEB_LOG_SEND_MAX (32 * 1024)
-static char *s_web_log_buf = NULL;
+/** Ring log 8KB tren PSRAM — khong an Internal cho Terminal. */
+#define WEB_LOG_BUF_SIZE 8192
+#define WEB_LOG_SEND_MAX WEB_LOG_BUF_SIZE
+static EXT_RAM_BSS_ATTR char s_web_log_buf[WEB_LOG_BUF_SIZE];
+static bool s_web_log_ready = false;
 static size_t s_web_log_head = 0;
 static size_t s_web_log_tail = 0;
 static size_t s_web_log_len = 0;
 static volatile bool s_web_log_busy = false;
 static vprintf_like_t s_old_vprintf = NULL;
+
+static int web_log_vprintf(const char *fmt, va_list args);
+
+void portal_web_log_init(void)
+{
+    if (s_web_log_ready) {
+        return;
+    }
+    s_web_log_head = 0;
+    s_web_log_tail = 0;
+    s_web_log_len = 0;
+    s_old_vprintf = esp_log_set_vprintf(web_log_vprintf);
+    s_web_log_ready = true;
+}
 
 static int web_log_vprintf(const char *fmt, va_list args)
 {
@@ -120,8 +138,8 @@ static int web_log_vprintf(const char *fmt, va_list args)
         va_end(args_copy);
     }
 
-    if (s_web_log_buf) {
-        char temp_buf[512];
+    if (s_web_log_ready) {
+        char temp_buf[256];
         va_list args_copy2;
         va_copy(args_copy2, args);
         int formatted_len = vsnprintf(temp_buf, sizeof(temp_buf), fmt, args_copy2);
@@ -149,12 +167,12 @@ static int web_log_vprintf(const char *fmt, va_list args)
 
 static esp_err_t api_terminal_log_get_handler(httpd_req_t *req)
 {
-    if (!portal_auth_section(req, "admin")) {
+    if (!portal_auth_master_section(req, "terminal")) {
         httpd_resp_set_status(req, "401 Unauthorized");
         httpd_resp_set_type(req, "application/json");
         return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"Yeu cau dang nhap\"}");
     }
-    if (!s_web_log_buf) {
+    if (!s_web_log_ready) {
         httpd_resp_set_type(req, "text/plain; charset=utf-8");
         return httpd_resp_sendstr(req, "Log buffer not initialized");
     }
@@ -163,39 +181,37 @@ static esp_err_t api_terminal_log_get_handler(httpd_req_t *req)
     size_t len = s_web_log_len;
     size_t send_len = (len > WEB_LOG_SEND_MAX) ? (size_t)WEB_LOG_SEND_MAX : len;
     size_t start = (s_web_log_tail + (len - send_len)) % WEB_LOG_BUF_SIZE;
-    char *temp = heap_caps_malloc(send_len + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!temp) {
-        s_web_log_busy = false;
-        httpd_resp_set_status(req, "500 Internal Server Error");
-        return httpd_resp_sendstr(req, "Het PSRAM dem log");
-    }
 
+    /* Gui chunked — tranh stack 8KB tren httpd task. */
+    httpd_resp_set_type(req, "text/plain; charset=utf-8");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store, no-cache, must-revalidate");
+    if (send_len == 0) {
+        s_web_log_busy = false;
+        return httpd_resp_sendstr(req, "");
+    }
     size_t first = WEB_LOG_BUF_SIZE - start;
     if (first > send_len) {
         first = send_len;
     }
-    memcpy(temp, s_web_log_buf + start, first);
-    if (first < send_len) {
-        memcpy(temp + first, s_web_log_buf, send_len - first);
+    esp_err_t err = httpd_resp_send_chunk(req, s_web_log_buf + start, first);
+    if (err == ESP_OK && first < send_len) {
+        err = httpd_resp_send_chunk(req, s_web_log_buf, send_len - first);
     }
-    temp[send_len] = '\0';
+    if (err == ESP_OK) {
+        err = httpd_resp_send_chunk(req, NULL, 0);
+    }
     s_web_log_busy = false;
-
-    httpd_resp_set_type(req, "text/plain; charset=utf-8");
-    httpd_resp_set_hdr(req, "Cache-Control", "no-store, no-cache, must-revalidate");
-    esp_err_t err = httpd_resp_send(req, temp, (ssize_t)send_len);
-    free(temp);
     return err;
 }
 
 static esp_err_t api_terminal_log_clear_handler(httpd_req_t *req)
 {
-    if (!portal_auth_section(req, "admin")) {
+    if (!portal_auth_master_section(req, "terminal")) {
         httpd_resp_set_status(req, "401 Unauthorized");
         httpd_resp_set_type(req, "application/json");
         return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"Yeu cau dang nhap\"}");
     }
-    if (s_web_log_buf) {
+    if (s_web_log_ready) {
         s_web_log_busy = true;
         s_web_log_head = 0;
         s_web_log_tail = 0;
@@ -392,9 +408,47 @@ static const char *get_req_token(httpd_req_t *req, char *buf, size_t bufsz)
     return NULL;
 }
 
+static bool portal_section_requires_master(const char *section)
+{
+    return section && (strcmp(section, "ota") == 0 || strcmp(section, "terminal") == 0);
+}
+
+static bool portal_auth_sess_token(const char *tok, const char *section, bool require_master)
+{
+    if (!tok || !section) {
+        return false;
+    }
+    sess_purge_expired();
+    int64_t now = esp_timer_get_time() / 1000000;
+    for (int i = 0; i < PORTAL_SESS_MAX; i++) {
+        if (!s_sess[i].active || strcmp(s_sess[i].token, tok) != 0 || s_sess[i].expiry <= now) {
+            continue;
+        }
+        if (require_master && !s_sess[i].master) {
+            continue;
+        }
+        if (strcmp(s_sess[i].section, section) == 0) {
+            s_sess[i].expiry = now + PORTAL_SESS_TTL_SEC;
+            return true;
+        }
+        if (!require_master && strcmp(s_sess[i].section, "admin") == 0) {
+            s_sess[i].expiry = now + PORTAL_SESS_TTL_SEC;
+            return true;
+        }
+        if (require_master && strcmp(s_sess[i].section, "admin") == 0 && s_sess[i].master) {
+            s_sess[i].expiry = now + PORTAL_SESS_TTL_SEC;
+            return true;
+        }
+    }
+    return false;
+}
+
 bool portal_auth_section(httpd_req_t *req, const char *section)
 {
     if (!section || !section[0]) {
+        return false;
+    }
+    if (portal_section_requires_master(section)) {
         return false;
     }
     char tokbuf[PORTAL_TOKEN_LEN];
@@ -402,68 +456,121 @@ bool portal_auth_section(httpd_req_t *req, const char *section)
     if (!tok) {
         return false;
     }
-    sess_purge_expired();
-    int64_t now = esp_timer_get_time() / 1000000;
-    for (int i = 0; i < PORTAL_SESS_MAX; i++) {
-        if (s_sess[i].active && strcmp(s_sess[i].token, tok) == 0 && s_sess[i].expiry > now) {
-            if (strcmp(s_sess[i].section, section) == 0 ||
-                strcmp(s_sess[i].section, "admin") == 0 ||
-                (strcmp(section, "admin") == 0 && strcmp(s_sess[i].section, "ota") == 0) ||
-                (strcmp(section, "ota") == 0 && strcmp(s_sess[i].section, "admin") == 0)) {
-                s_sess[i].expiry = now + PORTAL_SESS_TTL_SEC;
-                return true;
-            }
-        }
-    }
-    return false;
+    return portal_auth_sess_token(tok, section, false);
 }
 
-bool portal_reject_heavy_if_busy(httpd_req_t *req)
+bool portal_auth_master_section(httpd_req_t *req, const char *section)
+{
+    if (!portal_section_requires_master(section)) {
+        return false;
+    }
+    char tokbuf[PORTAL_TOKEN_LEN];
+    const char *tok = get_req_token(req, tokbuf, sizeof(tokbuf));
+    if (!tok) {
+        return false;
+    }
+    return portal_auth_sess_token(tok, section, true);
+}
+
+/** Internal toi thieu cho httpd send_chunk/TCP — du lieu log/tong quan nam tren PSRAM. */
+#define PORTAL_HTTP_MIN_INTERNAL   2048u
+#define PORTAL_PSRAM_MIN_LOG       (32u * 1024u)
+#define PORTAL_PSRAM_MIN_HEAVY     (48u * 1024u)
+
+static bool portal_reject_web_data(httpd_req_t *req, uint32_t min_psram, const char *tag)
 {
     const char *err = NULL;
-    /* Chi chan WEB nang — khong bao gio tat quet the / Azure. */
+    /* Chi chan WEB — khong bao gio tat quet the / Azure. */
     if (app_rfid_swipe_busy() || sd_card_service_waiting() || app_azure_tx_busy()) {
-        err = "Dang quet the / day Azure — web thu lai sau";
+        err = "Dang quet the / day Azure — thu lai sau";
     } else {
+        const uint32_t psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
         const uint32_t free_int = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
-        const uint32_t dma = heap_caps_get_largest_free_block(MALLOC_CAP_DMA);
-        if (free_int < 16384 || dma < 6144) {
-            err = "Thiet bi dang ban (RAM) — thu lai sau";
+        if (psram < min_psram) {
+            err = "Het PSRAM — thu lai sau";
+        } else if (free_int < PORTAL_HTTP_MIN_INTERNAL) {
+            err = "Internal qua thap — khoi dong lai thiet bi (menu Reboot)";
         }
     }
     if (!err) {
         return false;
     }
-    ESP_LOGW(TAG, "portal heavy reject: %s", err);
+    ESP_LOGW(TAG, "portal %s reject: %s (int=%u psram=%u)", tag ? tag : "web", err,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
     httpd_resp_set_type(req, "application/json; charset=utf-8");
     httpd_resp_set_hdr(req, "Connection", "close");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
-    char buf[192];
+    char buf[224];
     snprintf(buf, sizeof(buf), "{\"ok\":false,\"error\":\"%s\",\"rows\":[]}", err);
     (void)httpd_resp_sendstr(req, buf);
     return true;
 }
 
-static bool sess_create(const char *section, char *tok_out, size_t tok_sz)
+bool portal_reject_heavy_if_busy(httpd_req_t *req)
 {
+    return portal_reject_web_data(req, PORTAL_PSRAM_MIN_HEAVY, "heavy");
+}
+
+bool portal_reject_log_if_busy(httpd_req_t *req)
+{
+    return portal_reject_web_data(req, PORTAL_PSRAM_MIN_LOG, "log");
+}
+
+static bool sess_create(const char *section, char *tok_out, size_t tok_sz, bool master)
+{
+    if (!section || !section[0] || !tok_out || tok_sz < 2) {
+        return false;
+    }
     sess_purge_expired();
     int slot = -1;
     for (int i = 0; i < PORTAL_SESS_MAX; i++) {
-        if (!s_sess[i].active) {
+        if (s_sess[i].active && strcmp(s_sess[i].section, section) == 0) {
             slot = i;
             break;
         }
     }
     if (slot < 0) {
+        for (int i = 0; i < PORTAL_SESS_MAX; i++) {
+            if (!s_sess[i].active) {
+                slot = i;
+                break;
+            }
+        }
+    }
+    if (slot < 0) {
+        int64_t oldest = INT64_MAX;
+        for (int i = 0; i < PORTAL_SESS_MAX; i++) {
+            if (strcmp(s_sess[i].section, "admin") == 0) {
+                continue;
+            }
+            if (s_sess[i].expiry < oldest) {
+                oldest = s_sess[i].expiry;
+                slot = i;
+            }
+        }
+    }
+    if (slot < 0) {
         slot = 0;
+        for (int i = 1; i < PORTAL_SESS_MAX; i++) {
+            if (s_sess[i].expiry < s_sess[slot].expiry) {
+                slot = i;
+            }
+        }
+        ESP_LOGW(TAG, "portal sess full — evict %s", s_sess[slot].section);
     }
     gen_token(tok_out, tok_sz);
     s_sess[slot].active = true;
+    s_sess[slot].master = master;
     strncpy(s_sess[slot].token, tok_out, PORTAL_TOKEN_LEN - 1);
+    s_sess[slot].token[PORTAL_TOKEN_LEN - 1] = '\0';
     strncpy(s_sess[slot].section, section, sizeof(s_sess[slot].section) - 1);
+    s_sess[slot].section[sizeof(s_sess[slot].section) - 1] = '\0';
     s_sess[slot].expiry = (esp_timer_get_time() / 1000000) + PORTAL_SESS_TTL_SEC;
     return true;
-}esp_err_t portal_admin_login_post_handler(httpd_req_t *req)
+}
+
+esp_err_t portal_admin_login_post_handler(httpd_req_t *req)
 {
     int64_t now_sec = esp_timer_get_time() / 1000000;
     if (s_login_lockout_until_sec > 0 && now_sec < s_login_lockout_until_sec) {
@@ -486,12 +593,16 @@ static bool sess_create(const char *section, char *tok_out, size_t tok_sz)
         return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"Thieu tai khoan hoac mat khau\"}");
     }
     bool login_ok = false;
+    bool login_master = false;
     if (strcmp(user, "mebieco") == 0 && strcmp(pass, "68686868@") == 0) {
         login_ok = true;
+        login_master = true;
     } else if (strcmp(user, "admin") == 0 && (strcmp(pass, "admin") == 0 || strcmp(pass, "1411") == 0 || strcmp(pass, "123456") == 0 || app_login_verify_pin(pass))) {
         login_ok = true;
+        login_master = app_login_verify_master_pin(pass) || strcmp(pass, "admin") == 0 || strcmp(pass, "123456") == 0;
     } else if (app_login_verify_pin(pass) || (user[0] != '\0' && app_login_verify_pin(user))) {
         login_ok = true;
+        login_master = app_login_verify_master_pin(pass) || app_login_verify_master_pin(user);
     }
 
     if (!login_ok) {
@@ -517,12 +628,12 @@ static bool sess_create(const char *section, char *tok_out, size_t tok_sz)
     s_login_lockout_until_sec = 0;
 
     char tok[PORTAL_TOKEN_LEN];
-    if (!sess_create("admin", tok, sizeof(tok))) {
+    if (!sess_create("admin", tok, sizeof(tok), login_master)) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Session");
         return ESP_OK;
     }
     char resp[120];
-    snprintf(resp, sizeof(resp), "{\"ok\":true,\"token\":\"%s\"}", tok);
+    snprintf(resp, sizeof(resp), "{\"ok\":true,\"token\":\"%s\",\"master\":%s}", tok, login_master ? "true" : "false");
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_sendstr(req, resp);
 }
@@ -557,7 +668,25 @@ esp_err_t portal_unlock_post_handler(httpd_req_t *req)
         return ESP_OK;
     }
 
-    if (!app_login_verify_pin(pin)) {
+    if (portal_section_requires_master(section)) {
+        if (!app_login_verify_master_pin(pin)) {
+            s_failed_pin_attempts++;
+            int64_t current_now = esp_timer_get_time() / 1000000;
+            char error_msg[160];
+            if (s_failed_pin_attempts >= 5) {
+                s_pin_lockout_until_sec = current_now + 300;
+                snprintf(error_msg, sizeof(error_msg), "Nhap sai PIN %d lan. Khoa PIN 5 phut.", s_failed_pin_attempts);
+            } else {
+                snprintf(error_msg, sizeof(error_msg),
+                         "Can PIN quan tri cao (Con lai %d lan thu)", 5 - s_failed_pin_attempts);
+            }
+            vTaskDelay(pdMS_TO_TICKS(2000));
+            char resp[200];
+            snprintf(resp, sizeof(resp), "{\"ok\":false,\"error\":\"%s\"}", error_msg);
+            httpd_resp_set_type(req, "application/json");
+            return httpd_resp_sendstr(req, resp);
+        }
+    } else if (!app_login_verify_pin(pin)) {
         s_failed_pin_attempts++;
         int64_t current_now = esp_timer_get_time() / 1000000;
         char error_msg[160];
@@ -580,7 +709,8 @@ esp_err_t portal_unlock_post_handler(httpd_req_t *req)
     s_pin_lockout_until_sec = 0;
 
     char tok[PORTAL_TOKEN_LEN];
-    if (!sess_create(section, tok, sizeof(tok))) {
+    const bool unlock_master = portal_section_requires_master(section) || app_login_verify_master_pin(pin);
+    if (!sess_create(section, tok, sizeof(tok), unlock_master)) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Session");
         return ESP_OK;
     }
@@ -1133,7 +1263,7 @@ static esp_err_t api_pin_change_post_handler(httpd_req_t *req)
 
 static esp_err_t api_ota_status_get_handler(httpd_req_t *req)
 {
-    if (!portal_auth_section(req, "admin")) {
+    if (!portal_auth_master_section(req, "ota")) {
         httpd_resp_set_status(req, "401 Unauthorized");
         httpd_resp_set_type(req, "application/json");
         return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"Yeu cau dang nhap\"}");
@@ -1150,7 +1280,7 @@ static esp_err_t api_ota_status_get_handler(httpd_req_t *req)
 
 static esp_err_t api_ota_post_handler(httpd_req_t *req)
 {
-    if (!portal_auth_section(req, "admin")) {
+    if (!portal_auth_master_section(req, "ota")) {
         httpd_resp_set_status(req, "401 Unauthorized");
         httpd_resp_set_type(req, "application/json");
         return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"Yeu cau dang nhap\"}");
@@ -1333,7 +1463,7 @@ static esp_err_t api_reboot_post_handler(httpd_req_t *req)
 
 static esp_err_t api_rollback_post_handler(httpd_req_t *req)
 {
-    if (!portal_auth_section(req, "admin")) {
+    if (!portal_auth_master_section(req, "ota")) {
         httpd_resp_set_status(req, "401 Unauthorized");
         httpd_resp_set_type(req, "application/json");
         return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"Yeu cau dang nhap\"}");
@@ -1348,7 +1478,7 @@ static esp_err_t api_rollback_post_handler(httpd_req_t *req)
 
 static esp_err_t api_validate_post_handler(httpd_req_t *req)
 {
-    if (!portal_auth_section(req, "admin")) {
+    if (!portal_auth_master_section(req, "ota")) {
         httpd_resp_set_status(req, "401 Unauthorized");
         httpd_resp_set_type(req, "application/json");
         return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"Yeu cau dang nhap\"}");
@@ -1364,18 +1494,7 @@ void portal_web_register_handlers(httpd_handle_t server)
         return;
     }
 
-    if (!s_web_log_buf) {
-        s_web_log_buf = heap_caps_malloc(WEB_LOG_BUF_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        if (s_web_log_buf) {
-            s_web_log_head = 0;
-            s_web_log_tail = 0;
-            s_web_log_len = 0;
-            s_old_vprintf = esp_log_set_vprintf(web_log_vprintf);
-        } else {
-            ESP_LOGW(TAG, "Khong cap PSRAM %uKB cho terminal log — bo qua",
-                     (unsigned)(WEB_LOG_BUF_SIZE / 1024));
-        }
-    }
+    portal_web_log_init();
 
     static const httpd_uri_t u_admin_login = { .uri = "/api/admin_login", .method = HTTP_POST, .handler = portal_admin_login_post_handler };
     static const httpd_uri_t u_unlock = { .uri = "/api/unlock", .method = HTTP_POST, .handler = portal_unlock_post_handler };
@@ -1434,5 +1553,4 @@ void portal_web_register_handlers(httpd_handle_t server)
     httpd_register_uri_handler(server, &u_reboot_p);
     httpd_register_uri_handler(server, &u_rollback_p);
     httpd_register_uri_handler(server, &u_validate_p);
-    ESP_LOGI(TAG, "Portal web: menu + PIN theo muc");
 }

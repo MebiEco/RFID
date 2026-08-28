@@ -201,6 +201,15 @@ void sd_card_lock(void)
     }
 }
 
+bool sd_card_try_lock(uint32_t timeout_ms)
+{
+    sd_mutex_ensure();
+    if (!s_sd_mutex) {
+        return true;
+    }
+    return xSemaphoreTakeRecursive(s_sd_mutex, pdMS_TO_TICKS(timeout_ms)) == pdTRUE;
+}
+
 void sd_card_lock_service(void)
 {
     sd_mutex_ensure();

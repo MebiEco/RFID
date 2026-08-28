@@ -3,6 +3,7 @@
 
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
 #include <ctype.h>
@@ -17,6 +18,7 @@
 #include "esp_timer.h"
 #include "nvs_flash.h"
 #include "mqtt_client.h"
+#include "esp_tls_errors.h"
 #include <sys/stat.h>
 
 #include "mbedtls/md.h"
@@ -31,6 +33,11 @@
 #include "app_ota.h"
 #include "wifi_portal.h"
 #include "scan_log.h"
+#include "app_build_info.h"
+#include "app_rfid.h"
+#include "esp_app_desc.h"
+#include "esp_ota_ops.h"
+#include "esp_netif.h"
 
 /** CA gốc Azure IoT Hub (Baltimore + DigiCert G2 + MS RSA 2017) — nhúng từ azure_iot_ca.pem. */
 extern const uint8_t azure_iot_ca_pem_start[] asm("_binary_azure_iot_ca_pem_start");
@@ -39,7 +46,7 @@ extern const uint8_t azure_iot_ca_pem_end[] asm("_binary_azure_iot_ca_pem_end");
 /** Tu lcd_ui.c — lam moi danh sach the sau khi Cloud sua/xoa profile */
 extern void lcd_ui_invalidate_card_cache(void);
 
-static const char *TAG = "azure_iot";
+static const char *TAG = "app_azure";
 
 /** 2020-01-01 UTC — duoi nguong nay = chua NTP / epoch sai, khong gui backend. */
 #define AZURE_TS_MIN_UTC 1577836800LL
@@ -106,7 +113,6 @@ static void normalize_azure_host(char *host)
 }
 
 static void azure_note_publish(int msg_id, const char *payload);
-static const char *azure_lookup_publish(int msg_id);
 
 /** Tra loi Direct Method Azure IoT Hub (HTTP status trong topic). Tra ve msg_id publish (PUBACK). */
 static int azure_dm_response(esp_mqtt_client_handle_t client, const char *rid, int status_code,
@@ -138,6 +144,8 @@ typedef struct __attribute__((packed)) {
 static esp_mqtt_client_handle_t s_mqtt_client    = NULL;
 static volatile bool s_azure_connected  = false;
 static volatile int  s_azure_tx_busy    = 0;
+/** Mutex serialize MQTT: quet live uu tien — sync chi publish khi khong dang quet. */
+static SemaphoreHandle_t s_azure_pub_mtx;
 static volatile bool s_flush_requested = false; /* flag: azure_task se flush queue khi co mang */
 static volatile bool s_azure_config_reload = false;
 static volatile bool s_azure_ota_suspend = false; /* OTA: khong reconnect MQTT */
@@ -166,7 +174,7 @@ typedef struct {
 
 static azure_sync_req_t s_sync_req;
 
-/** Direct Method 605: tra loi sau khi flush + replay xong. */
+/** Direct Method 605: luon tra accepted ngay; sync chay nen (khong defer). */
 static struct {
     volatile bool pending;
     char rid[32];
@@ -180,13 +188,10 @@ static uint32_t s_mqtt_disc_count = 0;         /* dem ngat trong cua so 2 phut *
 
 /** Azure IoT Hub khuyến nghị keepalive tối đa 240s — ping giữ kết nối liên tục. */
 #define AZURE_MQTT_KEEPALIVE_SEC 240
-/** Hub dong idle sau ~1.5×keepalive; 15.6s thuong la keepalive=10 hoac 400027 trung client. */
-#define AZURE_MQTT_DISC_SHORT_MS_MIN 12000
-#define AZURE_MQTT_DISC_SHORT_MS_MAX 20000
 #define AZURE_PEND_SD_FILE  "/sdcard/az_pend.bin"
 #define AZURE_PEND_SD_TMP   "/sdcard/az_pend.tmp"
 
-/** Cache payload theo MQTT msg_id — PUBACK log lai noi dung da gui. */
+/** Cache payload publish + log JSON gui len Azure. */
 #define AZURE_PUB_TRACE_MAX 8
 #define AZURE_PUB_TRACE_PAYLOAD 384
 typedef struct {
@@ -196,30 +201,51 @@ typedef struct {
 static azure_pub_trace_t s_pub_trace[AZURE_PUB_TRACE_MAX];
 static uint8_t s_pub_trace_i;
 
+static void azure_format_payload(char *out, size_t out_sz, int code, int32_t idx, int64_t ts, const char *uid,
+                                 const char *name, const char *id)
+{
+    snprintf(out, out_sz,
+             "{\"Code\":%d,\"Index\":%ld,\"TimeStamp\":%lld,\"Data\":{\"DeviceName\":\"RFID_Scanner\",\"UID\":\"%s\","
+             "\"Name\":\"%s\",\"ID\":\"%s\"}}",
+             code, (long)idx, (long long)ts, uid, name ? name : "", id ? id : "");
+}
+
+/** Log JSON sap gui / dang gui len Azure (hien tren Log Terminal). */
+static void azure_log_outbound(const char *payload, bool queued)
+{
+    if (!payload || !payload[0]) {
+        return;
+    }
+    if (queued) {
+        ESP_LOGI(TAG, "[cho gui] %s", payload);
+    } else {
+        ESP_LOGI(TAG, "%s", payload);
+    }
+}
+
 static void azure_note_publish(int msg_id, const char *payload)
 {
     if (msg_id < 0 || !payload || !payload[0]) {
+        if (payload && payload[0]) {
+            ESP_LOGW(TAG, "[gui loi] %s", payload);
+        }
         return;
     }
+    azure_log_outbound(payload, false);
     azure_pub_trace_t *t = &s_pub_trace[s_pub_trace_i % AZURE_PUB_TRACE_MAX];
     s_pub_trace_i++;
     t->msg_id = msg_id;
     snprintf(t->payload, sizeof(t->payload), "%s", payload);
 }
 
-static const char *azure_lookup_publish(int msg_id)
-{
-    for (int i = 0; i < AZURE_PUB_TRACE_MAX; i++) {
-        if (s_pub_trace[i].msg_id == msg_id && s_pub_trace[i].payload[0]) {
-            return s_pub_trace[i].payload;
-        }
-    }
-    return NULL;
-}
-
 static void sd_pend_init(void);
 static int flush_pending_queue(esp_mqtt_client_handle_t client, const char *dev_id);
 static bool azure_pend_has_data(void);
+static void azure_wait_swipe_priority(void);
+static void azure_sync_send_begin(void);
+static void azure_sync_send_end(void);
+static void azure_live_send_begin(void);
+static void azure_live_send_end(void);
 
 static int32_t azure_peek_msg_index(msg_idx_type_t type)
 {
@@ -254,19 +280,17 @@ static int azure_publish_event_entry(esp_mqtt_client_handle_t client, const char
     snprintf(topic, sizeof(topic), "devices/%s/messages/events/$.ct=application%%2Fjson&$.ce=utf-8", dev_id);
 
     static char payload[448];
-    snprintf(payload, sizeof(payload),
-             "{\"Code\":%d,\"Index\":%ld,\"TimeStamp\":%lld,\"Data\":{\"DeviceName\":\"RFID_Scanner\","
-             "\"UID\":\"%s\",\"Name\":\"%s\",\"ID\":\"%s\"}}",
-             ent->event_code, (long)ent->index, (long long)ts, ent->uid, ent->name, ent->id);
+    azure_format_payload(payload, sizeof(payload), ent->event_code, ent->index, (int64_t)ts, ent->uid, ent->name,
+                         ent->id);
 
+    azure_sync_send_begin();
     int pub_ret = esp_mqtt_client_publish(client, topic, payload, 0, 1, 0);
+    azure_sync_send_end();
     if (pub_ret < 0) {
         ESP_LOGW(TAG, "Replay publish loi code=%d index=%ld", ent->event_code, (long)ent->index);
         return -1;
     }
     azure_note_publish(pub_ret, payload);
-    ESP_LOGI(TAG, "Replay tu log: code=%d index=%ld uid=%s msg_id=%d", ent->event_code, (long)ent->index, ent->uid,
-             pub_ret);
     return 0;
 }
 
@@ -280,6 +304,27 @@ static int azure_replay_publish_cb(const scan_log_replay_entry_t *entry, void *c
     return azure_publish_event_entry(rc->client, rc->dev_id, entry);
 }
 
+/** Doc so tu JSON: number hoac string "8300" (Azure Portal / backend hay gui string). */
+static bool azure_json_get_i32(const cJSON *j, int32_t *out)
+{
+    if (!j || !out) {
+        return false;
+    }
+    if (cJSON_IsNumber(j)) {
+        *out = (int32_t)j->valuedouble;
+        return true;
+    }
+    if (cJSON_IsString(j) && j->valuestring && j->valuestring[0]) {
+        char *end = NULL;
+        long v = strtol(j->valuestring, &end, 10);
+        if (end != j->valuestring) {
+            *out = (int32_t)v;
+            return true;
+        }
+    }
+    return false;
+}
+
 static void azure_parse_sync_data(cJSON *root, azure_sync_req_t *out)
 {
     memset(out, 0, sizeof(*out));
@@ -288,22 +333,25 @@ static void azure_parse_sync_data(cJSON *root, azure_sync_req_t *out)
     }
     cJSON *data = cJSON_GetObjectItem(root, "Data");
     if (!data || !cJSON_IsObject(data)) {
-        return;
+        /* Mot so tool gui StartIdx o root — van chap nhan. */
+        data = root;
     }
+
     cJSON *j = cJSON_GetObjectItem(data, "LastIdxSwipe");
-    if (j && cJSON_IsNumber(j)) {
+    int32_t tmp = 0;
+    if (azure_json_get_i32(j, &tmp)) {
         out->have_last_swipe = true;
-        out->last_swipe = (int32_t)j->valuedouble;
+        out->last_swipe = tmp;
     }
     j = cJSON_GetObjectItem(data, "LastIdxUnkn");
-    if (j && cJSON_IsNumber(j)) {
+    if (azure_json_get_i32(j, &tmp)) {
         out->have_last_unkn = true;
-        out->last_unkn = (int32_t)j->valuedouble;
+        out->last_unkn = tmp;
     }
     j = cJSON_GetObjectItem(data, "LastIdxAdmin");
-    if (j && cJSON_IsNumber(j)) {
+    if (azure_json_get_i32(j, &tmp)) {
         out->have_last_admin = true;
-        out->last_admin = (int32_t)j->valuedouble;
+        out->last_admin = tmp;
     }
     j = cJSON_GetObjectItem(data, "Missing");
     if (j && cJSON_IsArray(j)) {
@@ -315,32 +363,176 @@ static void azure_parse_sync_data(cJSON *root, azure_sync_req_t *out)
             }
             cJSON *c = cJSON_GetObjectItem(it, "Code");
             cJSON *ix = cJSON_GetObjectItem(it, "Index");
-            if (c && cJSON_IsNumber(c) && ix && cJSON_IsNumber(ix)) {
-                out->missing[out->missing_count].code = c->valueint;
-                out->missing[out->missing_count].index = (int32_t)ix->valuedouble;
+            int32_t code_v = 0, idx_v = 0;
+            if (azure_json_get_i32(c, &code_v) && azure_json_get_i32(ix, &idx_v)) {
+                out->missing[out->missing_count].code = (int)code_v;
+                out->missing[out->missing_count].index = idx_v;
                 out->missing_count++;
             }
         }
     }
-    
+
     cJSON *s = cJSON_GetObjectItem(data, "StartIdx");
+    if (!s) {
+        s = cJSON_GetObjectItem(data, "StartIndex");
+    }
     cJSON *e = cJSON_GetObjectItem(data, "EndIdx");
-    if (s && cJSON_IsNumber(s) && e && cJSON_IsNumber(e)) {
-        int32_t start_idx = (int32_t)s->valuedouble;
-        int32_t end_idx = (int32_t)e->valuedouble;
+    if (!e) {
+        e = cJSON_GetObjectItem(data, "EndIndex");
+    }
+    int32_t start_idx = 0, end_idx = 0;
+    if (azure_json_get_i32(s, &start_idx) && azure_json_get_i32(e, &end_idx)) {
         if (start_idx > 0 && end_idx >= start_idx) {
             cJSON *code_obj = cJSON_GetObjectItem(data, "CodeRange");
+            int32_t code_range = 602;
+            if (!azure_json_get_i32(code_obj, &code_range) || code_range <= 0) {
+                code_range = 602;
+            }
             out->have_range = true;
             out->range_start = start_idx;
             out->range_end = end_idx;
-            out->range_code = (code_obj && cJSON_IsNumber(code_obj)) ? code_obj->valueint : 602;
+            out->range_code = (int)code_range;
         }
     }
 
     if (out->have_last_swipe || out->have_last_unkn || out->have_last_admin || out->missing_count > 0 ||
         out->have_range) {
         out->active = true;
-        out->defer_response = true;
+        /* Tra Direct Method ngay (accepted); day MQTT/SD chay nen — tranh timeout Hub. */
+        out->defer_response = false;
+    }
+}
+
+static void azure_copy_json_str(cJSON *j, char *dst, size_t dstsz)
+{
+    /* Chi ghi de khi JSON co field string — khong xoa gia tri da parse (vd ConnectionString). */
+    if (!dst || dstsz == 0 || !j || !cJSON_IsString(j) || !j->valuestring || !j->valuestring[0]) {
+        return;
+    }
+    strncpy(dst, j->valuestring, dstsz - 1);
+    dst[dstsz - 1] = '\0';
+}
+
+/** Code 607: Host/DeviceId/SasKey rieng le, hoac 1 chuoi ConnectionString Azure IoT. */
+static void azure_parse_change_hub_data(cJSON *data, char *host, size_t host_sz, char *devid, size_t devid_sz,
+                                        char *sas, size_t sas_sz)
+{
+    if (!data || !cJSON_IsObject(data) || !host || !sas) {
+        return;
+    }
+    host[0] = '\0';
+    sas[0] = '\0';
+    if (devid && devid_sz) {
+        devid[0] = '\0';
+    }
+
+    static const char *const conn_keys[] = {"ConnectionString", "ConnString", "IoTHubConnectionString",
+                                            "ConnectionStr", NULL};
+    for (int i = 0; conn_keys[i]; i++) {
+        cJSON *cj = cJSON_GetObjectItem(data, conn_keys[i]);
+        if (cj && cJSON_IsString(cj) && cj->valuestring[0]) {
+            (void)wifi_portal_parse_iot_conn_string(cj->valuestring, host, host_sz, devid, devid_sz, sas, sas_sz);
+            break;
+        }
+    }
+
+    cJSON *host_j = cJSON_GetObjectItem(data, "Host");
+    if (!host_j) {
+        host_j = cJSON_GetObjectItem(data, "HostName");
+    }
+    if (!host_j) {
+        host_j = cJSON_GetObjectItem(data, "azure_host");
+    }
+    if (host_j && cJSON_IsString(host_j) && host_j->valuestring[0]) {
+        if (strstr(host_j->valuestring, "HostName=") != NULL) {
+            (void)wifi_portal_parse_iot_conn_string(host_j->valuestring, host, host_sz, devid, devid_sz, sas, sas_sz);
+        } else {
+            azure_copy_json_str(host_j, host, host_sz);
+        }
+    }
+
+    cJSON *dev_j = cJSON_GetObjectItem(data, "DeviceId");
+    if (!dev_j) {
+        dev_j = cJSON_GetObjectItem(data, "DeviceID");
+    }
+    if (!dev_j) {
+        dev_j = cJSON_GetObjectItem(data, "Device");
+    }
+    if (!dev_j) {
+        dev_j = cJSON_GetObjectItem(data, "azure_devid");
+    }
+    azure_copy_json_str(dev_j, devid, devid_sz);
+
+    cJSON *sas_j = cJSON_GetObjectItem(data, "SasKey");
+    if (!sas_j) {
+        sas_j = cJSON_GetObjectItem(data, "SASKey");
+    }
+    if (!sas_j) {
+        sas_j = cJSON_GetObjectItem(data, "SharedAccessKey");
+    }
+    if (!sas_j) {
+        sas_j = cJSON_GetObjectItem(data, "Key");
+    }
+    if (!sas_j) {
+        sas_j = cJSON_GetObjectItem(data, "azure_sas_key");
+    }
+    azure_copy_json_str(sas_j, sas, sas_sz);
+}
+
+static void azure_pub_mtx_ensure(void)
+{
+    if (!s_azure_pub_mtx) {
+        s_azure_pub_mtx = xSemaphoreCreateMutex();
+    }
+}
+
+static void azure_wait_swipe_priority(void)
+{
+    for (int w = 0; (app_rfid_swipe_busy() || sd_card_service_waiting()) && w < 500; w++) {
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+
+/** Sync/replay: doi quet the gui xong, roi moi publish 1 ban tin. */
+static void azure_sync_send_begin(void)
+{
+    azure_pub_mtx_ensure();
+    for (;;) {
+        /* Uu tien: dang quet / dang cho SD — dung sync, doi gui the xong. */
+        azure_wait_swipe_priority();
+        if (s_azure_pub_mtx) {
+            (void)xSemaphoreTake(s_azure_pub_mtx, portMAX_DELAY);
+        }
+        if (app_rfid_swipe_busy() || sd_card_service_waiting()) {
+            if (s_azure_pub_mtx) {
+                xSemaphoreGive(s_azure_pub_mtx);
+            }
+            continue;
+        }
+        return;
+    }
+}
+
+static void azure_sync_send_end(void)
+{
+    if (s_azure_pub_mtx) {
+        xSemaphoreGive(s_azure_pub_mtx);
+    }
+}
+
+/** Telemetry quet the live — lay MQTT ngay (sync phai doi). */
+static void azure_live_send_begin(void)
+{
+    azure_pub_mtx_ensure();
+    if (s_azure_pub_mtx) {
+        (void)xSemaphoreTake(s_azure_pub_mtx, portMAX_DELAY);
+    }
+}
+
+static void azure_live_send_end(void)
+{
+    if (s_azure_pub_mtx) {
+        xSemaphoreGive(s_azure_pub_mtx);
     }
 }
 
@@ -359,8 +551,13 @@ static void azure_run_sync_work(esp_mqtt_client_handle_t client, const char *dev
         return;
     }
 
+    app_azure_tx_busy_begin();
+    azure_wait_swipe_priority();
+
     if (azure_pend_has_data()) {
+        azure_wait_swipe_priority();
         vTaskDelay(pdMS_TO_TICKS(3000));
+        azure_wait_swipe_priority();
         pend_flushed = flush_pending_queue(client, dev_id);
     }
 
@@ -372,6 +569,7 @@ static void azure_run_sync_work(esp_mqtt_client_handle_t client, const char *dev
 
         /* LastIdx* + Missing[] (Missing van toi da 64 phan tu — khong doi). */
         if (req->have_last_swipe || req->have_last_unkn || req->have_last_admin || req->missing_count > 0) {
+            azure_wait_swipe_priority();
             scan_log_sync_filter_t filt;
             memset(&filt, 0, sizeof(filt));
             filt.have_last_swipe = req->have_last_swipe;
@@ -397,6 +595,7 @@ static void azure_run_sync_work(esp_mqtt_client_handle_t client, const char *dev
             int32_t cur = req->range_start;
             int batch = 0;
             while (cur <= req->range_end) {
+                azure_wait_swipe_priority();
                 scan_log_sync_filter_t filt;
                 memset(&filt, 0, sizeof(filt));
                 while (cur <= req->range_end && filt.missing_count < SCAN_LOG_SYNC_MISSING_MAX) {
@@ -416,6 +615,8 @@ static void azure_run_sync_work(esp_mqtt_client_handle_t client, const char *dev
             }
         }
     }
+
+    app_azure_tx_busy_end();
 
     if (pend_flushed_out) {
         *pend_flushed_out = pend_flushed;
@@ -437,20 +638,25 @@ static void azure_send_sync_dm_response(esp_mqtt_client_handle_t client, const c
 
     char res_payload[640];
     if (req && req->active) {
+        /* Accepted ngay — ResentFromLog/PendingFlushed = 0 (chua day); backend doi telemetry. */
         snprintf(res_payload, sizeof(res_payload),
                  "{\"status\":200,\"payload\":{\"Code\":605,\"TimeStamp\":%lld,"
                  "\"IdxSwipe\":%ld,\"IdxUnkn\":%ld,\"IdxAdmin\":%ld,"
                  "\"LastIdxSwipe\":%ld,\"LastIdxUnkn\":%ld,\"LastIdxAdmin\":%ld,"
+                 "\"StartIdx\":%ld,\"EndIdx\":%ld,\"CodeRange\":%d,"
                  "\"PendingFlushed\":%d,\"ResentFromLog\":%d,"
-                 "\"Message\":\"Sync done\"}}",
+                 "\"Accepted\":true,\"Message\":\"Sync accepted, pushing in background\"}}",
                  (long long)time(NULL), (long)idx_sw, (long)idx_un, (long)idx_ad,
                  req->have_last_swipe ? (long)req->last_swipe : -1L,
                  req->have_last_unkn ? (long)req->last_unkn : -1L,
-                 req->have_last_admin ? (long)req->last_admin : -1L, pend_flushed, log_resent);
+                 req->have_last_admin ? (long)req->last_admin : -1L,
+                 req->have_range ? (long)req->range_start : -1L,
+                 req->have_range ? (long)req->range_end : -1L,
+                 req->have_range ? req->range_code : 0, pend_flushed, log_resent);
     } else {
         snprintf(res_payload, sizeof(res_payload),
                  "{\"status\":200,\"payload\":{\"Code\":605,\"TimeStamp\":%lld,"
-                 "\"PendingFlushed\":%d,\"Message\":\"Flush trigger accepted\"}}",
+                 "\"PendingFlushed\":%d,\"Accepted\":true,\"Message\":\"Flush trigger accepted\"}}",
                  (long long)time(NULL), pend_flushed);
     }
     azure_dm_response(client, rid, COMMAND_STATUS_OK, res_payload);
@@ -475,9 +681,11 @@ static void azure_log_mqtt_error(const esp_mqtt_event_t *event, int64_t conn_upt
 {
     if (!event || !event->error_handle) {
         ESP_LOGE(TAG, "MQTT loi (uptime=%lld ms) — khong co error_handle", (long long)conn_uptime_ms);
+        ESP_LOGI("boot", "Azure MQTT: LOI (khong co chi tiet)");
         return;
     }
     const esp_mqtt_error_codes_t *e = event->error_handle;
+    const bool closed_fin = (e->esp_tls_last_esp_err == ESP_ERR_ESP_TLS_TCP_CLOSED_FIN);
     ESP_LOGE(TAG,
              "MQTT loi uptime=%lld ms type=%s conn_rc=%d sock_errno=%d tls=%s",
              (long long)conn_uptime_ms,
@@ -485,29 +693,47 @@ static void azure_log_mqtt_error(const esp_mqtt_event_t *event, int64_t conn_upt
              (int)e->connect_return_code,
              e->esp_transport_sock_errno,
              esp_err_to_name(e->esp_tls_last_esp_err));
+    if (closed_fin) {
+        /* Hub dong FIN sau khi da CONNECTED ~15-20s: gan nhu luon do client khac cung DeviceId. */
+        ESP_LOGW(TAG,
+                 "Hub dong ket noi (TCP FIN) — thuong do DeviceId dang dung boi Azure IoT Explorer / "
+                 "backend / may ESP khac. Chi 1 client MQTT / device.");
+        ESP_LOGI("boot", "Azure MQTT: Hub dong FIN — kiem tra DeviceId trung");
+    } else {
+        ESP_LOGI("boot", "Azure MQTT: LOI type=%s conn_rc=%d tls=%s",
+                 azure_mqtt_error_type_str(e->error_type), (int)e->connect_return_code,
+                 esp_err_to_name(e->esp_tls_last_esp_err));
+    }
 }
 
 static void azure_note_disconnect(int64_t conn_uptime_ms)
 {
     const int64_t now = azure_now_ms();
+    static int64_t s_last_disc_log_ms;
+    /* Log moi lan ngat (toi da 1 dong / 8s) — portal Terminal moi thay "Mat ket noi". */
+    if (s_last_disc_log_ms == 0 || (now - s_last_disc_log_ms) >= 8000) {
+        s_last_disc_log_ms = now;
+        if (conn_uptime_ms < 0) {
+            ESP_LOGW(TAG, "Azure MQTT: mat ket noi (chua tung CONNECTED — sai SAS/Host/Device hoac TLS)");
+            ESP_LOGI("boot", "Azure MQTT: mat ket noi (chua CONNECTED)");
+        } else {
+            ESP_LOGW(TAG, "Azure MQTT: mat ket noi (da online %lld ms)", (long long)conn_uptime_ms);
+            ESP_LOGI("boot", "Azure MQTT: mat ket noi");
+        }
+    }
+
     if (s_mqtt_disc_window_start_ms == 0 || (now - s_mqtt_disc_window_start_ms) > 120000) {
         s_mqtt_disc_window_start_ms = now;
         s_mqtt_disc_count = 0;
     }
     s_mqtt_disc_count++;
 
-    if (conn_uptime_ms >= AZURE_MQTT_DISC_SHORT_MS_MIN &&
-        conn_uptime_ms <= AZURE_MQTT_DISC_SHORT_MS_MAX) {
-        ESP_LOGW(TAG,
-                 "MQTT ngat sau %lld ms (~15s) — thuong do: (1) trung Device ID "
-                 "(IoT Explorer/backend khac, Azure 400027) hoac (2) keepalive ping khong kip",
-                 (long long)conn_uptime_ms);
-    }
-
     if (s_mqtt_disc_count >= 3) {
         ESP_LOGE(TAG,
                  "MQTT ngat %u lan/2 phut — KIEM TRA: dong Azure IoT Explorer, backend/service "
                  "dung cung deviceId, chi 1 thiet bi ESP ket noi",
+                 (unsigned)s_mqtt_disc_count);
+        ESP_LOGI("boot", "Azure MQTT: ngat lap lai %u lan/2p — kiem tra deviceId trung",
                  (unsigned)s_mqtt_disc_count);
         s_mqtt_disc_count = 0;
         s_mqtt_disc_window_start_ms = now;
@@ -559,8 +785,19 @@ static bool azure_load_cred(wifi_cred_t *cred)
 static void azure_wait_network_ready(void)
 {
     ESP_LOGI(TAG, "Cho WiFi + gio NTP truoc khi ket noi Azure...");
+    int64_t last_log_ms = 0;
     while (wifi_portal_get_conn_status() != WIFI_STATUS_CONNECTED ||
            !wifi_portal_time_is_valid()) {
+        const int64_t now = azure_now_ms();
+        if (last_log_ms == 0 || (now - last_log_ms) >= 10000) {
+            last_log_ms = now;
+            const bool wifi_ok = (wifi_portal_get_conn_status() == WIFI_STATUS_CONNECTED);
+            const bool time_ok = wifi_portal_time_is_valid();
+            ESP_LOGW(TAG, "Azure cho mang: WiFi=%s Gio=%s", wifi_ok ? "OK" : "chua",
+                     time_ok ? "OK" : "chua NTP");
+            ESP_LOGI("boot", "Azure cho: WiFi=%s Gio=%s", wifi_ok ? "OK" : "chua",
+                     time_ok ? "OK" : "chua NTP");
+        }
         if (s_ntp_done_sem) {
             (void)xSemaphoreTake(s_ntp_done_sem, pdMS_TO_TICKS(1000));
         } else {
@@ -634,17 +871,18 @@ static void pending_enqueue(const char *uid, const char *name, const char *id, i
     r.timestamp_utc = (int64_t)wifi_portal_get_utc_sec();
     r.index         = msg_idx;
 
+    {
+        char payload[384];
+        azure_format_payload(payload, sizeof(payload), event_code, msg_idx, r.timestamp_utc, uid, name, id);
+        azure_log_outbound(payload, true);
+    }
+
     xSemaphoreTake(s_sd_pend_mtx, portMAX_DELAY);
     sd_card_lock(); /* bảo vệ SPI bus SD */
     FILE *f = fopen(AZURE_PEND_SD_FILE, "ab");
     if (f) {
         fwrite(&r, sizeof(r), 1, f);
         fclose(f);
-        struct stat st;
-        if (stat(AZURE_PEND_SD_FILE, &st) == 0) {
-            ESP_LOGI(TAG, "SD queue: %ld ban ghi dang cho (code %d, index %ld)",
-                     (long)(st.st_size / (long)sizeof(azure_pend_rec_t)), event_code, (long)msg_idx);
-        }
     } else {
         ESP_LOGW(TAG, "SD queue: khong mo duoc file (SD san sang chua?)");
     }
@@ -728,13 +966,12 @@ static int flush_pending_queue(esp_mqtt_client_handle_t client, const char *dev_
 
         /* Dùng static để giảm áp lực lên stack của task */
         static char payload[448];
-        snprintf(payload, sizeof(payload),
-                 "{\"Code\":%d,\"Index\":%ld,\"TimeStamp\":%lld,\"Data\":{\"DeviceName\":\"RFID_Scanner\","
-                 "\"UID\":\"%s\",\"Name\":\"%s\",\"ID\":\"%s\"}}",
-                 (int)rec.event_code, (long)rec.index, (long long)rec.timestamp_utc,
-                 rec.uid, rec.name, rec.id);
+        azure_format_payload(payload, sizeof(payload), (int)rec.event_code, rec.index, rec.timestamp_utc, rec.uid,
+                             rec.name, rec.id);
 
+        azure_sync_send_begin();
         int pub_ret = esp_mqtt_client_publish(client, topic, payload, 0, 1, 0);
+        azure_sync_send_end();
         if (pub_ret < 0) {
             ESP_LOGW(TAG, "Publish loi — giu lai cac ban ghi con");
             had_error = true;
@@ -748,8 +985,9 @@ static int flush_pending_queue(esp_mqtt_client_handle_t client, const char *dev_
         }
         azure_note_publish(pub_ret, payload);
         total_flushed++;
-        /* Tăng delay lên 500ms để thẻ SD và bus SPI có thời gian nghỉ, nhường cho task RFID */
+        /* Mo nhan the ~500ms; neu quet thi doi gui the xong moi ban tin tiep. */
         vTaskDelay(pdMS_TO_TICKS(500));
+        azure_wait_swipe_priority();
     }
     sd_card_lock();
     fclose(f);
@@ -842,7 +1080,6 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     switch ((esp_mqtt_event_id_t)event_id) {
     case MQTT_EVENT_CONNECTED: {
         s_mqtt_conn_ms = azure_now_ms();
-        ESP_LOGI(TAG, "MQTT Connected to Azure IoT Hub! (keepalive=%ds)", AZURE_MQTT_KEEPALIVE_SEC);
         s_azure_connected = true;
         
         wifi_cred_t cred;
@@ -855,17 +1092,14 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         }
         if (cred.azure_dev[0] != '\0') {
             esp_mqtt_client_subscribe(event->client, "$iothub/methods/POST/#", 0);
-            ESP_LOGI(TAG, "Da dang ky nhan Direct Method: 603 cap nhat the, 604 xoa the");
-            /* Dat flag de azure_task flush queue an toan tu task context */
             s_flush_requested = true;
+            ESP_LOGI("boot", "Azure MQTT: OK");
         }
         break;
     }
     case MQTT_EVENT_DISCONNECTED: {
         const int64_t uptime = (s_mqtt_conn_ms > 0) ? (azure_now_ms() - s_mqtt_conn_ms) : -1;
         azure_note_disconnect(uptime);
-        ESP_LOGW(TAG, "MQTT ngat tam thoi (uptime=%lld ms) — ESP-MQTT tu reconnect",
-                 (long long)uptime);
         s_azure_connected = false;
         s_mqtt_conn_ms = 0;
         break;
@@ -897,9 +1131,9 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                     }
 
                     bool is_flush_req = (strcmp(method_name, "FlushQueue") == 0);
-                    bool is_ota_req = (strcmp(method_name, "TriggerOTA") == 0);
-                    bool is_change_hub_req = (strcmp(method_name, "ChangeHub") == 0);
-                    bool is_dev_cmd = (strcmp(method_name, "DeviceCommand") == 0);
+                    bool is_ota_req = (strcmp(method_name, "OTA") == 0);
+                    bool is_change_hub_req = (strcmp(method_name, "Hub") == 0);
+                    bool is_dev_cmd = (strcmp(method_name, "Check") == 0);
 
                     // 1. Sai tên method (404 - không support)
                     if (!is_flush_req && !is_ota_req && !is_change_hub_req && !is_dev_cmd) {
@@ -978,9 +1212,9 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                         method_code = code->valueint;
 
                         // 4. Kiem tra Code la (400 - Unknown Code: ...)
-                        bool known_code = (method_code == 600 || method_code == 603 || method_code == 604 ||
-                                           method_code == 605 || method_code == 606 || method_code == 607 ||
-                                           method_code == 611 || method_code == 612);
+                        bool known_code = (method_code == 500 || method_code == 600 || method_code == 603 ||
+                                           method_code == 604 || method_code == 605 || method_code == 606 ||
+                                           method_code == 607 || method_code == 611 || method_code == 612);
                         if (!known_code) {
                             if (rid[0] != '\0') {
                                 char res_payload[192];
@@ -1017,30 +1251,32 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                         s_sync_req = sync_copy;
                         s_flush_requested = true;
 
-                        if (sync_copy.defer_response && rid[0] != '\0') {
-                            s_sync_dm.pending = true;
-                            snprintf(s_sync_dm.rid, sizeof(s_sync_dm.rid), "%s", rid);
-                            s_sync_dm.client = event->client;
-                            ESP_LOGI(TAG,
-                                     "605 Sync: LastIdxSwipe=%ld LastIdxUnkn=%ld LastIdxAdmin=%ld missing=%d range=%ld..%ld",
-                                     sync_copy.have_last_swipe ? (long)sync_copy.last_swipe : -1L,
-                                     sync_copy.have_last_unkn ? (long)sync_copy.last_unkn : -1L,
-                                     sync_copy.have_last_admin ? (long)sync_copy.last_admin : -1L,
-                                     sync_copy.missing_count,
-                                     sync_copy.have_range ? (long)sync_copy.range_start : -1L,
-                                     sync_copy.have_range ? (long)sync_copy.range_end : -1L);
-                        } else {
-                            ESP_LOGI(TAG,
-                                     "Direct Method: Flush queue (605 / %s). Se thuc hien trong giay lat...",
-                                     method_name);
-                            if (rid[0] != '\0') {
-                                char res_payload[192];
-                                snprintf(res_payload, sizeof(res_payload),
-                                         "{\"status\":200,\"payload\":{\"Code\":605,\"TimeStamp\":%lld,"
-                                         "\"Message\":\"Flush trigger accepted\"}}",
-                                         (long long)time(NULL));
-                                azure_dm_response(event->client, rid, COMMAND_STATUS_OK, res_payload);
+                        /* Log payload de doi chieu khi range=-1 (tool gui sai / string). */
+                        if (root) {
+                            char *dump = cJSON_PrintUnformatted(root);
+                            if (dump) {
+                                ESP_LOGI(TAG, "605 payload: %.400s", dump);
+                                free(dump);
                             }
+                        }
+                        ESP_LOGI(TAG,
+                                 "605 accepted (bg push): active=%d LastIdxSwipe=%ld LastIdxUnkn=%ld LastIdxAdmin=%ld "
+                                 "missing=%d range=%ld..%ld codeRange=%d",
+                                 sync_copy.active ? 1 : 0,
+                                 sync_copy.have_last_swipe ? (long)sync_copy.last_swipe : -1L,
+                                 sync_copy.have_last_unkn ? (long)sync_copy.last_unkn : -1L,
+                                 sync_copy.have_last_admin ? (long)sync_copy.last_admin : -1L,
+                                 sync_copy.missing_count,
+                                 sync_copy.have_range ? (long)sync_copy.range_start : -1L,
+                                 sync_copy.have_range ? (long)sync_copy.range_end : -1L,
+                                 sync_copy.have_range ? sync_copy.range_code : 0);
+                        if (!sync_copy.active) {
+                            ESP_LOGW(TAG,
+                                     "605: khong co StartIdx/EndIdx/LastIdx/Missing hop le — chi flush pending (neu co)");
+                        }
+                        if (rid[0] != '\0') {
+                            /* Tra ngay — khong defer; day log chay sau trong azure_task. */
+                            azure_send_sync_dm_response(event->client, rid, sync_copy.active ? &sync_copy : NULL, 0, 0);
                         }
                     } else if (is_ota_req) {
                         char ota_url[1024] = {0};
@@ -1079,30 +1315,8 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
 
                         if (root) {
                             cJSON *data = cJSON_GetObjectItem(root, "Data");
-                            if (data && cJSON_IsObject(data)) {
-                                cJSON *host_j = cJSON_GetObjectItem(data, "Host");
-                                if (!host_j) host_j = cJSON_GetObjectItem(data, "HostName");
-                                if (!host_j) host_j = cJSON_GetObjectItem(data, "azure_host");
-                                if (host_j && cJSON_IsString(host_j)) {
-                                    strncpy(new_host, host_j->valuestring, sizeof(new_host) - 1);
-                                }
-
-                                cJSON *dev_j = cJSON_GetObjectItem(data, "DeviceId");
-                                if (!dev_j) dev_j = cJSON_GetObjectItem(data, "DeviceID");
-                                if (!dev_j) dev_j = cJSON_GetObjectItem(data, "Device");
-                                if (!dev_j) dev_j = cJSON_GetObjectItem(data, "azure_devid");
-                                if (dev_j && cJSON_IsString(dev_j)) {
-                                    strncpy(new_dev, dev_j->valuestring, sizeof(new_dev) - 1);
-                                }
-
-                                cJSON *sas_j = cJSON_GetObjectItem(data, "SasKey");
-                                if (!sas_j) sas_j = cJSON_GetObjectItem(data, "SASKey");
-                                if (!sas_j) sas_j = cJSON_GetObjectItem(data, "Key");
-                                if (!sas_j) sas_j = cJSON_GetObjectItem(data, "azure_sas_key");
-                                if (sas_j && cJSON_IsString(sas_j)) {
-                                    strncpy(new_sas, sas_j->valuestring, sizeof(new_sas) - 1);
-                                }
-                            }
+                            azure_parse_change_hub_data(data, new_host, sizeof(new_host), new_dev, sizeof(new_dev),
+                                                        new_sas, sizeof(new_sas));
                         }
 
                         if (new_host[0] != '\0' && new_sas[0] != '\0') {
@@ -1130,11 +1344,11 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                                 }
                             }
                         } else {
-                            ESP_LOGE(TAG, "Direct Method ChangeHub: Thieu Host hoac SasKey");
+                            ESP_LOGE(TAG, "Direct Method ChangeHub: Thieu Host/SasKey hoac ConnectionString");
                             if (rid[0] != '\0') {
                                 char res_payload[192];
                                 snprintf(res_payload, sizeof(res_payload),
-                                         "{\"status\":400,\"payload\":{\"Message\":\"Missing Host or SasKey in Data\"}}");
+                                         "{\"status\":400,\"payload\":{\"Message\":\"Missing Host/SasKey or ConnectionString in Data\"}}");
                                 azure_dm_response(event->client, rid, COMMAND_STATUS_BAD_REQUEST, res_payload);
                             }
                         }
@@ -1201,6 +1415,32 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                                     }
                                 }
                             }
+                        }
+                    } else if (method_code == 500) {
+                        /* Hoi phien ban firmware / build stamp / IP dang chay. */
+                        const esp_app_desc_t *app = esp_app_get_description();
+                        const esp_partition_t *run = esp_ota_get_running_partition();
+                        const char *ver = (app && app->version[0]) ? app->version : "?";
+                        const char *bld =
+                            (g_app_build_stamp[0]) ? g_app_build_stamp : ((app && app->date[0]) ? app->date : "?");
+                        const char *part = (run && run->label[0]) ? run->label : "?";
+                        char sta_ip[20] = "";
+                        esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+                        if (netif) {
+                            esp_netif_ip_info_t ipi;
+                            if (esp_netif_get_ip_info(netif, &ipi) == ESP_OK && ipi.ip.addr != 0) {
+                                snprintf(sta_ip, sizeof(sta_ip), IPSTR, IP2STR(&ipi.ip));
+                            }
+                        }
+                        ESP_LOGI(TAG, "Direct Method 500: Version=%s Build=%s Part=%s IP=%s", ver, bld, part,
+                                 sta_ip[0] ? sta_ip : "-");
+                        if (rid[0] != '\0') {
+                            char res_payload[384];
+                            snprintf(res_payload, sizeof(res_payload),
+                                     "{\"status\":200,\"payload\":{\"Code\":500,\"TimeStamp\":%lld,"
+                                     "\"Version\":\"%s\",\"Build\":\"%s\",\"Partition\":\"%s\",\"IP\":\"%s\"}}",
+                                     (long long)time(NULL), ver, bld, part, sta_ip);
+                            azure_dm_response(event->client, rid, COMMAND_STATUS_OK, res_payload);
                         }
                     } else if (method_code == 600) {
                         char reset_type[32] = "all";
@@ -1290,15 +1530,8 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         azure_log_mqtt_error(event, uptime);
         break;
     }
-    case MQTT_EVENT_PUBLISHED: {
-        const char *body = azure_lookup_publish(event->msg_id);
-        if (body) {
-            ESP_LOGI(TAG, "MQTT_EVENT_PUBLISHED msg_id=%d PUBACK — da gui: %s", event->msg_id, body);
-        } else {
-            ESP_LOGI(TAG, "MQTT_EVENT_PUBLISHED msg_id=%d — Azure PUBACK (khong con cache payload)", event->msg_id);
-        }
+    case MQTT_EVENT_PUBLISHED:
         break;
-    }
     default:
         break;
     }
@@ -1314,12 +1547,14 @@ static void azure_task(void *arg)
 
         wifi_cred_t cred;
         if (!azure_load_cred(&cred)) {
+            ESP_LOGI("boot", "Azure: chua cau hinh");
             ESP_LOGW(TAG, "Chua thiet lap Azure thong qua WiFi Portal. Tam dung MQTT.");
             s_azure_task_handle = NULL;
             vTaskDeleteWithCaps(NULL);
             return;
         }
 
+        ESP_LOGI("boot", "Azure: ket noi %s / %s", cred.azure_host, cred.azure_dev);
         ESP_LOGI(TAG, "Azure config: host=%s device=%s", cred.azure_host, cred.azure_dev);
         azure_wait_network_ready();
 
@@ -1344,7 +1579,8 @@ static void azure_task(void *arg)
             char sas_token[256];
             if (generate_sas_token(cred.azure_host, cred.azure_dev, cred.azure_sas, sas_token,
                                    sizeof(sas_token)) != ESP_OK) {
-                ESP_LOGE(TAG, "Tạo SAS token thất bại. Thử lại sau 1 phút.");
+                ESP_LOGE(TAG, "Tao SAS token that bai — kiem tra SAS Key (Primary key). Thu lai sau 1 phut.");
+                ESP_LOGI("boot", "Azure: SAS Key loi / decode fail");
                 vTaskDelay(pdMS_TO_TICKS(60000));
                 continue;
             }
@@ -1352,6 +1588,7 @@ static void azure_task(void *arg)
             char uri[128];
             snprintf(uri, sizeof(uri), "mqtts://%s:8883", cred.azure_host);
             ESP_LOGI(TAG, "MQTT TLS to host=%s (device=%s)", cred.azure_host, cred.azure_dev);
+            ESP_LOGI("boot", "Azure dang ket noi MQTT...");
 
             char username[128];
             snprintf(username, sizeof(username), "%s/%s/?api-version=2021-04-12", cred.azure_host,
@@ -1413,29 +1650,20 @@ static void azure_task(void *arg)
                 if (s_flush_requested && s_azure_connected && s_mqtt_client) {
                     s_flush_requested = false;
                     azure_sync_req_t sync_copy = s_sync_req;
-                    bool defer_dm = s_sync_dm.pending;
-                    char dm_rid[32];
-                    esp_mqtt_client_handle_t dm_client = s_sync_dm.client;
-                    if (defer_dm) {
-                        snprintf(dm_rid, sizeof(dm_rid), "%s", s_sync_dm.rid);
-                        s_sync_dm.pending = false;
-                        s_sync_dm.rid[0] = '\0';
-                    }
                     memset(&s_sync_req, 0, sizeof(s_sync_req));
+                    /* s_sync_dm khong dung defer nua — chi day nen. */
+                    s_sync_dm.pending = false;
+                    s_sync_dm.rid[0] = '\0';
 
                     if (azure_pend_has_data() || sync_copy.active) {
                         int pend_flushed = 0;
                         int log_resent = 0;
-                        ESP_LOGI(TAG, "605/Flush: bat dau (pend=%d sync=%d)...", azure_pend_has_data() ? 1 : 0,
+                        ESP_LOGI(TAG, "605/Flush bg: bat dau (pend=%d sync=%d)...", azure_pend_has_data() ? 1 : 0,
                                  sync_copy.active ? 1 : 0);
                         azure_run_sync_work(s_mqtt_client, cred.azure_dev, sync_copy.active ? &sync_copy : NULL,
                                             &pend_flushed, &log_resent);
-                        if (defer_dm) {
-                            azure_send_sync_dm_response(dm_client, dm_rid, sync_copy.active ? &sync_copy : NULL,
-                                                          pend_flushed, log_resent);
-                        }
-                    } else if (defer_dm) {
-                        azure_send_sync_dm_response(dm_client, dm_rid, sync_copy.active ? &sync_copy : NULL, 0, 0);
+                        ESP_LOGI(TAG, "605/Flush bg: xong PendingFlushed=%d ResentFromLog=%d", pend_flushed,
+                                 log_resent);
                     }
                 }
             }
@@ -1547,14 +1775,12 @@ void app_azure_send_telemetry(const char *uid, const char *name, const char *id,
     /* Chua NTP: xep hang, gui sau khi dong bo (timestamp=0 -> gan lai luc flush). */
     if (now == 0) {
         pending_enqueue(uid, name, id, code_val, msg_idx);
-        ESP_LOGW(TAG, "Chua co NTP — xep hang telemetry: UID=%s index=%ld", uid, (long)msg_idx);
         return;
     }
 
     /* Nếu chưa kết nối: lưu vào hàng đợi offline (SD), đợi flush khi có mạng */
     if (!s_azure_connected || !s_mqtt_client) {
         pending_enqueue(uid, name, id, code_val, msg_idx);
-        ESP_LOGW(TAG, "Azure offline — queued telemetry: UID=%s code=%d index=%ld", uid, code_val, (long)msg_idx);
         return;
     }
 
@@ -1575,15 +1801,14 @@ void app_azure_send_telemetry(const char *uid, const char *name, const char *id,
     snprintf(topic, sizeof(topic), "devices/%s/messages/events/$.ct=application%%2Fjson&$.ce=utf-8", cred.azure_dev);
 
     char payload[384];
-    snprintf(payload, sizeof(payload),
-             "{\"Code\":%d,\"Index\":%ld,\"TimeStamp\":%lld,\"Data\":{\"DeviceName\":\"RFID_Scanner\",\"UID\":\"%s\",\"Name\":\"%s\",\"ID\":\"%s\"}}",
-             code_val, (long)msg_idx, (long long)now, uid, name ? name : "", id ? id : "");
+    azure_format_payload(payload, sizeof(payload), code_val, msg_idx, (int64_t)now, uid, name, id);
 
     app_azure_tx_busy_begin();
+    azure_live_send_begin();
     int pub_id = esp_mqtt_client_publish(s_mqtt_client, topic, payload, 0, 1, 0);
+    azure_live_send_end();
     app_azure_tx_busy_end();
     azure_note_publish(pub_id, payload);
-    ESP_LOGI(TAG, "Da day telemetry len Azure (msg_id=%d, index=%ld): %s", pub_id, (long)msg_idx, payload);
 }
 
 void app_azure_send_card_event(const char *uid, const char *name, const char *id, int event_code,
@@ -1596,14 +1821,11 @@ void app_azure_send_card_event(const char *uid, const char *name, const char *id
     time_t now = wifi_portal_get_utc_sec();
     if (now == 0) {
         pending_enqueue(uid, name, id, event_code, msg_idx);
-        ESP_LOGW(TAG, "Chua co NTP — xep hang event %d: UID=%s index=%ld", event_code, uid, (long)msg_idx);
         return;
     }
 
-    /* Nếu chưa kết nối: lưu vào SD queue, flush tự động khi kết nối lại */
     if (!s_azure_connected || !s_mqtt_client) {
         pending_enqueue(uid, name, id, event_code, msg_idx);
-        ESP_LOGW(TAG, "Azure offline — queued card event: UID=%s code=%d index=%ld", uid, event_code, (long)msg_idx);
         return;
     }
 
@@ -1624,15 +1846,14 @@ void app_azure_send_card_event(const char *uid, const char *name, const char *id
     snprintf(topic, sizeof(topic), "devices/%s/messages/events/$.ct=application%%2Fjson&$.ce=utf-8", cred.azure_dev);
 
     char payload[384];
-    snprintf(payload, sizeof(payload),
-             "{\"Code\":%d,\"Index\":%ld,\"TimeStamp\":%lld,\"Data\":{\"DeviceName\":\"RFID_Scanner\",\"UID\":\"%s\",\"Name\":\"%s\",\"ID\":\"%s\"}}",
-             event_code, (long)msg_idx, (long long)now, uid, name ? name : "", id ? id : "");
+    azure_format_payload(payload, sizeof(payload), event_code, msg_idx, (int64_t)now, uid, name, id);
 
     app_azure_tx_busy_begin();
+    azure_live_send_begin();
     int pub_id = esp_mqtt_client_publish(s_mqtt_client, topic, payload, 0, 1, 0);
+    azure_live_send_end();
     app_azure_tx_busy_end();
     azure_note_publish(pub_id, payload);
-    ESP_LOGI(TAG, "Da day event %d len Azure (msg_id=%d, index=%ld): %s", event_code, pub_id, (long)msg_idx, payload);
 }
 
 int app_azure_resend_range(int code, int32_t start_idx, int32_t end_idx)

@@ -38,13 +38,14 @@ BAT BUOC la dung 1 trong 4 chuoi sau (phan biet hoa thuong):
   method-name = "FlushQueue"      // Code 605 — flush / dong bo log
   method-name = "TriggerOTA"      // Code 606 — OTA firmware
   method-name = "ChangeHub"       // Code 607 — doi cau hinh Hub online
-  method-name = "DeviceCommand"   // Code 600,603,604,605,606,607,611,612
+  method-name = "DeviceCommand"   // Code 500,600,603,604,605,606,607,611,612
 
 Ten khac (sai chinh ta, thua ky tu...) -> HTTP 404:
   { "Message": "Method name not supported: <name>" }
 
 Bang map nhanh Code -> method-name khuyen nghi:
 
+  Code 500  ->  method-name: DeviceCommand  (hoi Version / Build)
   Code 605  ->  method-name: FlushQueue     (hoac DeviceCommand)
   Code 606  ->  method-name: TriggerOTA     (hoac DeviceCommand)
   Code 607  ->  method-name: ChangeHub      (hoac DeviceCommand)
@@ -82,6 +83,7 @@ C. MA TRANG THAI HTTP (command_status.h)
 D. BANG MA SU KIEN (Code) — TONG QUAN
 --------------------------------------------------------------------------------
   Cloud -> Device (Direct Method / DeviceCommand):
+    500  Hoi phien ban firmware (Version / Build / Partition)
     600  Reset thiet bi / xoa cau hinh (roi reboot)
     603  Luu / dang ky / cap nhat profile the
     604  Xoa profile the
@@ -97,7 +99,7 @@ D. BANG MA SU KIEN (Code) — TONG QUAN
     603  Su kien sau khi luu/cap nhat the (admin SAVE)
     604  Su kien sau khi xoa the (admin DEL)
 
-  Code DeviceCommand khong nam trong {600,603,604,605,606,607,611,612}
+  Code DeviceCommand khong nam trong {500,600,603,604,605,606,607,611,612}
   -> 400  { "Message": "Unknown Code: <n>" }
 
 
@@ -328,18 +330,19 @@ az iot hub invoke-device-method --hub-name <HUB> --device-id <DEVICE> --method-n
 Cach goi:
   A) Chi trigger flush hang doi (khong doi chieu index):
      - FlushQueue voi body rong / Data rong
-     - Phan hoi NGAY (khong defer):
+     - Phan hoi NGAY:
        {
          "status": 200,
          "payload": {
            "Code": 605,
            "TimeStamp": 1720000000,
+           "Accepted": true,
            "Message": "Flush trigger accepted"
          }
        }
-     - Thiet bi van se flush pending trong background (azure task).
+     - Thiet bi flush pending trong background (azure task).
 
-  B) Dong bo theo LastIdx + Missing (defer — TRA LOI SAU KHI SYNC XONG):
+  B) Dong bo theo LastIdx + Missing (TRA LOI NGAY — day MQTT nen):
 {
   "Code": 605,
   "Data": {
@@ -373,10 +376,13 @@ Cach goi:
 }
   - Nghia: "gui lai cho toi tu index 100 toi index 120" (CodeRange).
   - Co the ket hop them LastIdx* / Missing trong cung Data.
+  - StartIdx..EndIdx: thiet bi TU CHIA batch 64 noi bo khi day (khong can goi nhieu method).
+  - UU TIEN QUET THE: luon nhan the khi quet. Sync 605 tam dung; gui telemetry the
+    do xong roi moi tiep tuc day log.
 
-Dieu kien defer_response:
-  Neu co bat ky LastIdx* / Missing / StartIdx-EndIdx hop le -> thiet bi KHONG tra
-  Direct Method ngay. Sau khi flush pending + replay log xong moi tra:
+Phan hoi Direct Method (MOI — luon TRA NGAY, Accepted=true):
+  Bat ky 605 (Data rong / LastIdx* / Missing / StartIdx-EndIdx) deu tra 200 ngay.
+  Sau do ESP day telemetry dan (background). Backend dem message 601/602/... de biet du.
 
 {
   "status": 200,
@@ -389,21 +395,64 @@ Dieu kien defer_response:
     "LastIdxSwipe": 150,
     "LastIdxUnkn": 12,
     "LastIdxAdmin": 5,
-    "PendingFlushed": 3,
-    "ResentFromLog": 12,
-    "Message": "Sync done"
+    "StartIdx": 100,
+    "EndIdx": 120,
+    "CodeRange": 602,
+    "PendingFlushed": 0,
+    "ResentFromLog": 0,
+    "Accepted": true,
+    "Message": "Sync accepted, pushing in background"
   }
 }
 
   Y nghia:
-  - IdxSwipe / IdxUnkn / IdxAdmin: index hien tai tren thiet bi (peek NVS, chua tang).
-  - LastIdx*: echo lai gia tri backend gui xuong (-1 neu backend khong gui truong do).
-  - PendingFlushed: so ban ghi day tu hang doi SD.
-  - ResentFromLog: so ban ghi gui lai tu CSV.
+  - Accepted=true: lenh da nhan; PendingFlushed/ResentFromLog trong response nay = 0
+    (chua day xong). So thuc te xem tren serial "605/Flush bg: xong ..." hoac dem telemetry.
+  - IdxSwipe / IdxUnkn / IdxAdmin: index hien tai tren thiet bi (peek NVS).
+  - LastIdx* / StartIdx / EndIdx / CodeRange: echo lai tham so backend gui xuong (-1 neu khong co).
+  - Timeout Hub: timeout ngan (vd 30s) la du — khong can --timeout 300 chi de doi sync xong.
 
 
 ================================================================================
-2. TriggerOTA  /  DeviceCommand Code 606
+0. Check — Code 500
+   Hoi phien ban firmware dang chay (sau OTA kiem tra Version/Build)
+================================================================================
+Method Name: DeviceCommand
+
+Payload:
+{
+  "Code": 500,
+  "Data": {}
+}
+
+Phan hoi thanh cong:
+{
+  "status": 200,
+  "payload": {
+    "Code": 500,
+    "TimeStamp": 1720000000,
+    "Version": "2.5.1",
+    "Build": "2026-08-26 14:30:00",
+    "Partition": "ota_0",
+    "IP": "192.168.1.50"
+  }
+}
+
+  - Version: PROJECT_VER trong CMakeLists.txt (vd 2.5.1)
+  - Build: gio compile that (g_app_build_stamp)
+  - Partition: partition dang chay (factory / ota_0 / ota_1)
+  - IP: dia chi STA hien tai (chuoi rong neu chua co WiFi)
+
+az CLI:
+  az iot hub invoke-device-method \
+    --hub-name <HUB> \
+    --device-id <DEVICE> \
+    --method-name DeviceCommand \
+    --method-payload "{\"Code\":500,\"Data\":{}}"
+
+
+================================================================================
+2. OTA  /  DeviceCommand Code 606
    Cap nhat firmware tu URL HTTP(S)
 ================================================================================
 Method Name:
@@ -709,17 +758,27 @@ az iot hub invoke-device-method --hub-name <HUB> --device-id <DEVICE> --method-n
 # ----- Doi cau hinh Azure Hub online (607 / ChangeHub) -----
 method-name: ChangeHub (hoac DeviceCommand)
 
-JSON:
+JSON (tung truong):
 {
   "Code": 607,
   "Data": {
-    "Host": "new-hub.azure-devices.net",
-    "DeviceId": "Device001",
-    "SasKey": "your_new_primary_or_secondary_sas_key"
+    "Host": "attendance-iot-hub-01.azure-devices.net",
+    "DeviceId": "mebisoft-attendance-device-01",
+    "SasKey": "<PRIMARY_KEY_FROM_AZURE_PORTAL>"
   }
 }
+HostName=<HUB>.azure-devices.net;DeviceId=<DEVICE_ID>;SharedAccessKey=<PRIMARY_KEY>
+
+JSON (1 chuoi ConnectionString — copy tu Azure Portal):
+{
+  "Code": 607,
+  "Data": {
+    "ConnectionString": "HostName=<HUB>.azure-devices.net;DeviceId=<DEVICE_ID>;SharedAccessKey=<PRIMARY_KEY>"
+  }
+}
+Ho tro them key: ConnString, IoTHubConnectionString. Co the tron: ConnectionString + DeviceId rieng de ghi de.
 Luu y: "DeviceId" co the bo qua neu muon giu nguyen ID thiet bi cu. Thiet bi se tra response 200 roi reboot sau 1s.
-az iot hub invoke-device-method --hub-name <HUB> --device-id <DEVICE> --method-name ChangeHub --method-payload "{\"Code\":607,\"Data\":{\"Host\":\"new-hub.azure-devices.net\",\"DeviceId\":\"Device001\",\"SasKey\":\"your_sas_key\"}}"
+az iot hub invoke-device-method --hub-name <HUB> --device-id <DEVICE> --method-name ChangeHub --method-payload "{\"Code\":607,\"Data\":{\"ConnectionString\":\"HostName=new-hub.azure-devices.net;DeviceId=Device001;SharedAccessKey=your_sas_key=\"}}"
 
 
 ================================================================================
@@ -728,8 +787,8 @@ az iot hub invoke-device-method --hub-name <HUB> --device-id <DEVICE> --method-n
 [ ] Chi dung 4 method name: FlushQueue | TriggerOTA | ChangeHub | DeviceCommand
 [ ] DeviceCommand luon co "Code" + "Data" (object)
 [ ] Telemetry 601/602/603/604: theo Index rieng tung loai
-[ ] Sync 605: gui LastIdx* thuc te backend dang giu; Missing[] <= 64
+[ ] Sync 605: gui LastIdx* thuc te backend dang giu; Missing[] <= 64; Accepted=true = nhan lenh, dem telemetry de biet du
 [ ] OTA 606: Url reachable; doi reboot + kiem tra version (khong chi tin "accepted")
 [ ] 600 / 607 / 611 / 612: thiet bi se reboot — timeout Direct Method can du dai
 [ ] Offline: thiet bi tu queue SD; backend co the dinh ky FlushQueue/605
-================================================================================
+[ ] 605 day nhieu: timeout Hub ngan (30s) du — ESP day nen sau Accepted; khong can doi Sync done================================================================================

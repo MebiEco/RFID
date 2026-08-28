@@ -29,6 +29,14 @@ void wifi_portal_get_azure(char *host, size_t host_sz, char *devid, size_t dev_s
 /** Luu thong tin Azure Hub moi vao NVS (HostName, DeviceID, SAS key). Neu devid NULL/rong thi giu nguyen devid cu. */
 esp_err_t wifi_portal_set_azure(const char *host, const char *devid, const char *sas_key);
 
+/**
+ * Parse Azure IoT device connection string:
+ *   HostName=hub.azure-devices.net;DeviceId=my-device;SharedAccessKey=base64key=
+ * Tra ve true neu co HostName + SharedAccessKey. DeviceId co the trong.
+ */
+bool wifi_portal_parse_iot_conn_string(const char *conn, char *host, size_t host_sz, char *devid, size_t devid_sz,
+                                       char *sas, size_t sas_sz);
+
 /** true khi da co gio hop le tu DS3231 (boot) hoac SNTP (nam >= 2020). */
 bool wifi_portal_time_is_valid(void);
 

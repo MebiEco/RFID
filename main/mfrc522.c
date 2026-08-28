@@ -240,8 +240,8 @@ static mfrc522_status_t pcd_communicate_with_picc(spi_device_handle_t spi, uint8
     if (command == PCD_Transceive) {
         pcd_set_reg_mask(spi, REG_BitFramingReg, 0x80);
     }
-    /* 36ms đôi khi hụt trên ESP (FreeRTOS); 50ms an toàn hơn với thẻ/clone RC522 */
-    uint32_t deadline = millis() + 50;
+    /* 80ms — SELECT/anticollision can timeout at 50ms when card held or SPI shared with SD */
+    uint32_t deadline = millis() + 80;
     bool completed = false;
     do {
         uint8_t n = pcd_read_reg(spi, REG_ComIrqReg);
@@ -605,4 +605,18 @@ mfrc522_status_t mfrc522_picc_read_card_serial(spi_device_handle_t spi, mfrc522_
 {
     memset(uid, 0, sizeof(*uid));
     return picc_select(spi, uid, 0);
+}
+
+mfrc522_status_t mfrc522_picc_halt_a(spi_device_handle_t spi)
+{
+    uint8_t buffer[4];
+    buffer[0] = 0x50; /* PICC_CMD_HLTA */
+    buffer[1] = 0;
+    mfrc522_status_t result = pcd_calc_crc(spi, buffer, 2, &buffer[2]);
+    if (result != MFRC522_OK) {
+        return result;
+    }
+    uint8_t back_len = 0;
+    (void)pcd_transceive_data(spi, buffer, 4, buffer, &back_len, NULL, 0, false);
+    return MFRC522_OK;
 }

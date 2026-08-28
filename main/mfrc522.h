@@ -44,3 +44,5 @@ const char *mfrc522_status_name(mfrc522_status_t s);
 
 mfrc522_status_t mfrc522_picc_is_new_card_present(spi_device_handle_t spi);
 mfrc522_status_t mfrc522_picc_read_card_serial(spi_device_handle_t spi, mfrc522_uid_t *uid);
+/** Dua the ve trang thai HALT — bat buoc sau doc UID de quet lai nhanh. */
+mfrc522_status_t mfrc522_picc_halt_a(spi_device_handle_t spi);
