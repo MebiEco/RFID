@@ -60,4 +60,9 @@ void app_ota_validate_running_firmware(void);
 /** Len lich validate sau 45s — goi tu main thay vi validate ngay luc boot. */
 void app_ota_schedule_validate_delayed(void);
 
+/** Bat dau / cap nhat / huy OTA upload file truc tiep tu portal (POST /api/ota). */
+void app_ota_portal_upload_begin(void);
+void app_ota_portal_upload_progress(int pct);
+void app_ota_portal_upload_failed(void);
+
 #endif // APP_OTA_H

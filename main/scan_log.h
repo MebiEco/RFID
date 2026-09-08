@@ -43,17 +43,24 @@ void scan_log_flush_pending(void);
  */
 void scan_log_trim_at_boot(void);
 
-/** Trang HTML bang nhat ky (chunked). Can SD + file co the trong. */
+/** Trang /scans — HTML tinh + fetch /api/scans (CSR). Can SD mount. */
 esp_err_t scan_log_send_html_page(httpd_req_t *req);
 
 /**
  * JSON nhat ky: {"rows":[{"ts","name","id","admin","code","index"},...]}
- * Query: page, limit (mac dinh 30, toi da 30/trang), days=N (toi da 7), from/to (span toi da 7 ngay),
+ * Endpoint: /api/log hoac /api/scans (giong nhau).
+ * Query: page, limit (mac dinh 30, toi da 30/trang), days=N (toi da 30), from/to (span toi da 30 ngay),
  *        all=1 (tu thu ve 7 ngay), code=601|602|603|604,
- *        sort=desc|asc|index_desc|index_asc|id_desc|id_asc (mac dinh desc).
- * Web: toi da 20 trang (600 dong); log day du tren SD / Azure 605.
+ *        sort=desc (web chi Moi nhat / tail EOF — khong full-scan).
+ * Web: toi da 10 trang (300 dong); log day du tren SD / Azure 605.
  */
 esp_err_t scan_log_send_json(httpd_req_t *req);
+
+/** Huy quet /api/log dang chay (doi tab portal) — giai phong Internal. */
+void scan_log_api_cancel_inflight(void);
+
+/** true khi task nen dang quet SD cho /api/log. */
+bool scan_log_api_is_busy(void);
 
 /** Muc tieu resend tu rfid_log.csv (605 sync). */
 #define SCAN_LOG_SYNC_MISSING_MAX 64

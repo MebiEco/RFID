@@ -7,6 +7,7 @@
 #include "driver/sdspi_host.h"
 #include "driver/spi_common.h"
 #include "esp_heap_caps.h"
+#include "esp_idf_version.h"
 #include "esp_log.h"
 #include "esp_vfs_fat.h"
 #include "freertos/FreeRTOS.h"
@@ -57,12 +58,15 @@ static void sd_host_attach_bounce(sdmmc_host_t *host)
         return;
     }
     host->dma_aligned_buffer = s_dma_bounce;
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 0)
+    /* Field added in IDF 5.5+ for unaligned multi-block R/W chunking. */
     size_t sz = heap_caps_get_allocated_size(s_dma_bounce);
     size_t sectors = sz / 512;
     if (sectors < 1) {
         sectors = 1;
     }
     host->unaligned_multi_block_rw_max_chunk_size = sectors;
+#endif
 }
 
 esp_err_t sd_spi_bus_ensure_init(void)
@@ -169,12 +173,14 @@ esp_err_t sd_card_mount(void)
     /* Dam bao card->host giu bounce (copy host luc mount). */
     if (s_card && s_dma_bounce) {
         s_card->host.dma_aligned_buffer = s_dma_bounce;
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 0)
         size_t sz = heap_caps_get_allocated_size(s_dma_bounce);
         size_t sectors = sz / 512;
         if (sectors < 1) {
             sectors = 1;
         }
         s_card->host.unaligned_multi_block_rw_max_chunk_size = sectors;
+#endif
     }
 
     s_mounted = true;

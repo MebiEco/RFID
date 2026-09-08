@@ -132,6 +132,48 @@ int app_ota_get_progress_pct(void)
     return s_ota_busy ? s_ota_pct : -1;
 }
 
+static void ota_log_heap(const char *when)
+{
+    ESP_LOGI(TAG, "Heap %s: internal_free=%u largest=%u spiram_free=%u", when,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+}
+
+/** OTA upload file qua portal (httpd) — giai phong dich vu + pause LVGL tu 0% (giong OTA URL). */
+void app_ota_portal_upload_begin(void)
+{
+    s_ota_busy = true;
+    s_ota_pct = 0;
+    ota_log_heap("portal_upload_begin");
+    app_audio_pause();
+    (void)app_audio_wait_i2s_released(3000);
+    app_azure_suspend_for_ota();
+    (void)app_azure_wait_suspended(5000);
+    ota_log_heap("portal_upload_ready");
+}
+
+void app_ota_portal_upload_progress(int pct)
+{
+    if (!s_ota_busy) {
+        return;
+    }
+    if (pct < 0) {
+        pct = 0;
+    } else if (pct > 100) {
+        pct = 100;
+    }
+    s_ota_pct = pct;
+}
+
+void app_ota_portal_upload_failed(void)
+{
+    s_ota_busy = false;
+    s_ota_pct = -1;
+    app_azure_resume_after_ota();
+    app_audio_resume();
+}
+
 static void ota_mark_skip_welcome_on_reboot(void)
 {
     nvs_handle_t h;
@@ -158,14 +200,6 @@ bool app_ota_take_skip_welcome(void)
     }
     nvs_close(h);
     return false;
-}
-
-static void ota_log_heap(const char *when)
-{
-    ESP_LOGI(TAG, "Heap %s: internal_free=%u largest=%u spiram_free=%u", when,
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 }
 
 static void ota_pending_clear(void)

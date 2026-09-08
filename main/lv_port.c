@@ -1067,12 +1067,12 @@ void lv_port_init(esp_lcd_panel_handle_t panel)
     build_idle_screen();
     update_ui_timer_cb(NULL);
 
-    /* Stack Internal bat buoc — uu tien 8KB de giu DMA headroom; 12KB chi khi 8KB fail. */
+    /* Stack LVGL tren PSRAM — nhan khoang 8KB-12KB Internal DRAM sang PSRAM. */
     BaseType_t ok = xTaskCreatePinnedToCoreWithCaps(lvgl_task, "lvgl_task", 8192, NULL, 5, &s_lvgl_task, 1,
-                                                    MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+                                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (ok != pdPASS) {
-        ESP_LOGW(TAG, "lvgl_task Internal 8KB fail — thu 12KB");
-        ok = xTaskCreatePinnedToCoreWithCaps(lvgl_task, "lvgl_task", 12288, NULL, 5, &s_lvgl_task, 1,
+        ESP_LOGW(TAG, "lvgl_task PSRAM 8KB fail — thu Internal 8KB");
+        ok = xTaskCreatePinnedToCoreWithCaps(lvgl_task, "lvgl_task", 8192, NULL, 5, &s_lvgl_task, 1,
                                             MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     }
     if (ok != pdPASS) {

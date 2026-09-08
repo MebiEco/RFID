@@ -12,6 +12,8 @@
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_random.h"
+#include "esp_attr.h"
+#include "esp_heap_caps.h"
 
 #include "app_rfid.h"
 #include "attendance_day.h"
@@ -29,8 +31,6 @@
 #include "esp_netif.h"
 #include "app_audio.h"
 #include "lv_port.h"
-#include "esp_attr.h"
-#include "esp_heap_caps.h"
 #include "esp_flash.h"
 #include "esp_chip_info.h"
 #include "esp_app_desc.h"
@@ -101,12 +101,19 @@ static void url_decode_inplace(char *s)
 /** Ring log 8KB tren PSRAM — khong an Internal cho Terminal. */
 #define WEB_LOG_BUF_SIZE 8192
 #define WEB_LOG_SEND_MAX WEB_LOG_BUF_SIZE
+#define OTA_UPLOAD_CHUNK 4096
+/** TCP/httpd can headroom Internal — upload 1.6MB that bai som neu duoi nguong. */
+#define OTA_MIN_INTERNAL_BYTES 28672u
 static EXT_RAM_BSS_ATTR char s_web_log_buf[WEB_LOG_BUF_SIZE];
+static EXT_RAM_BSS_ATTR char s_web_log_temp[256];
+/* Dem OTA phai nam tren Internal DRAM de httpd_req_recv / TCP socket ghi truc tiep khong bi loi PSRAM */
+static char s_ota_upload_buf[OTA_UPLOAD_CHUNK];
 static bool s_web_log_ready = false;
 static size_t s_web_log_head = 0;
 static size_t s_web_log_tail = 0;
 static size_t s_web_log_len = 0;
 static volatile bool s_web_log_busy = false;
+static volatile bool s_web_log_suppress = false;
 static vprintf_like_t s_old_vprintf = NULL;
 
 static int web_log_vprintf(const char *fmt, va_list args);
@@ -117,14 +124,29 @@ void portal_web_log_init(void)
         return;
     }
     s_web_log_head = 0;
-    s_web_log_tail = 0;
+    s_web_log_tail = 0; 
     s_web_log_len = 0;
     s_old_vprintf = esp_log_set_vprintf(web_log_vprintf);
     s_web_log_ready = true;
 }
 
+void portal_web_log_suppress(bool on)
+{
+    s_web_log_suppress = on;
+}
+
 static int web_log_vprintf(const char *fmt, va_list args)
 {
+    if (s_web_log_suppress) {
+        if (s_old_vprintf) {
+            va_list args_copy;
+            va_copy(args_copy, args);
+            int ret = s_old_vprintf(fmt, args_copy);
+            va_end(args_copy);
+            return ret;
+        }
+        return 0;
+    }
     if (s_web_log_busy) {
         return 0;
     }
@@ -139,18 +161,17 @@ static int web_log_vprintf(const char *fmt, va_list args)
     }
 
     if (s_web_log_ready) {
-        char temp_buf[256];
         va_list args_copy2;
         va_copy(args_copy2, args);
-        int formatted_len = vsnprintf(temp_buf, sizeof(temp_buf), fmt, args_copy2);
+        int formatted_len = vsnprintf(s_web_log_temp, sizeof(s_web_log_temp), fmt, args_copy2);
         va_end(args_copy2);
 
         if (formatted_len > 0) {
-            if (formatted_len >= sizeof(temp_buf)) {
-                formatted_len = sizeof(temp_buf) - 1;
+            if (formatted_len >= (int)sizeof(s_web_log_temp)) {
+                formatted_len = (int)sizeof(s_web_log_temp) - 1;
             }
             for (int i = 0; i < formatted_len; i++) {
-                s_web_log_buf[s_web_log_head] = temp_buf[i];
+                s_web_log_buf[s_web_log_head] = s_web_log_temp[i];
                 s_web_log_head = (s_web_log_head + 1) % WEB_LOG_BUF_SIZE;
                 if (s_web_log_len < WEB_LOG_BUF_SIZE) {
                     s_web_log_len++;
@@ -229,6 +250,8 @@ static esp_err_t api_hardware_get_handler(httpd_req_t *req)
         httpd_resp_set_type(req, "application/json");
         return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"Yeu cau dang nhap\"}");
     }
+
+    scan_log_api_cancel_inflight();
 
     int64_t uptime_sec = esp_timer_get_time() / 1000000;
     uint32_t free_heap = esp_get_free_heap_size();
@@ -473,24 +496,18 @@ bool portal_auth_master_section(httpd_req_t *req, const char *section)
 }
 
 /** Internal toi thieu cho httpd send_chunk/TCP — du lieu log/tong quan nam tren PSRAM. */
-#define PORTAL_HTTP_MIN_INTERNAL   2048u
 #define PORTAL_PSRAM_MIN_LOG       (32u * 1024u)
 #define PORTAL_PSRAM_MIN_HEAVY     (48u * 1024u)
+#define PORTAL_INTERNAL_MIN_LOG    (24u * 1024u)
 
-static bool portal_reject_web_data(httpd_req_t *req, uint32_t min_psram, const char *tag)
+/** Nhat ky / tong quan: buffer tren PSRAM — chi kiem PSRAM, khong chan vi Internal thap. */
+static bool portal_reject_web_data_psram_only(httpd_req_t *req, uint32_t min_psram, const char *tag)
 {
     const char *err = NULL;
-    /* Chi chan WEB — khong bao gio tat quet the / Azure. */
     if (app_rfid_swipe_busy() || sd_card_service_waiting() || app_azure_tx_busy()) {
         err = "Dang quet the / day Azure — thu lai sau";
-    } else {
-        const uint32_t psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
-        const uint32_t free_int = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
-        if (psram < min_psram) {
-            err = "Het PSRAM — thu lai sau";
-        } else if (free_int < PORTAL_HTTP_MIN_INTERNAL) {
-            err = "Internal qua thap — khoi dong lai thiet bi (menu Reboot)";
-        }
+    } else if (heap_caps_get_free_size(MALLOC_CAP_SPIRAM) < min_psram) {
+        err = "Het PSRAM — thu lai sau";
     }
     if (!err) {
         return false;
@@ -509,12 +526,32 @@ static bool portal_reject_web_data(httpd_req_t *req, uint32_t min_psram, const c
 
 bool portal_reject_heavy_if_busy(httpd_req_t *req)
 {
-    return portal_reject_web_data(req, PORTAL_PSRAM_MIN_HEAVY, "heavy");
+    return portal_reject_web_data_psram_only(req, PORTAL_PSRAM_MIN_HEAVY, "heavy");
 }
 
 bool portal_reject_log_if_busy(httpd_req_t *req)
 {
-    return portal_reject_web_data(req, PORTAL_PSRAM_MIN_LOG, "log");
+    const char *err = NULL;
+    if (app_rfid_swipe_busy()) {
+        err = "Dang quet the — thu lai sau";
+    } else if (heap_caps_get_free_size(MALLOC_CAP_SPIRAM) < PORTAL_PSRAM_MIN_LOG) {
+        err = "Het PSRAM — thu lai sau";
+    } else if (heap_caps_get_free_size(MALLOC_CAP_INTERNAL) < 16384u) {
+        err = "Internal RAM thap — thu lai sau";
+    }
+    if (!err) {
+        return false;
+    }
+    ESP_LOGW(TAG, "portal log reject: %s (int=%u psram=%u)", err,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    httpd_resp_set_type(req, "application/json; charset=utf-8");
+    httpd_resp_set_hdr(req, "Connection", "close");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    char buf[224];
+    snprintf(buf, sizeof(buf), "{\"ok\":false,\"error\":\"%s\",\"rows\":[]}", err);
+    (void)httpd_resp_sendstr(req, buf);
+    return true;
 }
 
 static bool sess_create(const char *section, char *tok_out, size_t tok_sz, bool master)
@@ -890,7 +927,22 @@ static esp_err_t api_log_get_handler(httpd_req_t *req)
         httpd_resp_set_type(req, "application/json");
         return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"Can PIN muc nay\"}");
     }
-    return scan_log_send_json(req);
+    portal_web_log_suppress(true);
+    esp_err_t err = scan_log_send_json(req);
+    portal_web_log_suppress(false);
+    return err;
+}
+
+static esp_err_t api_log_cancel_post_handler(httpd_req_t *req)
+{
+    if (!portal_auth_section(req, "log") && !portal_auth_section(req, "admin")) {
+        httpd_resp_set_status(req, "403 Forbidden");
+        httpd_resp_set_type(req, "application/json");
+        return httpd_resp_sendstr(req, "{\"ok\":false}");
+    }
+    scan_log_api_cancel_inflight();
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req, "{\"ok\":true}");
 }
 
 static esp_err_t api_log_sync_post_handler(httpd_req_t *req)
@@ -1270,12 +1322,106 @@ static esp_err_t api_ota_status_get_handler(httpd_req_t *req)
     }
     bool busy = app_ota_is_busy();
     int pct = app_ota_get_progress_pct();
-    char buf[128];
-    snprintf(buf, sizeof(buf), "{\"ok\":true,\"busy\":%s,\"pct\":%d}",
-             busy ? "true" : "false", pct);
+
+    const esp_partition_t *other_part = esp_ota_get_next_update_partition(NULL);
+    esp_app_desc_t other_app;
+    bool has_other = false;
+    char other_ver[32] = "";
+    char other_date[48] = "";
+    char other_part_label[32] = "";
+
+    if (other_part && esp_ota_get_partition_description(other_part, &other_app) == ESP_OK) {
+        if (other_app.magic_word == ESP_APP_DESC_MAGIC_WORD) {
+            has_other = true;
+            snprintf(other_ver, sizeof(other_ver), "%s", other_app.version);
+            snprintf(other_date, sizeof(other_date), "%s %s", other_app.date, other_app.time);
+            strlcpy(other_part_label, other_part->label, sizeof(other_part_label));
+        }
+    }
+
+    char buf[384];
+    snprintf(buf, sizeof(buf),
+             "{\"ok\":true,\"busy\":%s,\"pct\":%d,\"has_other\":%s,\"other_ver\":\"%s\",\"other_date\":\"%s\",\"other_part\":\"%s\"}",
+             busy ? "true" : "false", pct, has_other ? "true" : "false",
+             other_ver, other_date, other_part_label);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store, no-cache, must-revalidate");
     return httpd_resp_sendstr(req, buf);
+}
+
+typedef enum {
+    OTA_WORKER_NONE = 0,
+    OTA_WORKER_BEGIN,
+    OTA_WORKER_WRITE,
+    OTA_WORKER_END,
+    OTA_WORKER_ABORT,
+} ota_worker_cmd_t;
+
+typedef struct {
+    ota_worker_cmd_t cmd;
+    const esp_partition_t *part;
+    const void *data;
+    size_t len;
+    esp_ota_handle_t handle;
+    esp_err_t result;
+    SemaphoreHandle_t sem_req;
+    SemaphoreHandle_t sem_res;
+    TaskHandle_t task;
+} ota_worker_ctx_t;
+
+static ota_worker_ctx_t s_ota_worker;
+
+static void ota_flash_worker_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        if (xSemaphoreTake(s_ota_worker.sem_req, portMAX_DELAY) == pdTRUE) {
+            switch (s_ota_worker.cmd) {
+            case OTA_WORKER_BEGIN:
+                s_ota_worker.result = esp_ota_begin(s_ota_worker.part, OTA_WITH_SEQUENTIAL_WRITES, &s_ota_worker.handle);
+                break;
+            case OTA_WORKER_WRITE:
+                s_ota_worker.result = esp_ota_write(s_ota_worker.handle, s_ota_worker.data, s_ota_worker.len);
+                break;
+            case OTA_WORKER_END:
+                s_ota_worker.result = esp_ota_end(s_ota_worker.handle);
+                break;
+            case OTA_WORKER_ABORT:
+                s_ota_worker.result = esp_ota_abort(s_ota_worker.handle);
+                break;
+            default:
+                s_ota_worker.result = ESP_OK;
+                break;
+            }
+            xSemaphoreGive(s_ota_worker.sem_res);
+        }
+    }
+}
+
+static esp_err_t ota_worker_exec(ota_worker_cmd_t cmd, const esp_partition_t *part, const void *data, size_t len)
+{
+    if (s_ota_worker.sem_req == NULL) {
+        s_ota_worker.sem_req = xSemaphoreCreateBinary();
+        s_ota_worker.sem_res = xSemaphoreCreateBinary();
+    }
+    if (s_ota_worker.task == NULL) {
+        BaseType_t ok = xTaskCreateWithCaps(ota_flash_worker_task, "ota_wrk", 4096, NULL, 5, &s_ota_worker.task, MALLOC_CAP_INTERNAL);
+        if (ok != pdPASS) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    s_ota_worker.cmd = cmd;
+    if (cmd == OTA_WORKER_BEGIN) {
+        s_ota_worker.part = part;
+    }
+    s_ota_worker.data = data;
+    s_ota_worker.len = len;
+
+    xSemaphoreGive(s_ota_worker.sem_req);
+    if (xSemaphoreTake(s_ota_worker.sem_res, pdMS_TO_TICKS(15000)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    return s_ota_worker.result;
 }
 
 static esp_err_t api_ota_post_handler(httpd_req_t *req)
@@ -1336,76 +1482,117 @@ static esp_err_t api_ota_post_handler(httpd_req_t *req)
         return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"File rong\"}");
     }
 
-    esp_ota_handle_t ota_h = 0;
-    esp_err_t     err = esp_ota_begin(update_part, OTA_WITH_SEQUENTIAL_WRITES, &ota_h);
+    /* Giong OTA URL: giai phong dich vu + tat LCD truoc khi nhan file (0%) — tranh LVGL/SPI chen WiFi. */
+    scan_log_api_cancel_inflight();
+    app_ota_portal_upload_begin();
+    app_rfid_set_paused(true);
+    lv_port_suspend_for_ota();
+
+    {
+        const uint32_t int_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+        if (int_free < OTA_MIN_INTERNAL_BYTES) {
+            char buf[192];
+            snprintf(buf, sizeof(buf),
+                     "{\"ok\":false,\"error\":\"Internal RAM thap (%u B) — reboot thiet bi roi thu OTA lai\"}",
+                     (unsigned)int_free);
+            lv_port_resume_after_ota();
+            app_rfid_set_paused(false);
+            app_ota_portal_upload_failed();
+            httpd_resp_set_status(req, "503 Service Unavailable");
+            httpd_resp_set_type(req, "application/json");
+            return httpd_resp_sendstr(req, buf);
+        }
+    }
+
+    esp_err_t err = ota_worker_exec(OTA_WORKER_BEGIN, update_part, NULL, 0);
     if (err != ESP_OK) {
+        lv_port_resume_after_ota();
+        app_rfid_set_paused(false);
+        app_ota_portal_upload_failed();
         httpd_resp_set_status(req, "500 Internal Error");
         httpd_resp_set_type(req, "application/json");
         return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"esp_ota_begin that bai\"}");
     }
 
-    /* Nhan body ngay — khong ve LCD / khong pause LVGL truoc. Neu chan SPI hay delay,
-     * TCP window day, trinh duyet dung o vai % va man hinh cung dung. */
-    app_rfid_set_paused(true);
-
-    char *recv_buf = heap_caps_malloc(8192, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!recv_buf) {
-        esp_ota_abort(ota_h);
-        app_rfid_set_paused(false);
-        httpd_resp_set_status(req, "500 Internal Error");
-        httpd_resp_set_type(req, "application/json");
-        return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"Het PSRAM dem OTA\"}");
-    }
-
     int cur_len = 0;
+    int timeout_retries = 0;
     while (cur_len < total_len) {
         int to_read = total_len - cur_len;
-        if (to_read > 8192) to_read = 8192;
-        int received = httpd_req_recv(req, recv_buf, to_read);
+        if (to_read > OTA_UPLOAD_CHUNK) {
+            to_read = OTA_UPLOAD_CHUNK;
+        }
+        int received = httpd_req_recv(req, s_ota_upload_buf, to_read);
         if (received <= 0) {
             if (received == HTTPD_SOCK_ERR_TIMEOUT) {
-                continue;
+                if (++timeout_retries < 50) {
+                    vTaskDelay(pdMS_TO_TICKS(50));
+                    continue;
+                }
             }
-            free(recv_buf);
-            esp_ota_abort(ota_h);
+            (void)ota_worker_exec(OTA_WORKER_ABORT, NULL, NULL, 0);
+            lv_port_resume_after_ota();
             app_rfid_set_paused(false);
-            httpd_resp_set_status(req, "500 Internal Error");
+            app_ota_portal_upload_failed();
+            ESP_LOGW(TAG, "OTA recv fail rc=%d cur=%d/%d int_free=%u", received, cur_len, total_len,
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+            httpd_resp_set_status(req, "500 Internal Server Error");
             httpd_resp_set_type(req, "application/json");
             return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"Nhan file that bai\"}");
         }
-        err = esp_ota_write(ota_h, recv_buf, received);
+        err = ota_worker_exec(OTA_WORKER_WRITE, NULL, s_ota_upload_buf, (size_t)received);
         if (err != ESP_OK) {
-            free(recv_buf);
-            esp_ota_abort(ota_h);
+            (void)ota_worker_exec(OTA_WORKER_ABORT, NULL, NULL, 0);
+            lv_port_resume_after_ota();
             app_rfid_set_paused(false);
-            httpd_resp_set_status(req, "500 Internal Error");
+            app_ota_portal_upload_failed();
+            httpd_resp_set_status(req, "500 Internal Server Error");
             httpd_resp_set_type(req, "application/json");
             return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"Ghi flash that bai\"}");
         }
         cur_len += received;
+        timeout_retries = 0;
+        app_ota_portal_upload_progress((cur_len * 100) / total_len);
+        lv_port_feed_wdt();
+        vTaskDelay(1);
     }
-    free(recv_buf);
 
-    err = esp_ota_end(ota_h);
+    err = ota_worker_exec(OTA_WORKER_END, NULL, NULL, 0);
     if (err != ESP_OK) {
+        lv_port_resume_after_ota();
         app_rfid_set_paused(false);
-        httpd_resp_set_status(req, "500 Internal Error");
+        app_ota_portal_upload_failed();
+        httpd_resp_set_status(req, "500 Internal Server Error");
         httpd_resp_set_type(req, "application/json");
         return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"esp_ota_end that bai\"}");
     }
 
     err = esp_ota_set_boot_partition(update_part);
     if (err != ESP_OK) {
+        lv_port_resume_after_ota();
         app_rfid_set_paused(false);
-        httpd_resp_set_status(req, "500 Internal Error");
+        app_ota_portal_upload_failed();
+        httpd_resp_set_status(req, "500 Internal Server Error");
         httpd_resp_set_type(req, "application/json");
         return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"Set boot partition that bai\"}");
     }
 
-    lv_port_suspend_for_ota();
+    app_ota_portal_upload_progress(100);
     lcd_ui_show_ota_result(true, "Dang khoi dong lai...");
     httpd_resp_set_type(req, "application/json");
-    httpd_resp_sendstr(req, "{\"ok\":true,\"msg\":\"OTA thanh cong! Dang reboot...\",\"reboot\":true}");
+
+    esp_app_desc_t new_desc;
+    char resp[512];
+    if (esp_ota_get_partition_description(update_part, &new_desc) == ESP_OK) {
+        snprintf(resp, sizeof(resp),
+                 "{\"ok\":true,\"msg\":\"OTA thanh cong! Dang reboot...\",\"reboot\":true,"
+                 "\"fw_ver\":\"%s\",\"fw_date\":\"%s\",\"fw_part\":\"%s\"}",
+                 new_desc.version, new_desc.date, update_part->label);
+    } else {
+        snprintf(resp, sizeof(resp),
+                 "{\"ok\":true,\"msg\":\"OTA thanh cong! Dang reboot...\",\"reboot\":true,"
+                 "\"fw_part\":\"%s\"}", update_part->label);
+    }
+    httpd_resp_sendstr(req, resp);
 
     vTaskDelay(pdMS_TO_TICKS(800));
     esp_restart();
@@ -1483,9 +1670,12 @@ static esp_err_t api_validate_post_handler(httpd_req_t *req)
         httpd_resp_set_type(req, "application/json");
         return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"Yeu cau dang nhap\"}");
     }
-    app_ota_validate_running_firmware();
+    esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
     httpd_resp_set_type(req, "application/json");
-    return httpd_resp_sendstr(req, "{\"ok\":true,\"msg\":\"Da xac nhan firmware hien tai la hop le (Cancel Rollback)\"}");
+    if (err == ESP_OK) {
+        return httpd_resp_sendstr(req, "{\"ok\":true,\"msg\":\"Da luu phien ban hien tai lam mac dinh!\"}");
+    }
+    return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"Loi khi luu mac dinh\"}");
 }
 
 void portal_web_register_handlers(httpd_handle_t server)
@@ -1502,6 +1692,8 @@ void portal_web_register_handlers(httpd_handle_t server)
     static const httpd_uri_t u_cards_p = { .uri = "/api/cards", .method = HTTP_POST, .handler = api_cards_post_handler };
     static const httpd_uri_t u_cards_d = { .uri = "/api/cards/del", .method = HTTP_POST, .handler = api_cards_del_handler };
     static const httpd_uri_t u_log = { .uri = "/api/log", .method = HTTP_GET, .handler = api_log_get_handler };
+    static const httpd_uri_t u_scans = { .uri = "/api/scans", .method = HTTP_GET, .handler = api_log_get_handler };
+    static const httpd_uri_t u_log_cancel = { .uri = "/api/log/cancel", .method = HTTP_POST, .handler = api_log_cancel_post_handler };
     static const httpd_uri_t u_log_sync = { .uri = "/api/log_sync", .method = HTTP_POST, .handler = api_log_sync_post_handler };
     static const httpd_uri_t u_az = { .uri = "/api/azure", .method = HTTP_GET, .handler = api_azure_get_handler };
     static const httpd_uri_t u_st = { .uri = "/api/status", .method = HTTP_GET, .handler = api_status_get_handler };
@@ -1531,6 +1723,8 @@ void portal_web_register_handlers(httpd_handle_t server)
     httpd_register_uri_handler(server, &u_cards_p);
     httpd_register_uri_handler(server, &u_cards_d);
     httpd_register_uri_handler(server, &u_log);
+    httpd_register_uri_handler(server, &u_scans);
+    httpd_register_uri_handler(server, &u_log_cancel);
     httpd_register_uri_handler(server, &u_log_sync);
     httpd_register_uri_handler(server, &u_az);
     httpd_register_uri_handler(server, &u_st);

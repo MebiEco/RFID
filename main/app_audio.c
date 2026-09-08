@@ -230,7 +230,7 @@ esp_err_t app_audio_reserve_i2s_dma(void)
         return err;
     }
     s_open_rate_hz = AUDIO_OUT_RATE_HZ;
-    ESP_LOGI(TAG, "I2S DMA reserved @%" PRIu32 " Hz (disabled, largest_dma con %u)", AUDIO_OUT_RATE_HZ,
+    ESP_LOGI(TAG, "I2S DMA reserved @%u Hz (disabled, largest_dma con %u)", (unsigned)AUDIO_OUT_RATE_HZ,
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
     return ESP_OK;
 }
@@ -518,8 +518,8 @@ static esp_err_t play_wav_file(const char *path)
         return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG, "WAV %s: %" PRIu32 " Hz → %" PRIu32 " Hz out, %u ch, PCM %u B", path, rate_hz, AUDIO_OUT_RATE_HZ,
-             (unsigned)ch, (unsigned)data_len);
+    ESP_LOGI(TAG, "WAV %s: %u Hz -> %u Hz out, %u ch, PCM %u B", path, (unsigned)rate_hz,
+             (unsigned)AUDIO_OUT_RATE_HZ, (unsigned)ch, (unsigned)data_len);
 
     if (data_len == 0 || data_len > AUDIO_PRELOAD_MAX_BYTES) {
         fclose(f);
@@ -547,7 +547,7 @@ static esp_err_t play_wav_file(const char *path)
         return ESP_FAIL;
     }
     got -= got % frame_bytes;
-    ESP_LOGI(TAG, "Preload %u B — convert+phat @%" PRIu32, (unsigned)got, AUDIO_OUT_RATE_HZ);
+    ESP_LOGI(TAG, "Preload %u B — convert+phat @%u", (unsigned)got, (unsigned)AUDIO_OUT_RATE_HZ);
 
     int16_t *stereo48 = NULL;
     size_t stereo_bytes = 0;

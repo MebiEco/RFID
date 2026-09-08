@@ -18,19 +18,22 @@ bool portal_auth_master_section(httpd_req_t *req, const char *section);
 /** Nhan body POST ngan (vd form urlencoded); tra ve so byte hoac -1. */
 int portal_recv_small_body(httpd_req_t *req, char *buf, size_t bufsz);
 
-/** Bat hook log som (main) — ring 1KB chay lien tuc, khong can PSRAM. */
+/** Bat hook log som (main) — ring 8KB PSRAM, khong can Internal. */
 void portal_web_log_init(void);
+
+/** Tam tat ghi ring khi /api/log — tranh log spam lam tang Internal khi loat trang. */
+void portal_web_log_suppress(bool on);
 
 /** Dang ky them URI (/api/cards, /api/log, /api/pin_change, /api/azure, ...). */
 void portal_web_register_handlers(httpd_handle_t server);
 
 /**
- * Chan API tong quan/cham cong — du lieu tren PSRAM; chi can Internal toi thieu cho httpd/TCP.
+ * Chan API tong quan/cham cong — du lieu tren PSRAM; chi kiem PSRAM (Azure luon chay).
  * true = da gui JSON loi, caller return ngay.
  */
 bool portal_reject_heavy_if_busy(httpd_req_t *req);
 
 /**
- * Chan /api/log — buffer log tren PSRAM; chi can Internal toi thieu cho httpd chunk.
+ * Chan /api/log — 100%% buffer PSRAM; khong chan vi Internal thap.
  */
 bool portal_reject_log_if_busy(httpd_req_t *req);

@@ -312,6 +312,7 @@ Topic gửi: `devices/{deviceId}/messages/events/$.ct=application%2Fjson&$.ce=ut
 
 | Event Code | Ý nghĩa Sự kiện | Nguồn phát sinh |
 | :---: | :--- | :--- |
+| **`500`** | Khởi động lại thiết bị ngay lập tức (Reboot) | Yêu cầu từ Direct Method `Reboot` / `Code: 500` |
 | **`601`** | Quẹt thẻ **chưa đăng ký** (Unknown Card) | Thiết bị đọc UID không tìm thấy Profile |
 | **`602`** | Quẹt thẻ **thành công** (Registered Card) | Thiết bị đọc UID hợp lệ và ghi log thành công |
 | **`603`** | Lưu / Cập nhật thẻ nhân viên thành công | Admin thao tác từ Web / Cloud |

@@ -29,6 +29,7 @@
 #include "ds3231.h"
 #include "scan_log.h"
 #include "app_azure.h"
+#include "app_ota.h"
 #include "app_rfid.h"
 #include "portal_web.h"
 
@@ -248,7 +249,7 @@ void wifi_list_get_item(int idx, char *ssid, char *pass) {
 #define PORTAL_HEALTH_INITIAL_DELAY_SEC  600
 #define PORTAL_HEALTH_FAIL_RESTART       1
 /* LWIP_MAX_SOCKETS=10 → httpd can dung toi da 7 (7+3 noi bo). */
-#define PORTAL_HTTP_MAX_SOCKETS           2 /* 1 trang + 1 API; bot LWIP Internal */
+#define PORTAL_HTTP_MAX_SOCKETS           4 /* Hàng chờ 4 socket — tránh nghẽn kẹt RAM khi chuyển tab */
 
 static httpd_handle_t s_server;
 static bool s_sntp_started;
@@ -1094,7 +1095,7 @@ static void portal_health_task(void *arg)
 
     int fail_streak = 0;
     for (;;) {
-        if (s_httpd_ota_hold) {
+        if (s_httpd_ota_hold || app_ota_is_busy() || scan_log_api_is_busy()) {
             fail_streak = 0;
             vTaskDelay(pdMS_TO_TICKS(1000));
             continue;
@@ -1189,16 +1190,15 @@ static esp_err_t start_httpd(void)
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     /* Gioi han URI/header: ESP-IDF 5.3 chi co CONFIG_HTTPD_MAX_* trong sdkconfig (khong co field trong httpd_config_t). */
     cfg.task_priority = 3; /* Thap hon rfid(10) / mqtt(6) / azure(5) — uu tien quet+gui */
-    cfg.stack_size = 8192; /* 6KB de stack overflow khi browser load portal + API song song */
-    /* Stack httpd phai nam o INTERNAL RAM (DRAM) de an toan khi ghi Flash / OTA (tranh loi s_task_stack_is_sane_when_cache_frozen). */
+    cfg.stack_size = 8192;
+    /* Stack httpd trong Internal DRAM bat buoc de nhan TCP socket khi ghi SPI Flash OTA (tranh crash/timeout do disable cache PSRAM). */
     cfg.task_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
     cfg.lru_purge_enable = true;
     cfg.max_uri_handlers = 48;
     cfg.max_open_sockets = PORTAL_HTTP_MAX_SOCKETS;
     cfg.keep_alive_enable = false;
-    /* SoftAP + HTML lon: mac dinh 5s de send EAGAIN (errno 11). */
-    cfg.send_wait_timeout = 30;
-    cfg.recv_wait_timeout = 15;
+    cfg.send_wait_timeout = 10;
+    cfg.recv_wait_timeout = 10;
 
     esp_err_t err = httpd_start(&s_server, &cfg);
     if (err != ESP_OK) {

@@ -38,6 +38,7 @@
 #include "esp_app_desc.h"
 #include "esp_ota_ops.h"
 #include "esp_netif.h"
+#include "esp_heap_caps.h"
 
 /** CA gốc Azure IoT Hub (Baltimore + DigiCert G2 + MS RSA 2017) — nhúng từ azure_iot_ca.pem. */
 extern const uint8_t azure_iot_ca_pem_start[] asm("_binary_azure_iot_ca_pem_start");
@@ -1106,7 +1107,8 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     }
     case MQTT_EVENT_DATA: { 
         if (event->data_len > 0 && event->data_len < 1024) {
-            char *topic_str = malloc(event->topic_len + 1);
+            char *topic_str =
+                (char *)heap_caps_malloc((size_t)event->topic_len + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
             if (topic_str) {
                 memcpy(topic_str, event->topic, event->topic_len);
                 topic_str[event->topic_len] = '\0';
@@ -1144,7 +1146,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                                      method_name);
                             azure_dm_response(event->client, rid, COMMAND_STATUS_NOT_FOUND, res_payload);
                         }
-                        free(topic_str);
+                        heap_caps_free(topic_str);
                         break;
                     }
 
@@ -1152,7 +1154,8 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                     cJSON *root = NULL;
                     bool invalid_json = false;
                     if (event->data_len > 0) {
-                        char *json_str = malloc(event->data_len + 1);
+                        char *json_str =
+                            (char *)heap_caps_malloc((size_t)event->data_len + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
                         if (json_str) {
                             memcpy(json_str, event->data, event->data_len);
                             json_str[event->data_len] = '\0';
@@ -1165,7 +1168,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                                     invalid_json = true;
                                 }
                             }
-                            free(json_str);
+                            heap_caps_free(json_str);
                         } else {
                             invalid_json = true;
                         }
@@ -1178,7 +1181,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                                      "{\"status\":400,\"payload\":{\"Message\":\"Invalid JSON\"}}");
                             azure_dm_response(event->client, rid, COMMAND_STATUS_BAD_REQUEST, res_payload);
                         }
-                        free(topic_str);
+                        heap_caps_free(topic_str);
                         break;
                     }
 
@@ -1193,20 +1196,19 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                                          "{\"status\":400,\"payload\":{\"Message\":\"Missing Code or Data\"}}");
                                 azure_dm_response(event->client, rid, COMMAND_STATUS_BAD_REQUEST, res_payload);
                             }
-                            free(topic_str);
+                            heap_caps_free(topic_str);
                             break;
                         }
                         cJSON *code = cJSON_GetObjectItem(root, "Code");
                         cJSON *data = cJSON_GetObjectItem(root, "Data");
-                        if (!code || !cJSON_IsNumber(code) || !data || !cJSON_IsObject(data)) {
+                        if (!code || !cJSON_IsNumber(code) || !data) {
                             if (rid[0] != '\0') {
                                 char res_payload[128];
                                 snprintf(res_payload, sizeof(res_payload),
                                          "{\"status\":400,\"payload\":{\"Message\":\"Missing Code or Data\"}}");
                                 azure_dm_response(event->client, rid, COMMAND_STATUS_BAD_REQUEST, res_payload);
                             }
-                            cJSON_Delete(root);
-                            free(topic_str);
+                            heap_caps_free(topic_str);
                             break;
                         }
                         method_code = code->valueint;
@@ -1224,7 +1226,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                                 azure_dm_response(event->client, rid, COMMAND_STATUS_BAD_REQUEST, res_payload);
                             }
                             cJSON_Delete(root);
-                            free(topic_str);
+                            heap_caps_free(topic_str);
                             break;
                         }
                     } else {
@@ -1236,6 +1238,19 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                         }
                     }
 
+                    bool is_reboot_req = (method_code == 500) || (strcasecmp(method_name, "Reboot") == 0) || (strcasecmp(method_name, "500") == 0);
+                    if (root) {
+                        cJSON *data = cJSON_GetObjectItem(root, "Data");
+                        if (data) {
+                            if (cJSON_IsString(data) && strcasecmp(data->valuestring, "Reboot") == 0) {
+                                is_reboot_req = true;
+                            } else if (cJSON_IsObject(data)) {
+                                cJSON *rb = cJSON_GetObjectItem(data, "Reboot");
+                                if (rb) is_reboot_req = true;
+                            }
+                        }
+                    }
+
                     if (method_code == 605) {
                         is_flush_req = true;
                     } else if (method_code == 606) {
@@ -1243,8 +1258,19 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                     } else if (method_code == 607) {
                         is_change_hub_req = true;
                     }
-                    
-                    if (is_flush_req) {
+
+                    if (is_reboot_req || method_code == 500) {
+                        ESP_LOGI(TAG, "Direct Method: Nhan lenh Reset/Reboot (Code 500). Thuc hien esp_restart() ngong lap tuc...");
+                        if (rid[0] != '\0') {
+                            char res_payload[256];
+                            snprintf(res_payload, sizeof(res_payload),
+                                     "{\"status\":200,\"payload\":{\"Code\":500,\"TimeStamp\":%lld,\"Message\":\"Device rebooting immediately...\"}}",
+                                     (long long)time(NULL));
+                            azure_dm_response(event->client, rid, COMMAND_STATUS_OK, res_payload);
+                        }
+                        vTaskDelay(pdMS_TO_TICKS(500));
+                        esp_restart();
+                    } else if (is_flush_req) {
                         azure_sync_req_t sync_copy;
                         memset(&sync_copy, 0, sizeof(sync_copy));
                         azure_parse_sync_data(root, &sync_copy);
@@ -1520,7 +1546,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                         cJSON_Delete(root);
                     }
                 }
-                free(topic_str);
+                heap_caps_free(topic_str);
             }
         }
         break;

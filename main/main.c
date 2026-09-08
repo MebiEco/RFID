@@ -10,6 +10,7 @@
 #endif
 #if BOARD_ENABLE_AZURE
 #include "app_azure.h"
+#include "mem_guard.h"
 #endif
 #if BOARD_ENABLE_AUDIO
 #include "app_audio.h"
@@ -241,8 +242,8 @@ void app_main(void)
 #endif
 
 #if BOARD_ENABLE_AZURE
-    /* Start Azure IoT background task */
     app_azure_start();
+    mem_guard_start();
 #endif
 
 #if BOARD_ENABLE_AUDIO

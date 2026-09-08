@@ -17,6 +17,8 @@
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/idf_additions.h"
+#include "freertos/task.h"
 #include "nvs.h"
 #include "sd_card.h"
 #include "esp_task_wdt.h"
@@ -24,6 +26,7 @@
 #include "portal_web.h"
 #include "app_rfid.h"
 #include <sys/stat.h>
+#include <sys/socket.h>
 
 static const char *TAG = "scan_log";
 
@@ -88,9 +91,53 @@ static EXT_RAM_BSS_ATTR scan_pend_blob_t s_pend_blob;
 static SemaphoreHandle_t s_pend_mtx;
 
 #define SCAN_LOG_LINE_SZ 384
-/** Doc dong CSV — PSRAM, dung duoi sd_card_lock (httpd + replay). */
-EXT_RAM_BSS_ATTR static char s_scan_log_line[SCAN_LOG_LINE_SZ];
-EXT_RAM_BSS_ATTR static char s_log_json_chunk[640];
+/** Doc dong CSV — PSRAM (tail window / linebuf). */
+/** 1 dong JSON ~640B; trang toi da 30 dong + hdr — 1 chunk HTTP (khong cap Internal moi lan send). */
+#define SCAN_LOG_JSON_ROW_MAX 640
+#define SCAN_LOG_JSON_BUF_SZ (384 + 30 * SCAN_LOG_JSON_ROW_MAX + 8)
+EXT_RAM_BSS_ATTR static char s_log_json_chunk[SCAN_LOG_JSON_ROW_MAX];
+EXT_RAM_BSS_ATTR static char s_log_json_buf[SCAN_LOG_JSON_BUF_SZ];
+EXT_RAM_BSS_ATTR static char s_log_file_buf[512];
+EXT_RAM_BSS_ATTR static char s_log_esc_ts[80];
+EXT_RAM_BSS_ATTR static char s_log_esc_uid[48];
+EXT_RAM_BSS_ATTR static char s_log_esc_nm[128];
+EXT_RAM_BSS_ATTR static char s_log_esc_id[128];
+EXT_RAM_BSS_ATTR static char s_log_esc_ad[24];
+
+static volatile uint32_t s_log_api_gen;
+
+static bool scan_log_api_aborted(uint32_t my_gen)
+{
+    return s_log_api_gen != my_gen;
+}
+
+/** Tra -3 huy, -2 uu tien quet/Azure, 0 tiep tuc. */
+static int scan_log_yield_or_abort(uint32_t my_gen)
+{
+    static uint32_t s_line_ctr;
+    lv_port_feed_wdt();
+    if ((++s_line_ctr & 15u) == 0) {
+        vTaskDelay(1);
+    }
+    if (scan_log_api_aborted(my_gen)) {
+        return -3;
+    }
+    if (app_rfid_swipe_busy() || sd_card_service_waiting()) {
+        for (int w = 0; (app_rfid_swipe_busy() || sd_card_service_waiting()) && w < 300; w++) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            if (scan_log_api_aborted(my_gen)) {
+                return -3;
+            }
+        }
+        if (app_rfid_swipe_busy() || sd_card_service_waiting()) {
+            return -2;
+        }
+    }
+    if (app_azure_tx_busy()) {
+        vTaskDelay(1);
+    }
+    return 0;
+}
 
 static void pend_mtx_take(void)
 {
@@ -197,19 +244,10 @@ void scan_log_ts_field_ymd_local(const char *ts_field, char *ymd_out, size_t ymd
     if (!ts_field || ts_field[0] == '\0') {
         return;
     }
-    time_t utc = scan_log_ts_field_to_utc(ts_field);
-    if (utc > 0) {
-        struct tm ti;
-        scan_log_wall_tm(utc, &ti);
-        if (ti.tm_year >= (2020 - 1900)) {
-            snprintf(ymd_out, ymd_sz, "%04d-%02d-%02d", (int)(ti.tm_year + 1900), (int)(ti.tm_mon + 1),
-                     (int)ti.tm_mday);
-        }
-        return;
-    }
-    /* Fallback ISO cu chua parse duoc day du: lay 10 ky tu dau */
-    if (strlen(ts_field) >= 10 && ts_field[4] == '-' && ts_field[7] == '-') {
-        snprintf(ymd_out, ymd_sz, "%.10s", ts_field);
+    char wall_iso[40] = "";
+    scan_log_ts_field_to_wall_iso(ts_field, wall_iso, sizeof(wall_iso));
+    if (wall_iso[0] != '\0' && strlen(wall_iso) >= 10) {
+        snprintf(ymd_out, ymd_sz, "%.10s", wall_iso);
     }
 }
 
@@ -591,44 +629,6 @@ void scan_log_append(const char *uid_hex, const char *name, const char *id, int 
     pending_enqueue(uid_hex, name, id, registered, msg_idx);
 }
 
-static void html_escape(const char *in, char *out, size_t outsz)
-{
-    size_t j = 0;
-    if (!in) {
-        in = "";
-    }
-    for (size_t i = 0; in[i] && j + 1 < outsz; i++) {
-        if (in[i] == '&') {
-            if (j + 5 >= outsz) {
-                break;
-            }
-            memcpy(out + j, "&amp;", 5);
-            j += 5;
-        } else if (in[i] == '<') {
-            if (j + 4 >= outsz) {
-                break;
-            }
-            memcpy(out + j, "&lt;", 4);
-            j += 4;
-        } else if (in[i] == '>') {
-            if (j + 4 >= outsz) {
-                break;
-            }
-            memcpy(out + j, "&gt;", 4);
-            j += 4;
-        } else if (in[i] == '"') {
-            if (j + 6 >= outsz) {
-                break;
-            }
-            memcpy(out + j, "&quot;", 6);
-            j += 6;
-        } else {
-            out[j++] = in[i];
-        }
-    }
-    out[j] = '\0';
-}
-
 static void json_escape(const char *in, char *out, size_t outsz)
 {
     size_t j = 0;
@@ -650,17 +650,6 @@ static void json_escape(const char *in, char *out, size_t outsz)
         }
     }
     out[j] = '\0';
-}
-
-/** ts: epoch UTC hoac ISO VN cu — loc theo ngay dia phuong */
-static int line_matches_today(const char *ts, const char *today_ymd)
-{
-    char ymd[12];
-    scan_log_ts_field_ymd_local(ts, ymd, sizeof(ymd));
-    if (ymd[0] == '\0' || !today_ymd) {
-        return 0;
-    }
-    return strcmp(ymd, today_ymd) == 0;
 }
 
 /** Ghi YYYY-MM-DD (can toi thieu 11 byte); gioi han y/m/d de tranh -Wformat-truncation. */
@@ -719,10 +708,19 @@ typedef struct {
 /** Toi da dong/trang portal — bot JSON + RAM httpd. */
 #define SCAN_LOG_PAGE_LIMIT_MAX 30
 /** Gioi han xem nhat ky tren web portal (bot RAM/SD). */
-#define SCAN_LOG_WEB_MAX_DAYS 7
-#define SCAN_LOG_WEB_MAX_PAGE 20
-/** Dung dem quet file khi loc nhieu ngay — tranh quet ca MB log. */
+#define SCAN_LOG_WEB_MAX_DAYS 30
+/**
+ * Web chi doc tail EOF — toi da 10 trang (300 dong).
+ * KHONG cho ring/full-scan (nguyen nhan reset Internal/WDT).
+ */
+#define SCAN_LOG_WEB_MAX_PAGE 100
 #define SCAN_LOG_STREAM_MAX_MATCH (SCAN_LOG_WEB_MAX_PAGE * SCAN_LOG_PAGE_LIMIT_MAX)
+#define PORTAL_LOG_MIN_INTERNAL (16u * 1024u)
+#define SCAN_LOG_TAIL_WIN_START   (8 * 1024)
+#define SCAN_LOG_TAIL_WIN_MAX     (128 * 1024)
+#define SCAN_LOG_TAIL_MAX_NEED    (SCAN_LOG_WEB_MAX_PAGE * SCAN_LOG_PAGE_LIMIT_MAX)
+#define SCAN_LOG_TAIL_LINE_PTR_MAX 4096
+#define SCAN_LOG_API_ERR_HARD (-4)
 
 typedef struct {
     char ts[80];
@@ -734,6 +732,49 @@ typedef struct {
     long msg_index;
     bool is_admin;
 } scan_log_stored_row_t;
+
+enum {
+    LOG_JOB_IDLE = 0,
+    LOG_JOB_RUNNING,
+    LOG_JOB_DONE,
+    LOG_JOB_ERR,
+};
+
+typedef struct {
+    volatile uint8_t state;
+    scan_log_json_query_t q;
+    bool time_ok;
+    char today_ymd[16];
+    uint32_t gen;
+    int page_count;
+    int total_matched;
+    int full_filtered;
+    bool stream_truncated;
+    bool sort_truncated;
+    char err[96];
+} scan_log_job_meta_t;
+
+/** Ket qua quet — BSS PSRAM; web chi tail (khong ring full-file). */
+static EXT_RAM_BSS_ATTR scan_log_stored_row_t s_log_job_rows[SCAN_LOG_PAGE_LIMIT_MAX];
+static EXT_RAM_BSS_ATTR scan_log_job_meta_t s_log_job;
+static EXT_RAM_BSS_ATTR scan_log_stored_row_t s_log_tail_rows[SCAN_LOG_TAIL_MAX_NEED];
+static EXT_RAM_BSS_ATTR char s_log_tail_win[SCAN_LOG_TAIL_WIN_MAX + 1];
+static EXT_RAM_BSS_ATTR char *s_log_tail_line_ptrs[SCAN_LOG_TAIL_LINE_PTR_MAX];
+static EXT_RAM_BSS_ATTR char s_log_tail_linebuf[SCAN_LOG_LINE_SZ];
+
+void scan_log_api_cancel_inflight(void)
+{
+    if (s_log_job.state != LOG_JOB_RUNNING) {
+        return;
+    }
+    s_log_api_gen++;
+    ESP_LOGD(TAG, "log api cancel — int_free=%u", (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+}
+
+bool scan_log_api_is_busy(void)
+{
+    return s_log_job.state == LOG_JOB_RUNNING;
+}
 
 typedef struct {
     const char *ts;
@@ -802,7 +843,7 @@ static bool scan_log_row_matches_query(const scan_log_parsed_row_t *row, const s
     char row_ymd[12];
     scan_log_ts_field_ymd_local(row->ts, row_ymd, sizeof(row_ymd));
     if (row_ymd[0] == '\0') {
-        return false;
+        return true;
     }
     if (!time_ok) {
         return true;
@@ -897,24 +938,46 @@ static int scan_log_cmp_id_desc(const void *a, const void *b)
     return scan_log_cmp_id_asc(b, a);
 }
 
-static esp_err_t scan_log_emit_json_stored(httpd_req_t *req, const scan_log_stored_row_t *row, bool *first)
+/** Append 1 row JSON vao s_log_json_buf. Tra false neu tran buffer. */
+static bool scan_log_append_json_stored(size_t *off, const scan_log_stored_row_t *row, bool *first)
 {
+    if (!off || !row || !first || *off >= sizeof(s_log_json_buf)) {
+        return false;
+    }
     char wall_ts[40];
     scan_log_ts_field_to_wall_iso(row->ts, wall_ts, sizeof(wall_ts));
-    char e_ts[80], e_uid[48], e_nm[128], e_id[128], e_ad[24];
-    json_escape(wall_ts[0] ? wall_ts : row->ts, e_ts, sizeof(e_ts));
-    json_escape(row->uid, e_uid, sizeof(e_uid));
-    json_escape(row->name, e_nm, sizeof(e_nm));
-    json_escape(row->id, e_id, sizeof(e_id));
-    json_escape(row->admin_act, e_ad, sizeof(e_ad));
+    json_escape(wall_ts[0] ? wall_ts : row->ts, s_log_esc_ts, sizeof(s_log_esc_ts));
+    json_escape(row->uid, s_log_esc_uid, sizeof(s_log_esc_uid));
+    json_escape(row->name, s_log_esc_nm, sizeof(s_log_esc_nm));
+    json_escape(row->id, s_log_esc_id, sizeof(s_log_esc_id));
+    json_escape(row->admin_act, s_log_esc_ad, sizeof(s_log_esc_ad));
 
-    snprintf(s_log_json_chunk, sizeof(s_log_json_chunk),
-             "%s{\"ts\":\"%s\",\"uid\":\"%s\",\"name\":\"%s\",\"id\":\"%s\",\"admin\":%s,\"action\":\"%s\","
-             "\"code\":%d,\"index\":%ld}",
-             *first ? "" : ",", e_ts, e_uid, e_nm, e_id, row->is_admin ? "true" : "false", e_ad, row->event_code,
-             row->msg_index);
+    const int n = snprintf(s_log_json_chunk, sizeof(s_log_json_chunk),
+                           "%s{\"ts\":\"%s\",\"uid\":\"%s\",\"name\":\"%s\",\"id\":\"%s\",\"admin\":%s,\"action\":\"%s\","
+                           "\"code\":%d,\"index\":%ld}",
+                           *first ? "" : ",", s_log_esc_ts, s_log_esc_uid, s_log_esc_nm, s_log_esc_id,
+                           row->is_admin ? "true" : "false", s_log_esc_ad, row->event_code, row->msg_index);
+    if (n <= 0 || (size_t)n >= sizeof(s_log_json_chunk)) {
+        return false;
+    }
+    if (*off + (size_t)n >= sizeof(s_log_json_buf)) {
+        return false;
+    }
+    memcpy(s_log_json_buf + *off, s_log_json_chunk, (size_t)n);
+    *off += (size_t)n;
     *first = false;
-    return httpd_resp_send_chunk(req, s_log_json_chunk, strlen(s_log_json_chunk));
+    return true;
+}
+
+static esp_err_t scan_log_json_done(httpd_req_t *req, esp_err_t send_err)
+{
+    if (req) {
+        const int sock = httpd_req_to_sockfd(req);
+        if (sock >= 0) {
+            (void)httpd_sess_trigger_close(req->handle, sock);
+        }
+    }
+    return send_err;
 }
 
 static void scan_log_json_parse_query(httpd_req_t *req, scan_log_json_query_t *q, bool time_ok,
@@ -945,6 +1008,10 @@ static void scan_log_json_parse_query(httpd_req_t *req, scan_log_json_query_t *q
     }
     if (httpd_query_key_value(query, "to", v, sizeof(v)) == ESP_OK && v[0]) {
         snprintf(q->to_ymd, sizeof(q->to_ymd), "%.10s", v);
+    }
+    if (q->from_ymd[0] && !q->to_ymd[0]) {
+        strncpy(q->to_ymd, q->from_ymd, sizeof(q->to_ymd) - 1);
+        q->to_ymd[sizeof(q->to_ymd) - 1] = '\0';
     }
     if (httpd_query_key_value(query, "code", v, sizeof(v)) == ESP_OK && v[0]) {
         int c = atoi(v);
@@ -980,14 +1047,20 @@ static void scan_log_json_parse_query(httpd_req_t *req, scan_log_json_query_t *q
         }
     }
 
-    if (q->days > 0 && time_ok && !q->show_all) {
+    if (q->days > 0 && time_ok && !q->show_all && (!q->from_ymd[0] || !q->to_ymd[0])) {
         time_t now = time(NULL);
-        time_t from_t = now - (time_t)q->days * 86400;
-        struct tm tfrom;
-        scan_log_wall_tm(from_t, &tfrom);
-        scan_log_format_ymd(&tfrom, q->from_ymd, sizeof(q->from_ymd));
-        strncpy(q->to_ymd, today_ymd, sizeof(q->to_ymd) - 1);
-        q->to_ymd[sizeof(q->to_ymd) - 1] = '\0';
+        struct tm tnow;
+        scan_log_wall_tm(now, &tnow);
+        scan_log_format_ymd(&tnow, q->to_ymd, sizeof(q->to_ymd));
+        if (q->days <= 1) {
+            scan_log_format_ymd(&tnow, q->from_ymd, sizeof(q->from_ymd));
+        } else {
+            /* N ngay = hom nay + (N-1) ngay truoc — tranh span=N+1 bi tu choi. */
+            time_t from_utc = now - (time_t)(q->days - 1) * 86400;
+            struct tm tfrom;
+            scan_log_wall_tm(from_utc, &tfrom);
+            scan_log_format_ymd(&tfrom, q->from_ymd, sizeof(q->from_ymd));
+        }
     }
 }
 
@@ -1019,7 +1092,36 @@ static int scan_log_ymd_span_days(const char *from, const char *to)
     return (int)((tt_t - tf_t) / 86400) + 1;
 }
 
-/** Gioi han portal: toi da 7 ngay, 20 trang; all/30 ngay tu dong thu ve 7. */
+/** Loc nhieu ngay — tail/ring; mot ngay (Tu=Den / hom nay) dung tail tu EOF. */
+static bool scan_log_wide_date_filter(const scan_log_json_query_t *jq)
+{
+    if (!jq) {
+        return false;
+    }
+    if (jq->show_all) {
+        return true;
+    }
+    if (jq->days > 1) {
+        return true;
+    }
+    if (jq->from_ymd[0] && jq->to_ymd[0] && strcmp(jq->from_ymd, jq->to_ymd) != 0) {
+        return true;
+    }
+    return false;
+}
+
+/** Gioi han portal: toi da 30 ngay, 10 trang (300 dong) — chi tail EOF. */
+static bool scan_log_use_tail_first(const scan_log_json_query_t *jq, const char *today_ymd)
+{
+    (void)today_ymd;
+    if (!jq) {
+        return false;
+    }
+    const int page_cap = jq->limit > 0 ? jq->limit : SCAN_LOG_PAGE_LIMIT_MAX;
+    const int need = jq->page * page_cap;
+    return need > 0 && need <= SCAN_LOG_TAIL_MAX_NEED;
+}
+
 static bool scan_log_web_limits_ok(scan_log_json_query_t *jq, char *err, size_t err_sz)
 {
     if (!jq) {
@@ -1032,8 +1134,13 @@ static bool scan_log_web_limits_ok(scan_log_json_query_t *jq, char *err, size_t 
     if (jq->days > SCAN_LOG_WEB_MAX_DAYS) {
         jq->days = SCAN_LOG_WEB_MAX_DAYS;
     }
+    /* Web chi Moi nhat + tail — asc/index/id se full-scan → reset. */
+    if (jq->sort_mode != SCAN_LOG_SORT_TIME_DESC) {
+        snprintf(err, err_sz, "Web chi sap xep Moi nhat (tranh quet full SD / reset)");
+        return false;
+    }
     if (jq->page > SCAN_LOG_WEB_MAX_PAGE) {
-        snprintf(err, err_sz, "Toi da %d trang (%d dong) tren web — thu loc hep hon", SCAN_LOG_WEB_MAX_PAGE,
+        snprintf(err, err_sz, "Toi da %d trang (%d dong) tren web (chi doc cuoi file)", SCAN_LOG_WEB_MAX_PAGE,
                  SCAN_LOG_WEB_MAX_PAGE * jq->limit);
         return false;
     }
@@ -1051,249 +1158,93 @@ static bool scan_log_web_limits_ok(scan_log_json_query_t *jq, char *err, size_t 
     return true;
 }
 
-static esp_err_t scan_log_emit_json_row(httpd_req_t *req, const scan_log_parsed_row_t *row, bool *first)
-{
-    char wall_ts[40];
-    scan_log_ts_field_to_wall_iso(row->ts, wall_ts, sizeof(wall_ts));
-    char e_ts[80], e_uid[48], e_nm[128], e_id[128], e_ad[24];
-    json_escape(wall_ts[0] ? wall_ts : (row->ts ? row->ts : ""), e_ts, sizeof(e_ts));
-    json_escape(row->uid, e_uid, sizeof(e_uid));
-    json_escape(row->name, e_nm, sizeof(e_nm));
-    json_escape(row->id, e_id, sizeof(e_id));
-    json_escape(row->admin_act, e_ad, sizeof(e_ad));
-
-    char chunk[640];
-    snprintf(chunk, sizeof(chunk),
-             "%s{\"ts\":\"%s\",\"uid\":\"%s\",\"name\":\"%s\",\"id\":\"%s\",\"admin\":%s,\"action\":\"%s\","
-             "\"code\":%d,\"index\":%ld}",
-             *first ? "" : ",", e_ts, e_uid, e_nm, e_id, row->is_admin ? "true" : "false", e_ad, row->event_code,
-             row->msg_index);
-    *first = false;
-    return httpd_resp_send_chunk(req, chunk, strlen(chunk));
-}
-
-static const char SCANS_CSS[] =
+/** /scans — HTML tinh + fetch /api/scans (CSR, khong SSR while(fgets)). */
+static const char SCANS_CSR_HTML[] =
+    "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width\">"
+    "<title>Nhật ký RFID</title>"
     "<style>"
     "*{box-sizing:border-box;margin:0;padding:0}"
-    "body{font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#090d16;color:#f3f4f6;padding:24px;line-height:1.5}"
-    "h1{font-size:22px;font-weight:600;margin-bottom:16px;color:#fff;border-bottom:1px solid rgba(255,255,255,0.08);padding-bottom:12px}"
-    ".nav{margin-bottom:16px;display:flex;gap:12px}"
-    ".nav a{color:#6366f1;text-decoration:none;font-size:14px;font-weight:500;transition:color .2s}"
-    ".nav a:hover{color:#8b5cf6}"
+    "body{font-family:system-ui,sans-serif;background:#090d16;color:#f3f4f6;padding:24px;line-height:1.5}"
+    "h1{font-size:22px;font-weight:600;margin-bottom:16px;color:#fff;border-bottom:1px solid rgba(255,255,255,.08);padding-bottom:12px}"
+    ".nav{margin:12px 0;display:flex;flex-wrap:wrap;gap:8px;align-items:center}"
+    ".nav a{color:#6366f1;text-decoration:none;font-size:14px;font-weight:500}"
     ".hint{font-size:12px;color:#9ca3af;margin:8px 0 16px}"
-    "table{width:100%;border-collapse:collapse;font-size:13px;max-width:800px;border-radius:8px;overflow:hidden;margin-top:10px}"
-    "th{background:#0f172a;color:#9ca3af;font-weight:600;text-transform:uppercase;font-size:11px;letter-spacing:.5px;padding:12px 16px;text-align:left}"
-    "td{padding:12px 16px;border-bottom:1px solid rgba(255,255,255,0.04);color:#e5e7eb}"
-    "tr:last-child td{border-bottom:none}"
-    "tr:nth-child(even){background:rgba(255,255,255,0.01)}"
-    "tr:hover{background:rgba(255,255,255,0.03)}"
-    ".admin-save{background:rgba(16,185,129,0.08)!important;font-style:italic}"
-    ".admin-del{background:rgba(239,68,68,0.08)!important;font-style:italic}"
-    "code{color:#06b6d4}"
-    "</style>";
+    "table{width:100%;border-collapse:collapse;font-size:13px;max-width:900px;border-radius:8px;overflow:hidden;margin-top:10px}"
+    "th{background:#0f172a;color:#9ca3af;font-weight:600;text-transform:uppercase;font-size:11px;padding:12px 16px;text-align:left}"
+    "td{padding:12px 16px;border-bottom:1px solid rgba(255,255,255,.04);color:#e5e7eb}"
+    "tr:nth-child(even){background:rgba(255,255,255,.01)}"
+    ".admin-save{background:rgba(16,185,129,.08)!important;font-style:italic}"
+    ".admin-del{background:rgba(239,68,68,.08)!important;font-style:italic}"
+    "button{background:#6366f1;color:#fff;border:none;border-radius:6px;padding:8px 14px;font-size:13px;cursor:pointer}"
+    "button:disabled{opacity:.45;cursor:not-allowed}"
+    "</style></head><body>"
+    "<h1 id=title>Nhật ký quét thẻ</h1>"
+    "<p class=nav><a href=\"/\">&larr; Về portal</a><span id=modeLink></span></p>"
+    "<p class=hint id=status>Đang tải...</p>"
+    "<table id=logTable><thead><tr>"
+    "<th>Code</th><th>Index</th><th>Thời gian</th><th>Tên nhân viên</th><th>Mã / Thao tác</th>"
+    "</tr></thead><tbody></tbody></table>"
+    "<p class=nav>"
+    "<button type=button id=prevBtn>Trang trước</button>"
+    "<button type=button id=nextBtn>Trang sau</button>"
+    "<button type=button id=reloadBtn>Tải lại</button>"
+    "<span id=pageInfo style=\"font-size:13px;color:#9ca3af\"></span>"
+    "</p>"
+    "<script>"
+    "(function(){"
+    "var cur=1,loading=false;"
+    "function qs(){return new URLSearchParams(location.search);}"
+    "function tok(){var p=qs();if(p.get('token'))return p.get('token');"
+    "try{var t=JSON.parse(sessionStorage.getItem('portal_tokens')||'{}');return t.log||t.admin||'';}catch(e){return '';}}"
+    "function wide(){return qs().get('all')==='1';}"
+    "function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\"/g,'&quot;');}"
+    "function act(r){if(r.admin){var l=r.action==='DEL'?'[XOA THE]':'[LUU THE]';"
+    "return esc(l+' '+(r.id||r.uid||'')+' ('+(r.name||r.uid||'')+')');}return esc(r.id||'');}"
+    "function row(r){var c=r.admin?(r.action==='DEL'?' class=\"admin-del\"':' class=\"admin-save\"'):'';"
+    "return '<tr'+c+'><td>'+esc(r.code)+'</td><td>'+esc(r.index)+'</td><td>'+esc(r.ts)+'</td>"
+    "+'<td>'+esc(r.name||r.uid)+'</td><td>'+act(r)+'</td></tr>';}"
+    "function apiUrl(p){var u='/api/scans?page='+p+'&limit=30';if(wide())u+='&all=1';return u;}"
+    "function loadLogs(p){"
+    "if(p<1||loading)return;loading=true;document.getElementById('status').textContent='Đang tải...';"
+    "var h={'Accept':'application/json'},t=tok();if(t)h['X-Portal-Token']=t;"
+    "fetch(apiUrl(p),{headers:h}).then(function(r){return r.json();}).then(function(d){"
+    "loading=false;"
+    "if(!d.ok){document.getElementById('status').textContent=d.error||'Lỗi';"
+    "document.querySelector('#logTable tbody').innerHTML='';return;}"
+    "cur=p;var tb=document.querySelector('#logTable tbody');"
+    "if(!d.rows||!d.rows.length)tb.innerHTML='<tr><td colspan=\"5\"><em>Chưa có dữ liệu.</em></td></tr>';"
+    "else tb.innerHTML=d.rows.map(row).join('');"
+    "var mp=d.max_page||1;document.getElementById('pageInfo').textContent=' Trang '+cur+' / '+mp;"
+    "document.getElementById('status').textContent='Tổng '+ (d.total||0) +' dòng — bấm Tải lại để cập nhật';"
+    "document.getElementById('prevBtn').disabled=cur<=1;"
+    "document.getElementById('nextBtn').disabled=cur>=mp;}).catch(function(){"
+    "loading=false;document.getElementById('status').textContent='Lỗi kết nối';});}"
+    "function modeLink(){"
+    "var p=qs(),t=p.get('token'),q=t?'?token='+encodeURIComponent(t):'';"
+    "var el=document.getElementById('modeLink');"
+    "if(wide())el.innerHTML=' | <a href=\"/scans'+q+'\">Chỉ hôm nay</a>';"
+    "else el.innerHTML=' | <a href=\"/scans?all=1'+(t?'&token='+encodeURIComponent(t):'')+'\">30 ngày gần nhất</a>';"
+    "document.getElementById('title').textContent=wide()?'Nhật ký 30 ngày':'Quét thẻ hôm nay';}"
+    "document.getElementById('prevBtn').onclick=function(){loadLogs(cur-1);};"
+    "document.getElementById('nextBtn').onclick=function(){loadLogs(cur+1);};"
+    "document.getElementById('reloadBtn').onclick=function(){loadLogs(cur);};"
+    "modeLink();loadLogs(1);"
+    "})();"
+    "</script></body></html>";
 
 esp_err_t scan_log_send_html_page(httpd_req_t *req)
 {
+    httpd_resp_set_type(req, "text/html; charset=utf-8");
     if (!sd_card_is_mounted()) {
-        httpd_resp_set_type(req, "text/html; charset=utf-8");
         return httpd_resp_sendstr(req,
                                   "<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
                                   "<meta name=\"viewport\" content=\"width=device-width\">"
                                   "<style>body{font-family:sans-serif;background:#090d16;color:#f3f4f6;padding:24px;text-align:center}"
                                   "a{color:#6366f1;text-decoration:none}</style></head><body>"
                                   "<h3>Thẻ SD chưa gắn hoặc chưa mount.</h3>"
-                                  "<p style=\"margin-top:12px\"><a href=\"/\">Về trang chủ</a></p></body></html>");
+                                  "<p style=\"margin-top:12px\"><a href=\"/\">Về portal</a></p></body></html>");
     }
-
-    bool show_all = false;
-    char qry[128];
-    char tok[36] = {0};
-    if (httpd_req_get_url_query_str(req, qry, sizeof(qry)) == ESP_OK) {
-        char v[8];
-        if (httpd_query_key_value(qry, "all", v, sizeof(v)) == ESP_OK && v[0] == '1') {
-            show_all = true;
-        }
-        httpd_query_key_value(qry, "token", tok, sizeof(tok));
-    }
-
-    time_t now = time(NULL);
-    struct tm tloc;
-    scan_log_wall_tm(now, &tloc);
-    const bool time_ok = (tloc.tm_year >= (2020 - 1900));
-    char today_ymd[16];
-    scan_log_format_ymd(&tloc, today_ymd, sizeof(today_ymd));
-
-    sd_card_lock();
-    FILE *fp = fopen(BOARD_SD_RFID_LOG_PATH, "r");
-    if (!fp) {
-        sd_card_unlock();
-        httpd_resp_set_type(req, "text/html; charset=utf-8");
-        return httpd_resp_sendstr(req,
-                                  "<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
-                                  "<meta name=\"viewport\" content=\"width=device-width\">"
-                                  "<style>body{font-family:sans-serif;background:#090d16;color:#f3f4f6;padding:24px;text-align:center}"
-                                  "a{color:#6366f1;text-decoration:none}</style></head><body>"
-                                  "<h3>Chưa có file nhật ký. Quét thẻ khi SD đã mount.</h3>"
-                                  "<p style=\"margin-top:12px\"><a href=\"/\">Về trang chủ</a></p></body></html>");
-    }
-
-    httpd_resp_set_type(req, "text/html; charset=utf-8");
-
-    esp_err_t e = httpd_resp_send_chunk(req, "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width\"><meta http-equiv=\"refresh\" content=\"8\"><title>Nhật ký RFID</title>", HTTPD_RESP_USE_STRLEN);
-    if (e != ESP_OK) {
-        fclose(fp);
-        sd_card_unlock();
-        return e;
-    }
-    e = httpd_resp_send_chunk(req, SCANS_CSS, HTTPD_RESP_USE_STRLEN);
-    if (e != ESP_OK) {
-        fclose(fp);
-        sd_card_unlock();
-        return e;
-    }
-    e = httpd_resp_send_chunk(req, "</head><body>", HTTPD_RESP_USE_STRLEN);
-    if (e != ESP_OK) {
-        fclose(fp);
-        sd_card_unlock();
-        return e;
-    }
-
-    char link_buf[192];
-    if (show_all) {
-        if (tok[0]) {
-            snprintf(link_buf, sizeof(link_buf), " | <a href=\"/scans?token=%s\">Chỉ hôm nay</a>", tok);
-        } else {
-            strcpy(link_buf, " | <a href=\"/scans\">Chỉ hôm nay</a>");
-        }
-    } else {
-        if (tok[0]) {
-            snprintf(link_buf, sizeof(link_buf), " | <a href=\"/scans?all=1&token=%s\">Xem tất cả</a>", tok);
-        } else {
-            strcpy(link_buf, " | <a href=\"/scans?all=1\">Xem tất cả</a>");
-        }
-    }
-
-    char head_buf[768];
-    snprintf(head_buf, sizeof(head_buf),
-             "<h1>%s</h1>"
-             "<p class=\"nav\"><a href=\"/\">&larr; Về trang chủ</a>"
-             "%s"
-             "</p><p class=\"hint\">Tự động tải lại sau mỗi 8 giây</p>"
-             "<table><tr><th>Code</th><th>Index</th><th>Thời gian</th><th>Tên nhân viên</th><th>Mã / Thao tác</th></tr>",
-             show_all ? "Tất cả nhật ký" : "Quét thẻ trong ngày",
-             link_buf);
-
-    e = httpd_resp_send_chunk(req, head_buf, strlen(head_buf));
-    if (e != ESP_OK) {
-        fclose(fp);
-        sd_card_unlock();
-        return e;
-    }
-
-    if (!show_all) {
-        char sub[192];
-        snprintf(sub, sizeof(sub), "<p><strong>Ngay: %02d/%02d/%04d</strong> (Real time)</p>",
-                 (int)tloc.tm_mday, (int)(tloc.tm_mon + 1), (int)(tloc.tm_year + 1900));
-        e = httpd_resp_send_chunk(req, sub, strlen(sub));
-        if (e != ESP_OK) {
-            fclose(fp);
-            sd_card_unlock();
-            return e;
-        }
-    }
-
-    char raw[384];
-    int rows_out = 0;
-    while (fgets(raw, sizeof(raw), fp)) {
-        lv_port_feed_wdt();
-        char buf[384];
-        snprintf(buf, sizeof(buf), "%s", raw);
-        csv_strip_line_end(buf);
-
-        char *fld0 = strtok(buf, "|");
-        if (!fld0) {
-            continue;
-        }
-        char *fld1 = strtok(NULL, "|"); /* uid */
-        char *fld2 = strtok(NULL, "|"); /* name */
-        char *fld3 = strtok(NULL, "|"); /* id */
-        char *fld4 = strtok(NULL, "|"); /* registered / "99"=admin */
-        char *fld5 = strtok(NULL, "|"); /* admin action label (SAVE/DEL) neu fld4==99, hoac index neu normal */
-        char *fld6 = strtok(NULL, "|"); /* index neu admin, NULL neu cu */
-        csv_strip_field_cr(fld1);
-        csv_strip_field_cr(fld2);
-        csv_strip_field_cr(fld3);
-        csv_strip_field_cr(fld4);
-        csv_strip_field_cr(fld5);
-        csv_strip_field_cr(fld6);
-
-        const char *ts = fld0;
-        const char *uidv = fld1 ? fld1 : "";
-        const char *nm = fld2 ? fld2 : "";
-        const char *idv = fld3 ? fld3 : "";
-        int is_admin = (fld4 && strcmp(fld4, "99") == 0);
-        int reg = (fld4 && !is_admin) ? atoi(fld4) : -1;
-        const char *admin_act = (is_admin && fld5 && fld5[0]) ? fld5 : "";
-        const char *idx_str = is_admin ? (fld6 ? fld6 : "-") : (fld5 ? fld5 : "-");
-        if (!idx_str || idx_str[0] == '\0') {
-            idx_str = "-";
-        }
-        int event_code = scan_log_row_event_code(reg, is_admin, admin_act);
-
-        if (!show_all && time_ok && !line_matches_today(ts, today_ymd)) {
-            continue;
-        }
-
-        char wall_ts[40];
-        scan_log_ts_field_to_wall_iso(ts, wall_ts, sizeof(wall_ts));
-        char e_ts[80], e_uid[48], e_nm[128], e_id[128], e_act[24];
-        html_escape(wall_ts[0] ? wall_ts : ts, e_ts, sizeof(e_ts));
-        html_escape(uidv, e_uid, sizeof(e_uid));
-        html_escape(nm, e_nm, sizeof(e_nm));
-        html_escape(idv, e_id, sizeof(e_id));
-        html_escape(admin_act, e_act, sizeof(e_act));
-
-        char row[720];
-        if (is_admin) {
-            /* Admin row: hien thi ten the va action (SAVE/DEL) voi mau khac */
-            const char *css_class = (strcmp(admin_act, "DEL") == 0) ? "admin-del" : "admin-save";
-            const char *label = (strcmp(admin_act, "DEL") == 0) ? "[XOA THE]" : "[LUU THE]";
-            const char *who = e_nm[0] ? e_nm : e_uid;
-            const char *detail = e_id[0] ? e_id : e_uid;
-            snprintf(row, sizeof(row),
-                     "<tr class=\"%s\"><td>%d</td><td>%s</td><td>%s</td><td>%s</td><td>%s %s (%s)</td></tr>",
-                     css_class, event_code, idx_str, e_ts, who, label, detail, e_uid);
-        } else {
-            snprintf(row, sizeof(row),
-                     "<tr><td>%d</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>",
-                     event_code, idx_str, e_ts, e_nm, e_id);
-        }
-        e = httpd_resp_send_chunk(req, row, strlen(row));
-        if (e != ESP_OK) {
-            fclose(fp);
-            sd_card_unlock();
-            return e;
-        }
-        rows_out++;
-    }
-    fclose(fp);
-    sd_card_unlock();
-
-    if (!show_all && rows_out == 0) {
-        const char *empty_row = "<tr><td colspan=\"5\"><em>Chua co lan quet nao trong ngay hom nay.</em></td></tr>";
-        e = httpd_resp_send_chunk(req, empty_row, strlen(empty_row));
-        if (e != ESP_OK) {
-            return e;
-        }
-    }
-
-    char tail[384];
-    snprintf(tail, sizeof(tail), "</table><p><small>File: %s</small></p><script>const tb=document.querySelector('table');const rs=Array.from(tb.rows).slice(1);rs.reverse().forEach(r=>tb.appendChild(r));</script></body></html>", BOARD_SD_RFID_LOG_PATH);
-    e = httpd_resp_send_chunk(req, tail, strlen(tail));
-    if (e != ESP_OK) {
-        return e;
-    }
-    return httpd_resp_send_chunk(req, NULL, 0);
+    return httpd_resp_sendstr(req, SCANS_CSR_HTML);
 }
 
 static void scan_log_page_range(const scan_log_json_query_t *jq, int total_matched, int *start_idx, int *end_idx)
@@ -1319,235 +1270,94 @@ static void scan_log_page_range(const scan_log_json_query_t *jq, int total_match
     }
 }
 
-/** Loc nhieu ngay / all — tail 48KB khong du; quet xuoi file (PSRAM ~0, 2 pass). */
-static bool scan_log_wide_date_filter(const scan_log_json_query_t *jq)
-{
-    return jq && (jq->show_all || jq->days > 1 || jq->from_ymd[0] != '\0');
-}
-
-/**
- * Dem + lay 1 trang (desc/asc) — khong giu toan bo log trong RAM.
- * Tra -2 neu can uu tien quet/Azure.
- */
-static int scan_log_fill_page_stream(FILE *fp, const scan_log_json_query_t *jq, bool time_ok,
-                                     const char *today_ymd, scan_log_stored_row_t *page_rows, int page_cap,
-                                     int *total_out, bool *stream_truncated_out)
-{
-    if (stream_truncated_out) {
-        *stream_truncated_out = false;
-    }
-    if (total_out) {
-        *total_out = 0;
-    }
-    if (!fp || !jq || !page_rows || page_cap <= 0) {
-        return 0;
-    }
-
-    int total = 0;
-    bool truncated = false;
-    if (fseek(fp, 0, SEEK_SET) != 0) {
-        return 0;
-    }
-    while (fgets(s_scan_log_line, SCAN_LOG_LINE_SZ, fp)) {
-        lv_port_feed_wdt();
-        if (app_rfid_swipe_busy() || sd_card_service_waiting() || app_azure_tx_busy()) {
-            ESP_LOGW(TAG, "log stream abort — uu tien quet/Azure");
-            return -2;
-        }
-        scan_log_parsed_row_t row;
-        if (!scan_log_parse_csv_line(s_scan_log_line, &row) ||
-            !scan_log_row_matches_query(&row, jq, time_ok, today_ymd)) {
-            continue;
-        }
-        total++;
-        if (total >= SCAN_LOG_STREAM_MAX_MATCH) {
-            truncated = true;
-            break;
-        }
-    }
-    if (stream_truncated_out) {
-        *stream_truncated_out = truncated;
-    }
-    if (total_out) {
-        *total_out = total;
-    }
-
-    int skip_lo = 0;
-    int skip_hi = 0;
-    if (jq->sort_mode == SCAN_LOG_SORT_TIME_DESC) {
-        skip_lo = total - jq->page * page_cap;
-        if (skip_lo < 0) {
-            skip_lo = 0;
-        }
-        skip_hi = total - (jq->page - 1) * page_cap;
-        if (skip_hi < 0) {
-            return 0;
-        }
-    } else {
-        skip_lo = (jq->page - 1) * page_cap;
-        skip_hi = skip_lo + page_cap;
-        if (skip_lo >= total) {
-            return 0;
-        }
-        if (skip_hi > total) {
-            skip_hi = total;
-        }
-    }
-
-    if (fseek(fp, 0, SEEK_SET) != 0) {
-        return 0;
-    }
-    int cur = 0;
-    int page_count = 0;
-    while (fgets(s_scan_log_line, SCAN_LOG_LINE_SZ, fp) && page_count < page_cap) {
-        lv_port_feed_wdt();
-        if (app_rfid_swipe_busy() || sd_card_service_waiting() || app_azure_tx_busy()) {
-            ESP_LOGW(TAG, "log stream pass2 abort");
-            return -2;
-        }
-        scan_log_parsed_row_t row;
-        if (!scan_log_parse_csv_line(s_scan_log_line, &row) ||
-            !scan_log_row_matches_query(&row, jq, time_ok, today_ymd)) {
-            continue;
-        }
-        if (cur >= skip_lo && cur < skip_hi) {
-            scan_log_store_row(&row, &page_rows[page_count++]);
-        }
-        cur++;
-        if (cur >= skip_hi) {
-            break;
-        }
-    }
-    ESP_LOGI(TAG, "log stream total=%d page=%d rows=%d skip=%d..%d", total, jq->page, page_count, skip_lo,
-             skip_hi);
-    return page_count;
-}
-
-
 /**
  * TIME_DESC: doc 1 cua so co dinh tu EOF (PSRAM).
  * - Du match trong cua so → nhanh, khong quet ca file.
- * - Thieu match ma chua cham dau file → -1 (fallback full-scan).
+ * - Thieu match ma chua cham dau file → -1 (web: BAO LOI, khong fallback ring).
  * - covered_all chi khi start == 0.
  * page_rows: cu → moi.
  */
 /* Cua so nho + mo rong khi thieu — tranh fread 128KB (SPI bounce lau, Internal bi WiFi/TLS can kip). */
-#define SCAN_LOG_TAIL_WIN_START (8 * 1024)
-#define SCAN_LOG_TAIL_WIN_MAX   (48 * 1024)
-#define SCAN_LOG_TAIL_MAX_NEED  300
-
 /**
  * Doc tu EOF: cua so PSRAM nho, duyet dong moi→cu, dung ngay khi du `need` match.
- * Tra ve so dong trang; -1 = can fallback full-scan.
+ * Tra ve so dong trang; -1 = thieu (web khong duoc full-scan).
  */
 static int scan_log_fill_page_from_tail(FILE *fp, const scan_log_json_query_t *jq, bool time_ok,
                                         const char *today_ymd, scan_log_stored_row_t *page_rows, int page_cap,
-                                        int *total_out)
+                                        uint32_t api_gen, int *total_out)
 {
     if (total_out) {
         *total_out = 0;
     }
     if (!fp || !jq || !page_rows || page_cap <= 0) {
-        return 0;
+        return -1;
     }
     if (fseek(fp, 0, SEEK_END) != 0) {
-        return 0;
+        return -1;
     }
     long fsz = ftell(fp);
     if (fsz <= 0) {
         return 0;
     }
 
-    const int need = jq->page * page_cap;
-    if (need <= 0 || need > SCAN_LOG_TAIL_MAX_NEED) {
-        return -1;
+    int need = jq->page * page_cap;
+    if (need > SCAN_LOG_TAIL_MAX_NEED) {
+        need = SCAN_LOG_TAIL_MAX_NEED;
     }
 
-    scan_log_stored_row_t *newest = (scan_log_stored_row_t *)heap_caps_calloc(
-        (size_t)need, sizeof(scan_log_stored_row_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!newest) {
-        return -1;
-    }
-
-    size_t win = (size_t)SCAN_LOG_TAIL_WIN_START;
-    if ((long)win > fsz) {
-        win = (size_t)fsz;
-    }
+    scan_log_stored_row_t *newest = s_log_tail_rows;
     int got = 0;
-    bool covered_all = false;
-    size_t used_win = win;
+    long pos = fsz;
+    const size_t max_chunk = SCAN_LOG_TAIL_WIN_MAX;
 
-    while (1) {
-        lv_port_feed_wdt();
-        /* Quet the dang cho SD / dang xu ly — nhường ngay, khong mo rong cua so. */
-        if (app_rfid_swipe_busy() || sd_card_service_waiting() || app_azure_tx_busy()) {
-            free(newest);
-            ESP_LOGW(TAG, "log tail abort — uu tien quet/Azure");
-            return -2;
-        }
-        long start = fsz - (long)win;
-        if (start < 0) {
-            start = 0;
-        }
-        covered_all = (start == 0);
-        size_t n = (size_t)(fsz - start);
-        used_win = n;
+    int scan_target_max = SCAN_LOG_TAIL_MAX_NEED;
 
-        char *buf = (char *)heap_caps_malloc(n + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        if (!buf) {
-            free(newest);
-            return -1;
+    while (pos > 0 && got < scan_target_max) {
+        int y = scan_log_yield_or_abort(api_gen);
+        if (y != 0) {
+            return y;
         }
-        if (fseek(fp, start, SEEK_SET) != 0 || fread(buf, 1, n, fp) != n) {
-            free(buf);
-            free(newest);
-            return -1;
+
+        long chunk_start = pos - (long)max_chunk;
+        if (chunk_start < 0) {
+            chunk_start = 0;
+        }
+        size_t n = (size_t)(pos - chunk_start);
+        pos = chunk_start;
+
+        char *buf = s_log_tail_win;
+        if (fseek(fp, chunk_start, SEEK_SET) != 0 || fread(buf, 1, n, fp) != n) {
+            break;
         }
         buf[n] = '\0';
 
         char *body = buf;
-        if (start > 0) {
+        if (chunk_start > 0) {
             char *nl = strchr(buf, '\n');
-            if (!nl) {
-                free(buf);
-                if (covered_all) {
-                    got = 0;
-                    break;
-                }
-                goto expand_win;
+            if (nl) {
+                body = nl + 1;
             }
-            body = nl + 1;
         }
 
-        /* Thu thap con tro dong, duyet moi → cu, dung khi du need. */
         int max_lines = (int)(n / 40) + 8;
-        if (max_lines < 32) {
-            max_lines = 32;
-        }
-        char **lines = (char **)heap_caps_malloc((size_t)max_lines * sizeof(char *), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        if (!lines) {
-            free(buf);
-            free(newest);
-            return -1;
-        }
+        if (max_lines < 32) max_lines = 32;
+        if (max_lines > SCAN_LOG_TAIL_LINE_PTR_MAX) max_lines = SCAN_LOG_TAIL_LINE_PTR_MAX;
+
+        char **lines = s_log_tail_line_ptrs;
         int nlines = 0;
         char *line = body;
         while (line && *line && nlines < max_lines) {
             char *nl = strchr(line, '\n');
             lines[nlines++] = line;
-            if (!nl) {
-                break;
-            }
+            if (!nl) break;
             *nl = '\0';
             line = nl + 1;
         }
 
-        got = 0;
-        for (int i = nlines - 1; i >= 0 && got < need; i--) {
+        for (int i = nlines - 1; i >= 0 && got < scan_target_max; i--) {
             scan_log_parsed_row_t row;
-            char linebuf[384];
-            snprintf(linebuf, sizeof(linebuf), "%s", lines[i]);
-            if (scan_log_parse_csv_line(linebuf, &row) &&
+            snprintf(s_log_tail_linebuf, sizeof(s_log_tail_linebuf), "%s", lines[i]);
+            if (scan_log_parse_csv_line(s_log_tail_linebuf, &row) &&
                 scan_log_row_matches_query(&row, jq, time_ok, today_ymd)) {
                 scan_log_store_row(&row, &newest[got++]);
             }
@@ -1555,28 +1365,49 @@ static int scan_log_fill_page_from_tail(FILE *fp, const scan_log_json_query_t *j
                 lv_port_feed_wdt();
             }
         }
-        free(lines);
-        free(buf);
 
-        if (got >= need || covered_all) {
-            break;
-        }
-expand_win:
-        if (win >= (size_t)SCAN_LOG_TAIL_WIN_MAX || (long)win >= fsz) {
-            free(newest);
-            ESP_LOGI(TAG, "log tail miss need=%d got=%d win=%u — fallback full", need, got, (unsigned)used_win);
-            return -1;
-        }
-        win *= 2;
-        if (win > (size_t)SCAN_LOG_TAIL_WIN_MAX) {
-            win = (size_t)SCAN_LOG_TAIL_WIN_MAX;
-        }
-        if ((long)win > fsz) {
-            win = (size_t)fsz;
+        vTaskDelay(1);
+    }
+
+    /* Neu loc theo ngay khong ra dong nao (va gio chua sync), fallback lay cac dong moi nhat */
+    if (got == 0 && jq->page == 1 && !time_ok && !jq->from_ymd[0] && !jq->to_ymd[0]) {
+        pos = fsz;
+        while (pos > 0 && got < scan_target_max) {
+            long chunk_start = pos - (long)max_chunk;
+            if (chunk_start < 0) chunk_start = 0;
+            size_t n = (size_t)(pos - chunk_start);
+            pos = chunk_start;
+            char *buf = s_log_tail_win;
+            if (fseek(fp, chunk_start, SEEK_SET) != 0 || fread(buf, 1, n, fp) != n) break;
+            buf[n] = '\0';
+            char *body = buf;
+            if (chunk_start > 0) {
+                char *nl = strchr(buf, '\n');
+                if (nl) body = nl + 1;
+            }
+            int max_lines = (int)(n / 40) + 8;
+            if (max_lines < 32) max_lines = 32;
+            if (max_lines > SCAN_LOG_TAIL_LINE_PTR_MAX) max_lines = SCAN_LOG_TAIL_LINE_PTR_MAX;
+            char **lines = s_log_tail_line_ptrs;
+            int nlines = 0;
+            char *line = body;
+            while (line && *line && nlines < max_lines) {
+                char *nl = strchr(line, '\n');
+                lines[nlines++] = line;
+                if (!nl) break;
+                *nl = '\0';
+                line = nl + 1;
+            }
+            for (int i = nlines - 1; i >= 0 && got < scan_target_max; i--) {
+                scan_log_parsed_row_t row;
+                snprintf(s_log_tail_linebuf, sizeof(s_log_tail_linebuf), "%s", lines[i]);
+                if (scan_log_parse_csv_line(s_log_tail_linebuf, &row)) {
+                    scan_log_store_row(&row, &newest[got++]);
+                }
+            }
         }
     }
 
-    /* newest[0]=moi nhat … page: cu→moi trong trang (portal reverse khi desc). */
     int start_i = (jq->page - 1) * page_cap;
     int page_count = 0;
     if (start_i < got) {
@@ -1585,19 +1416,125 @@ expand_win:
             page_rows[page_count++] = newest[i];
         }
     }
-    free(newest);
-
     if (total_out) {
-        int base = (jq->page - 1) * page_cap + page_count;
-        if (!covered_all && got >= need) {
-            *total_out = jq->page * page_cap + 1;
-        } else {
-            *total_out = base;
+        *total_out = got;
+    }
+    ESP_LOGI(TAG, "log tail need=%d got=%d page=%d/%d", need, got, page_count, page_cap);
+    return page_count;
+}
+
+static bool scan_log_query_same(const scan_log_json_query_t *a, const scan_log_json_query_t *b)
+{
+    if (!a || !b) {
+        return false;
+    }
+    return a->show_all == b->show_all && a->sort_mode == b->sort_mode && a->days == b->days &&
+           a->type_code == b->type_code && a->limit == b->limit && a->page == b->page &&
+           strcmp(a->from_ymd, b->from_ymd) == 0 && strcmp(a->to_ymd, b->to_ymd) == 0;
+}
+
+static esp_err_t scan_log_send_json_rows(httpd_req_t *req, const scan_log_json_query_t *jq, bool time_ok,
+                                         int page_count, int total_matched, int full_filtered, bool stream_truncated,
+                                         bool sort_truncated, const scan_log_stored_row_t *page_rows)
+{
+    size_t off = 0;
+    int n;
+    if (sort_truncated) {
+        n = snprintf(s_log_json_buf, sizeof(s_log_json_buf),
+                     "{\"ok\":true,\"time_ok\":%s,\"total\":%d,\"total_filtered\":%d,\"page\":%d,\"limit\":%d,"
+                     "\"max_page\":%d,\"max_days\":%d,\"stream_truncated\":%s,\"sort\":\"%s\",\"sort_truncated\":true,"
+                     "\"rows\":[",
+                     time_ok ? "true" : "false", total_matched, full_filtered, jq->page, jq->limit, SCAN_LOG_WEB_MAX_PAGE,
+                     SCAN_LOG_WEB_MAX_DAYS, stream_truncated ? "true" : "false", scan_log_sort_mode_str(jq->sort_mode));
+    } else {
+        n = snprintf(s_log_json_buf, sizeof(s_log_json_buf),
+                     "{\"ok\":true,\"time_ok\":%s,\"total\":%d,\"page\":%d,\"limit\":%d,\"max_page\":%d,\"max_days\":%d,"
+                     "\"stream_truncated\":%s,\"sort\":\"%s\",\"sort_truncated\":false,\"rows\":[",
+                     time_ok ? "true" : "false", total_matched, jq->page, jq->limit, SCAN_LOG_WEB_MAX_PAGE,
+                     SCAN_LOG_WEB_MAX_DAYS, stream_truncated ? "true" : "false", scan_log_sort_mode_str(jq->sort_mode));
+    }
+    if (n <= 0 || (size_t)n >= sizeof(s_log_json_buf)) {
+        return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"JSON buffer overflow\",\"rows\":[]}");
+    }
+    off = (size_t)n;
+
+    bool first = true;
+    for (int i = 0; i < page_count; i++) {
+        if (!scan_log_append_json_stored(&off, &page_rows[i], &first)) {
+            return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"JSON buffer overflow\",\"rows\":[]}");
         }
     }
-    ESP_LOGI(TAG, "log tail-win=%u need=%d got=%d page=%d/%d covered=%d",
-             (unsigned)used_win, need, got, page_count, page_cap, (int)covered_all);
-    return page_count;
+    if (off + 2 >= sizeof(s_log_json_buf)) {
+        return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"JSON buffer overflow\",\"rows\":[]}");
+    }
+    s_log_json_buf[off++] = ']';
+    s_log_json_buf[off++] = '}';
+
+    /* Gui theo chunk 1KB de LWIP/httpd khong cap phat khoi Internal RAM lon gay reset */
+    size_t sent = 0;
+    while (sent < off) {
+        size_t chunk_sz = (off - sent > 1024) ? 1024 : (off - sent);
+        esp_err_t e = httpd_resp_send_chunk(req, s_log_json_buf + sent, chunk_sz);
+        if (e != ESP_OK) {
+            return e;
+        }
+        sent += chunk_sz;
+    }
+    return httpd_resp_send_chunk(req, NULL, 0);
+}
+
+/** Quet SD vao s_log_job_rows — web CHI tail EOF (khong ring/full-scan). Tra 0 OK, -3 huy, -2 busy, -4 hard refuse. */
+static int scan_log_execute_query_bg(const scan_log_json_query_t *jq, bool time_ok, const char *today_ymd,
+                                     uint32_t my_gen)
+{
+    const bool field_sort = scan_log_sort_by_field(jq->sort_mode);
+    const bool time_desc = (!field_sort && jq->sort_mode == SCAN_LOG_SORT_TIME_DESC);
+    const int page_cap = jq->limit > 0 ? jq->limit : 30;
+
+    s_log_job.page_count = 0;
+    s_log_job.total_matched = 0;
+    s_log_job.full_filtered = 0;
+    s_log_job.stream_truncated = false;
+    s_log_job.sort_truncated = false;
+    s_log_job.err[0] = '\0';
+
+    /* Rang cung: khong cho duong full-scan (nguyen nhan reset). */
+    if (!time_desc || !scan_log_use_tail_first(jq, today_ymd)) {
+        snprintf(s_log_job.err, sizeof(s_log_job.err),
+                 "Web chi doc cuoi file (toi da %d trang, Moi nhat) — khong quet full SD",
+                 SCAN_LOG_WEB_MAX_PAGE);
+        return SCAN_LOG_API_ERR_HARD;
+    }
+
+    portal_web_log_suppress(true);
+    sd_card_lock();
+    FILE *fp = fopen(BOARD_SD_RFID_LOG_PATH, "r");
+    if (!fp) {
+        sd_card_unlock();
+        portal_web_log_suppress(false);
+        return 0;
+    }
+    (void)setvbuf(fp, s_log_file_buf, _IOFBF, sizeof(s_log_file_buf));
+
+    int rc = 0;
+    int n = scan_log_fill_page_from_tail(fp, jq, time_ok, today_ymd, s_log_job_rows, page_cap, my_gen,
+                                         &s_log_job.total_matched);
+    if (n == -3 || n == -2) {
+        rc = n;
+        goto done;
+    }
+    if (n < 0) {
+        n = 0;
+    }
+    s_log_job.page_count = n;
+    rc = 0;
+
+done:
+    fclose(fp);
+    sd_card_unlock();
+    portal_web_log_suppress(false);
+    vTaskDelay(1);
+    return rc;
 }
 
 esp_err_t scan_log_send_json(httpd_req_t *req)
@@ -1607,15 +1544,11 @@ esp_err_t scan_log_send_json(httpd_req_t *req)
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
 
     if (portal_reject_log_if_busy(req)) {
-        return ESP_OK;
+        return scan_log_json_done(req, ESP_OK);
     }
 
-    const uint32_t free_int0 = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
-    const uint32_t dma0 = heap_caps_get_largest_free_block(MALLOC_CAP_DMA);
-    ESP_LOGI(TAG, "api/log begin free_int=%u dma=%u", (unsigned)free_int0, (unsigned)dma0);
-
     if (!sd_card_is_mounted()) {
-        return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"SD chua mount\",\"rows\":[]}");
+        return scan_log_json_done(req, httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"SD chua mount\",\"rows\":[]}"));
     }
 
     time_t now = time(NULL);
@@ -1627,251 +1560,67 @@ esp_err_t scan_log_send_json(httpd_req_t *req)
 
     scan_log_json_query_t jq;
     scan_log_json_parse_query(req, &jq, time_ok, today_ymd);
+    const uint32_t int_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    ESP_LOGI(TAG, "api/log p=%d days=%d free_int=%u sort=%d (tail-only)", jq.page, jq.days, (unsigned)int_free,
+             (int)jq.sort_mode);
+    if (int_free < PORTAL_LOG_MIN_INTERNAL) {
+        char buf[192];
+        snprintf(buf, sizeof(buf),
+                 "{\"ok\":false,\"error\":\"Internal RAM thap (%u B) — doi 15s hoac reboot thiet bi\",\"rows\":[]}",
+                 (unsigned)int_free);
+        return scan_log_json_done(req, httpd_resp_sendstr(req, buf));
+    }
 
     char limit_err[96];
     if (!scan_log_web_limits_ok(&jq, limit_err, sizeof(limit_err))) {
-        char buf[160];
+        char buf[192];
         snprintf(buf, sizeof(buf), "{\"ok\":false,\"error\":\"%s\",\"rows\":[]}", limit_err);
-        return httpd_resp_sendstr(req, buf);
+        return scan_log_json_done(req, httpd_resp_sendstr(req, buf));
     }
 
-    const bool field_sort = scan_log_sort_by_field(jq.sort_mode);
-    const bool time_desc = (!field_sort && jq.sort_mode == SCAN_LOG_SORT_TIME_DESC);
-    const int page_cap = jq.limit > 0 ? jq.limit : 30;
-
-    scan_log_stored_row_t *page_rows = (scan_log_stored_row_t *)heap_caps_calloc(
-        (size_t)page_cap, sizeof(scan_log_stored_row_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!page_rows) {
-        return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"Het PSRAM dem trang log\",\"rows\":[]}");
+    if (s_log_job.state == LOG_JOB_DONE && scan_log_query_same(&s_log_job.q, &jq)) {
+        return scan_log_json_done(req, scan_log_send_json_rows(req, &s_log_job.q, s_log_job.time_ok, s_log_job.page_count,
+                                                                s_log_job.total_matched, s_log_job.full_filtered,
+                                                                s_log_job.stream_truncated, s_log_job.sort_truncated,
+                                                                s_log_job_rows));
     }
 
-    scan_log_stored_row_t *stored = NULL;
-    int stored_count = 0;
-    int full_filtered = 0;
-    bool sort_truncated = false;
-    int total_matched = 0;
-    int page_count = 0;
-    bool stream_truncated = false;
+    s_log_job.q = jq;
+    s_log_job.time_ok = time_ok;
+    snprintf(s_log_job.today_ymd, sizeof(s_log_job.today_ymd), "%s", today_ymd);
+    s_log_job.gen = ++s_log_api_gen;
+    s_log_job.state = LOG_JOB_RUNNING;
+    s_log_job.page_count = 0;
+    s_log_job.total_matched = 0;
+    s_log_job.full_filtered = 0;
+    s_log_job.stream_truncated = false;
+    s_log_job.sort_truncated = false;
+    s_log_job.err[0] = '\0';
 
-    if (field_sort) {
-        stored = (scan_log_stored_row_t *)heap_caps_calloc(
-            SCAN_LOG_SORT_BUF_MAX, sizeof(scan_log_stored_row_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        if (!stored) {
-            free(page_rows);
-            return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"Het PSRAM sort log\",\"rows\":[]}");
-        }
+    const int rc = scan_log_execute_query_bg(&jq, time_ok, today_ymd, s_log_job.gen);
+
+    if (rc == -3) {
+        s_log_job.state = LOG_JOB_IDLE;
+        return scan_log_json_done(req, httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"Da huy\",\"rows\":[]}"));
+    }
+    if (rc == -2) {
+        s_log_job.state = LOG_JOB_IDLE;
+        return scan_log_json_done(req,
+                                  httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"Dang quet the — thu lai sau\",\"rows\":[]}"));
+    }
+    if (rc == SCAN_LOG_API_ERR_HARD) {
+        s_log_job.state = LOG_JOB_IDLE;
+        char buf[256];
+        snprintf(buf, sizeof(buf), "{\"ok\":false,\"error\":\"%s\",\"rows\":[]}",
+                 s_log_job.err[0] ? s_log_job.err : "Web tu choi quet full SD");
+        return scan_log_json_done(req, httpd_resp_sendstr(req, buf));
     }
 
-    sd_card_lock();
-    FILE *fp = fopen(BOARD_SD_RFID_LOG_PATH, "r");
-    if (!fp) {
-        sd_card_unlock();
-        free(page_rows);
-        free(stored);
-        return httpd_resp_sendstr(req, "{\"ok\":true,\"rows\":[],\"total\":0,\"page\":1,\"limit\":30}");
-    }
-
-    if (time_desc) {
-        int n;
-        if (scan_log_wide_date_filter(&jq)) {
-            /* 7 ngay / custom: quet file co gioi han dem. */
-            n = scan_log_fill_page_stream(fp, &jq, time_ok, today_ymd, page_rows, page_cap, &total_matched,
-                                          &stream_truncated);
-        } else {
-            /* Hom nay: doc cua so tu EOF — nhanh, it IO. */
-            n = scan_log_fill_page_from_tail(fp, &jq, time_ok, today_ymd, page_rows, page_cap, &total_matched);
-        }
-        if (n == -2) {
-            fclose(fp);
-            sd_card_unlock();
-            free(page_rows);
-            free(stored);
-            return httpd_resp_sendstr(req,
-                                      "{\"ok\":false,\"error\":\"Dang quet the / gui Azure — thu lai sau\",\"rows\":[]}");
-        }
-        if (n >= 0) {
-            page_count = n;
-        } else {
-            /* Fallback: quet xuoi + ring (page*limit qua lon / het PSRAM). */
-            int ring_i = 0, ring_n = 0;
-            rewind(fp);
-            while (fgets(s_scan_log_line, SCAN_LOG_LINE_SZ, fp)) {
-                lv_port_feed_wdt();
-                scan_log_parsed_row_t row;
-                if (!scan_log_parse_csv_line(s_scan_log_line, &row) ||
-                    !scan_log_row_matches_query(&row, &jq, time_ok, today_ymd)) {
-                    continue;
-                }
-                total_matched++;
-                scan_log_store_row(&row, &page_rows[ring_i]);
-                ring_i = (ring_i + 1) % page_cap;
-                if (ring_n < page_cap) {
-                    ring_n++;
-                }
-            }
-            page_count = ring_n;
-            if (ring_n == page_cap) {
-                scan_log_stored_row_t *ordered = (scan_log_stored_row_t *)heap_caps_malloc(
-                    (size_t)page_cap * sizeof(scan_log_stored_row_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-                if (ordered) {
-                    for (int i = 0; i < page_cap; i++) {
-                        ordered[i] = page_rows[(ring_i + i) % page_cap];
-                    }
-                    memcpy(page_rows, ordered, (size_t)page_cap * sizeof(scan_log_stored_row_t));
-                    free(ordered);
-                }
-            }
-            /* total_matched = dem full; trang 1 ring = page_cap dong moi nhat */
-            if (jq.page == 1) {
-                /* OK */
-            } else {
-                /* Fallback ring chi dung page 1 — trang >1 can pass 2 */
-                int start_idx = 0, end_idx = 0;
-                scan_log_page_range(&jq, total_matched, &start_idx, &end_idx);
-                page_count = 0;
-                rewind(fp);
-                int current_match = 0;
-                while (fgets(s_scan_log_line, SCAN_LOG_LINE_SZ, fp) && page_count < page_cap) {
-                    lv_port_feed_wdt();
-                    scan_log_parsed_row_t row;
-                    if (!scan_log_parse_csv_line(s_scan_log_line, &row) ||
-                        !scan_log_row_matches_query(&row, &jq, time_ok, today_ymd)) {
-                        continue;
-                    }
-                    if (current_match < start_idx) {
-                        current_match++;
-                        continue;
-                    }
-                    if (current_match >= end_idx) {
-                        break;
-                    }
-                    scan_log_store_row(&row, &page_rows[page_count++]);
-                    current_match++;
-                }
-            }
-        }
-    } else if (field_sort) {
-        while (fgets(s_scan_log_line, SCAN_LOG_LINE_SZ, fp)) {
-            lv_port_feed_wdt();
-            scan_log_parsed_row_t row;
-            if (!scan_log_parse_csv_line(s_scan_log_line, &row) ||
-                !scan_log_row_matches_query(&row, &jq, time_ok, today_ymd)) {
-                continue;
-            }
-            full_filtered++;
-            if (stored_count < SCAN_LOG_SORT_BUF_MAX) {
-                scan_log_store_row(&row, &stored[stored_count++]);
-            } else {
-                sort_truncated = true;
-            }
-        }
-        if (full_filtered > SCAN_LOG_SORT_BUF_MAX) {
-            sort_truncated = true;
-        }
-        total_matched = stored_count;
-        int (*cmp_fn)(const void *, const void *) = scan_log_cmp_index_desc;
-        if (jq.sort_mode == SCAN_LOG_SORT_INDEX_ASC) {
-            cmp_fn = scan_log_cmp_index_asc;
-        } else if (jq.sort_mode == SCAN_LOG_SORT_ID_ASC) {
-            cmp_fn = scan_log_cmp_id_asc;
-        } else if (jq.sort_mode == SCAN_LOG_SORT_ID_DESC) {
-            cmp_fn = scan_log_cmp_id_desc;
-        }
-        if (stored_count > 1) {
-            qsort(stored, (size_t)stored_count, sizeof(scan_log_stored_row_t), cmp_fn);
-        }
-        int start_idx = 0, end_idx = 0;
-        scan_log_page_range(&jq, total_matched, &start_idx, &end_idx);
-        for (int i = start_idx; i < end_idx && page_count < page_cap; i++) {
-            page_rows[page_count++] = stored[i];
-        }
-        free(stored);
-        stored = NULL;
-    } else {
-        /* TIME_ASC: dem + pass 2 */
-        while (fgets(s_scan_log_line, SCAN_LOG_LINE_SZ, fp)) {
-            lv_port_feed_wdt();
-            scan_log_parsed_row_t row;
-            if (!scan_log_parse_csv_line(s_scan_log_line, &row) ||
-                !scan_log_row_matches_query(&row, &jq, time_ok, today_ymd)) {
-                continue;
-            }
-            total_matched++;
-        }
-        int start_idx = 0, end_idx = 0;
-        scan_log_page_range(&jq, total_matched, &start_idx, &end_idx);
-        rewind(fp);
-        int current_match = 0;
-        while (fgets(s_scan_log_line, SCAN_LOG_LINE_SZ, fp) && page_count < page_cap) {
-            lv_port_feed_wdt();
-            scan_log_parsed_row_t row;
-            if (!scan_log_parse_csv_line(s_scan_log_line, &row) ||
-                !scan_log_row_matches_query(&row, &jq, time_ok, today_ymd)) {
-                continue;
-            }
-            if (current_match < start_idx) {
-                current_match++;
-                continue;
-            }
-            if (current_match >= end_idx) {
-                break;
-            }
-            scan_log_store_row(&row, &page_rows[page_count++]);
-            current_match++;
-        }
-    }
-
-    fclose(fp);
-    sd_card_unlock();
-
-    ESP_LOGI(TAG, "api/log after SD free_int=%u dma=%u page=%d total=%d",
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA), page_count, total_matched);
-
-    char hdr[320];
-    if (field_sort && sort_truncated) {
-        snprintf(hdr, sizeof(hdr),
-                 "{\"ok\":true,\"time_ok\":%s,\"total\":%d,\"total_filtered\":%d,\"page\":%d,\"limit\":%d,"
-                 "\"max_page\":%d,\"max_days\":%d,\"stream_truncated\":%s,\"sort\":\"%s\",\"sort_truncated\":true,"
-                 "\"rows\":[",
-                 time_ok ? "true" : "false", total_matched, full_filtered, jq.page, jq.limit, SCAN_LOG_WEB_MAX_PAGE,
-                 SCAN_LOG_WEB_MAX_DAYS, stream_truncated ? "true" : "false",
-                 scan_log_sort_mode_str(jq.sort_mode));
-    } else {
-        snprintf(hdr, sizeof(hdr),
-                 "{\"ok\":true,\"time_ok\":%s,\"total\":%d,\"page\":%d,\"limit\":%d,\"max_page\":%d,\"max_days\":%d,"
-                 "\"stream_truncated\":%s,\"sort\":\"%s\",\"sort_truncated\":false,\"rows\":[",
-                 time_ok ? "true" : "false", total_matched, jq.page, jq.limit, SCAN_LOG_WEB_MAX_PAGE,
-                 SCAN_LOG_WEB_MAX_DAYS, stream_truncated ? "true" : "false",
-                 scan_log_sort_mode_str(jq.sort_mode));
-    }
-
-    esp_err_t e = httpd_resp_send_chunk(req, hdr, strlen(hdr));
-    if (e != ESP_OK) {
-        free(page_rows);
-        return e;
-    }
-
-    bool first = true;
-    /* TIME_DESC: gui cu→moi trong trang; portal.html se reverse khi sort=desc. */
-    for (int i = 0; i < page_count; i++) {
-        e = scan_log_emit_json_stored(req, &page_rows[i], &first);
-        if (e != ESP_OK) {
-            free(page_rows);
-            return e;
-        }
-    }
-
-    free(page_rows);
-    e = httpd_resp_send_chunk(req, "]}", 2);
-    if (e != ESP_OK) {
-        return e;
-    }
-    e = httpd_resp_send_chunk(req, NULL, 0);
-    ESP_LOGI(TAG, "api/log done free_int=%u dma=%u",
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
-    return e;
+    s_log_job.state = LOG_JOB_DONE;
+    return scan_log_json_done(req, scan_log_send_json_rows(req, &s_log_job.q, s_log_job.time_ok, s_log_job.page_count,
+                                                            s_log_job.total_matched, s_log_job.full_filtered,
+                                                            s_log_job.stream_truncated, s_log_job.sort_truncated,
+                                                            s_log_job_rows));
 }
 
 void scan_log_append_admin(const char *uid_hex, const char *name, const char *id, const char *action,
